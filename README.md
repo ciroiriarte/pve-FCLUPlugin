@@ -1,5 +1,8 @@
 # PVE FCLU — First-class Logical Unit storage framework
 
+*Bring enterprise SAN features — zero-copy cloning, hardware snapshots, per-VM storage
+policies — natively into the Proxmox VE ecosystem.*
+
 > **📝 DRAFT.** This is an early-stage draft. The repository currently holds a
 > **design proposal only** — no implementation. Everything here (interfaces, naming,
 > layering, decisions) is provisional and expected to change as the design is reviewed
