@@ -1,12 +1,17 @@
 # PVE FCLU — First-class Logical Unit storage framework
 
+> **📝 DRAFT.** This is an early-stage draft. The repository currently holds a
+> **design proposal only** — no implementation. Everything here (interfaces, naming,
+> layering, decisions) is provisional and expected to change as the design is reviewed
+> and the migration begins. Do not treat it as stable or final.
+
 A vendor-neutral [Proxmox VE](https://www.proxmox.com/) storage framework that
 delivers **first-class per-virtual-disk volume** service over Fibre Channel: **one array LUN per virtual
 disk**, with array-offloaded snapshots, copy-on-write linked clones, online resize,
 per-volume QoS, and replication. The generic core is shared; each storage vendor
 plugs in through a thin driver.
 
-It generalizes [`pve-HitachiBlockPlugin`](https://github.com/ciriarte/pve-HitachiBlockPlugin)
+It generalizes [`pve-HitachiBlockPlugin`](https://github.com/ciroiriarte/pve-HitachiBlockPlugin)
 — a working single-vendor (Hitachi VSP) plugin — into a framework where Dell
 PowerMax/PowerStore, Pure Storage FlashArray, IBM FlashSystem, NetApp, and others are
 added as drivers that reuse the generic orchestration, registry, and host-side FC
