@@ -125,12 +125,21 @@ sub create_cg_snapshot { }   # optional: consistency-group snapshot
 
 **Host access is the hardest part of the abstraction, and the part most over-fit to
 Hitachi today** [Claude + Codex]. Hitachi uses *host groups* (`PVE_<hostname>` per FC
-port, with WWNs + host-mode options + HMO numbers). But:
-- Dell PowerMax uses **masking views** = initiator group + port group + storage group.
-- Pure FlashArray uses **host / host-group objects** with connections.
-- IBM FlashSystem uses **host objects + volume mappings**.
+port, with WWNs + host-mode options + HMO numbers). But the control plane, the LU
+object, and the host-access model differ sharply per vendor — a concrete spec sheet for
+driver authors:
 
-So the core must speak only `ensure_host_access(%host_ctx)` / `publish_lu` /
+| Vendor / family | Control plane (API) | LU object | Host-access model |
+|---|---|---|---|
+| **Hitachi VSP** (E, G, One) | Configuration Manager REST | LDEV | **Host Group** per FC port (WWNs + host-mode + HMO) |
+| **Dell PowerStore** | Native array REST (`/api/rest/`) | Volume | **Host / Host Group** objects |
+| **Dell PowerMax** | Unisphere for PowerMax REST | Device | **Masking View** = Initiator Group + Port Group + Storage Group |
+| **Pure FlashArray** | Native REST (`/api/`) | Volume | **Host / Host-Group** objects with connections |
+| **IBM FlashSystem** | Native REST / CLI | Volume (vdisk) | **Host objects + volume mappings** |
+
+The spread — three- vs one-object masking, per-port host groups vs cluster-wide host
+objects — is exactly why host access cannot be generic. So the core must speak only
+`ensure_host_access(%host_ctx)` / `publish_lu` /
 `unpublish_lu`, where `%host_ctx` carries `{ hostname, protocol, initiators => [wwns] }`.
 The current `_ensure_host_groups` / `_map_lun_to_local` / `_unmap_lun_from_local` logic
 (`HitachiBlockPlugin.pm:1326–1505`), including HMO reconciliation and host-mode options,
@@ -407,3 +416,38 @@ WWID synthesis + vendor sysfs discovery, and any direct-REST assumptions in plug
    length/charset limits from the profile.
 4. **`fclu-repl`** — generalize the replication CLI now, or defer until a second
    replication-capable backend exists.
+
+---
+
+## Considered alternatives
+
+### Out-of-process broker (REJECTED)
+
+A fourth-model review proposed a two-tier design: a near-empty Perl shim that forwards
+PVE hooks as JSON over a local socket to a **Python/FastAPI broker daemon** on each node,
+which performs vendor REST via official SDKs (Dell PyU4V / PyPowerStore, etc.). Rejected
+— it loses to the in-process Perl design on the factors that matter for a PVE storage
+plugin:
+
+- **Its premises don't hold.** "REST in Perl is too painful" is disproven by the
+  existing `RestClient.pm` (async job polling, multi-endpoint failover, pagination —
+  already working). "Stateless, state lives on the array" ignores the **mandatory
+  cluster registry** (volname↔LU identity, snapshot/clone parentage, atomic
+  reservations) that must live on pmxcfs under corosync locks regardless — see §7.
+- **It doesn't shrink the hard part.** Host-side multipath/SCSI/sysfs, taint-mode
+  untainting, device-path resolution, and the registry+locking all stay on the node in
+  Perl. The broker offloads only array REST while importing a whole second runtime.
+- **It adds operational, availability, and security cost** — a daemon per node to
+  package/boot-order/upgrade, a new *broker-down → storage-down* failure mode, and a
+  local service holding array-admin credentials.
+
+**What was salvaged from it** and folded into this document:
+- The concrete **vendor control-plane / object / host-access table** (§2) — the
+  proposal's most useful contribution.
+- **SDK-as-reference**: the official vendor Python SDKs (PyU4V for PowerMax/Unisphere,
+  PyPowerStore for PowerStore, vendor Configuration-Manager tooling for Hitachi) are
+  excellent **reference implementations** to mine when authoring each Perl driver —
+  auth flows, object models, quirks — *without* taking them as a runtime dependency.
+- The design value it optimized for — **a low barrier to contribute a new vendor** — is
+  kept, and met in-process by the thin-driver model (§1, §5): adding a backend is one
+  `Driver::<Vendor>` plus a ~50-line plugin subclass, no daemon to touch.
