@@ -1,0 +1,15 @@
+# Build / packaging artifacts
+*.deb
+*.buildinfo
+*.changes
+build/
+
+# CLI scratch output (joint-review runs, etc.)
+*.err
+
+# Local agent/orchestration tooling state — never commit (may contain lab specifics).
+# Root-anchored so committed docs/ is unaffected.
+/.claude/
+/.omc/
+/.codex/
+/reference/
