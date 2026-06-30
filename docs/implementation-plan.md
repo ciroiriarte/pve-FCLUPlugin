@@ -76,8 +76,22 @@ a time.
       `_unmap_lun_from_local`. Test: `hitachi_hostaccess.t` (stateful fake rest).
       **Deferred (slice C):** snapshots/clones (Thin Image), and the stateful-fake
       `contract_hitachi.t` parametrizing `FCLU::ContractTest`.
-- [ ] Introduce `FCLU::Plugin`; move read-only/common methods first
+- [~] Introduce `FCLU::Plugin`; move read-only/common methods first
       (`status`, `list_images`, `volume_size_info`, shared `parse_volname`).
+      **Slice 4A done:** generic base `src/PVE/Storage/FCLU/Plugin.pm`
+      (`use base PVE::Storage::Plugin`) — identity (`api`/`plugindata`), abstract
+      vendor hooks (`type`/`vendor`/`driver_class`/`driver_config`, `connector_class`
+      default), core accessors (`_registry`/`_credentials`/`_driver`/`_build_driver`
+      seam, `$REGISTRY_BASE_DIR`/`$CREDS_BASE_DIR` test seams), and the
+      vendor-neutral read-only methods: `parse_volname`/`vmid_from_volname` (§7
+      cloudinit-aware), `volume_has_feature` (role table), `get`/`update_volume_attribute`
+      + notes (registry-backed), `list_images`, `status` (driver `storage_status`),
+      `activate`/`deactivate_storage` (driver connect/disconnect). Tested under
+      BEGIN-stubbed PVE modules + a fake driver (`t/unit/plugin.t`). **Deferred
+      (later step-4 slices):** `alloc_image`/`free_image` (+ the core `ldev_range`
+      safety FENCE §7), `activate`/`deactivate_volume` map/unmap orchestration,
+      snapshot/clone orchestration (incl the #24 linked-clone assign flow),
+      `volume_export`/`import`, `create_base`/`rename`/`manage`/`migrate`/orphans.
 - [ ] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
       one operation at a time, swapping direct REST calls for driver-contract calls.
 - [ ] Add profile detection + quirk handling behind the driver (§4); delete
