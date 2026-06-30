@@ -96,6 +96,14 @@ subtest 'update_meta merges and deletes; unknown volume croaks' => sub {
 
     eval { $r->update_meta( 'ghost', protected => 1 ) };
     like( $@, qr/not in registry/, 'update_meta on unknown volume croaks' );
+
+    # update_meta must not be a back door around the identity guard or the
+    # snapshot subregistry.
+    eval { $r->update_meta( 'vm-2-disk-1', backend_id => 'B' ) };
+    like( $@, qr/reserved key 'backend_id'/, 'update_meta refuses to retarget backend_id' );
+    is( scalar $r->lookup('vm-2-disk-1'), 'A', 'backend_id intact after refused update_meta' );
+    eval { $r->update_meta( 'vm-2-disk-1', snapshots => {} ) };
+    like( $@, qr/reserved key 'snapshots'/, 'update_meta refuses to clobber snapshots' );
 };
 
 subtest 'find_volname_by_backend' => sub {

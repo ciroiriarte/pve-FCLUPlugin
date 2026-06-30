@@ -229,6 +229,13 @@ sub update_meta {
 
     croak "volname is required" unless $volname;
 
+    # `backend_id` is identity-guarded (only register() may set/retarget it) and
+    # `snapshots` is the subregistry owned by the register_snapshot() family —
+    # neither is a free-form attribute, so refuse to let a metadata merge silently
+    # overwrite them (closes an identity-bypass latent in the reference source).
+    croak "update_meta must not touch reserved key '$_'"
+        for grep { exists $meta{$_} } qw(backend_id snapshots);
+
     $self->_with_registry_lock( sub {
         my ($reg) = @_;
         my $entry = $reg->{$volname};
