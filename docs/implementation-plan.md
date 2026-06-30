@@ -42,8 +42,14 @@ a time.
       `fclu-registry-<storeid>` lock domain, configurable `base_dir` for tests.
       Hitachi-specific `platform_defaults`/`validate_config` deliberately NOT
       moved — they stay in the driver. Tests: `t/unit/{credentials,registry,label}.t`.
-- [ ] Extract host side: `Multipath.pm` → `FCLU::Host::FCMultipath`; Hitachi WWID
-      synthesis kept only as a private driver fallback during transition.
+- [x] Extract host side: `Multipath.pm` → `FCLU::Host::Connector` (abstract §3
+      interface) + `FCLU::Host::FCMultipath` (vendor-neutral port). DELETED the
+      Hitachi WWID synthesis (`ldev_to_wwid`, `_assert_ldev_id`) and
+      `discover_wwid`'s `60060e80`-OUI + `HITACHI`-vendor gate; page-83 matching
+      (`find_device_paths`) is now generic against the driver's canonical identity
+      (§12.1). `_wwid_from_identity` is the single identity→wwid translation.
+      Synthesis-as-fallback is deferred to `Driver::Hitachi` (a private driver
+      concern, not the host layer). Tests: `t/unit/{host_connector,fcmultipath}.t`.
 - [ ] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
       the contract; transport untouched.
 - [ ] Introduce `FCLU::Plugin`; move read-only/common methods first
