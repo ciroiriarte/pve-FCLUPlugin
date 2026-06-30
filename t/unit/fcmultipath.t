@@ -48,12 +48,15 @@ subtest '_wwid_from_identity: naa preferred, prefixes stripped, lowercased' => s
         '60060e80aa', 'naa preferred over wwid; naa. prefix stripped' );
     is( $mp->_wwid_from_identity( { ids => { wwid => '0x60060e80BB' } } ),
         '60060e80bb', 'falls back to wwid; 0x stripped' );
-    is( $mp->_wwid_from_identity( { ids => { eui => 'EUI123' } } ),
-        'eui123', 'falls back to eui' );
     is( $mp->_wwid_from_identity('60060E8012'), '60060e8012', 'bare string accepted' );
 
+    # EUI-only is rejected loudly (NAA-centric pipeline) rather than silently
+    # mis-resolved into a wrong '3'-prefixed multipath path.
+    eval { $mp->_wwid_from_identity( { ids => { eui => 'EUI123' } } ) };
+    like( $@, qr/EUI-only identity is not supported/, 'eui-only identity rejected' );
+
     eval { $mp->_wwid_from_identity( { ids => {} } ) };
-    like( $@, qr/no naa\/wwid\/eui/, 'identity with no ids croaks' );
+    like( $@, qr/carries no usable id/, 'identity with no ids croaks' );
     eval { $mp->_wwid_from_identity(undef) };
     like( $@, qr/identity is required/, 'undef identity croaks' );
 };

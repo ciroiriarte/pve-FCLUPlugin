@@ -42,16 +42,28 @@ sub new {
 #
 # The ONE place the §12.1 identity becomes a device-mapper wwid. Accepts the full
 # identity hash, its inner ids hash, or a bare id string (convenience). Prefers
-# the array-reported NAA, then an explicit page-83 wwid, then EUI; strips the
-# naa./0x page-83 prefixes and lowercases. Returns the bare hex id (no '3').
+# the array-reported NAA, then an explicit page-83 wwid (naa is the canonical raw
+# descriptor; a driver supplying a dm-form '3...' wwid still survives _dm_wwid).
+# Strips the naa./0x page-83 prefixes and lowercases. Returns the bare hex id.
+#
+# This pipeline is NAA-centric end to end: _dm_wwid hardcodes the multipath '3'
+# (NAA) prefix and find_device_paths strips only naa./0x. A true EUI-64 device
+# uses the multipath '2' prefix and an 'eui.' page-83 form, so an eui-ONLY
+# identity is rejected loudly here rather than silently mis-resolved — EUI support
+# is deferred until a driver that needs it lands (§3 reserves nvme/iscsi too).
 sub _wwid_from_identity {
     my ($self, $identity) = @_;
 
     my $id;
     if ( ref $identity eq 'HASH' ) {
         my $ids = ( ref $identity->{ids} eq 'HASH' ) ? $identity->{ids} : $identity;
-        $id = $ids->{naa} // $ids->{wwid} // $ids->{eui};
-        croak "identity carries no naa/wwid/eui id" unless defined $id && length $id;
+        $id = $ids->{naa} // $ids->{wwid};
+        unless ( defined $id && length $id ) {
+            croak "FC multipath connector needs a naa or page-83 wwid; "
+                . ( defined $ids->{eui}
+                    ? "an EUI-only identity is not supported yet"
+                    : "identity carries no usable id" );
+        }
     } else {
         croak "identity is required" unless defined $identity && length $identity;
         $id = $identity;
