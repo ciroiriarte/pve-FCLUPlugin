@@ -42,6 +42,11 @@ use PVE::Storage::FCLU::Plugin;
     sub set_lu_label { my ( $s, $id, $l ) = @_; $s->{calls}{set_lu_label}++; die "BOOM label\n" if $s->{fail_label}; $s->{lus}{$id}{label} = $l if $s->{lus}{$id}; 1 }
     sub set_lu_qos   { my ( $s ) = @_; $s->{calls}{set_lu_qos}++; 1 }
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
+    sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
+        $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
+    sub capabilities { { snapshot => { single => 1 }, clone => {}, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    sub list_snapshots { my ( $s ) = @_; $s->{calls}{list_snapshots}++; [] }
+    sub delete_snapshot { my ( $s ) = @_; $s->{calls}{delete_snapshot}++; 1 }
     sub ensure_host_access { my ( $s, %c ) = @_; $s->{calls}{ensure_host_access}++; "PVE_$c{hostname}" }
     sub publish_lu   { my ( $s, $id, %c ) = @_; $s->{calls}{publish_lu}++; { hostname => $c{hostname}, access_ref => "PVE_$c{hostname}" } }
     sub unpublish_lu { my ( $s ) = @_; $s->{calls}{unpublish_lu}++; 1 }
@@ -54,6 +59,8 @@ use PVE::Storage::FCLU::Plugin;
     sub host_context { my ( $s, %o ) = @_; { hostname => $o{hostname}, protocol => 'scsi-fc', initiators => ['10000000c9aa'] } }
     sub attach      { my ( $s, $id ) = @_; $s->{calls}{attach}++; '/dev/mapper/3' . $id->{ids}{naa} }
     sub detach      { my ( $s ) = @_; $s->{calls}{detach}++; 1 }
+    sub flush       { my ( $s ) = @_; $s->{calls}{flush}++; 1 }
+    sub resize      { my ( $s ) = @_; $s->{calls}{resize}++; 1 }
     sub device_path { my ( $s, $id ) = @_; '/dev/mapper/3' . $id->{ids}{naa} }
 }
 
@@ -256,6 +263,88 @@ subtest 'vendor hooks: _alloc_backend_id requested_id, safe_delete_precheck defa
     is( scalar( reg()->lookup($name) ), '4242', 'subclass _alloc_backend_id drove the backend id' );
 
     is( $P->safe_delete_precheck( {}, 'anything' ), 1, 'default safe_delete_precheck allows' );
+};
+
+subtest 'free_image: guards, snapshot cleanup, teardown, delete, unregister' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 900, 'raw', undef, 1 << 30 );
+
+    is( $P->free_image( 'store1', {}, $name ), undef, 'free_image returns undef (PVE contract)' );
+    is( $T::Plugin::FAKE->{calls}{list_snapshots}, 1, 'capability-gated snapshot cleanup ran' );
+    is( $T::Plugin::CONN->{calls}{detach}, 1, 'host detach (via deactivate)' );
+    is( $T::Plugin::FAKE->{calls}{unpublish_lu}, 1, 'unpublish (via deactivate)' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'array delete_lu' );
+    is( reg()->lookup($name), undef, 'unregistered' );
+
+    eval { $P->free_image( 'store1', {}, 'vm-404-disk-0' ) };
+    like( $@, qr/not found in registry/, 'free of a missing volume dies' );
+};
+
+subtest 'free_image refuses protected + dependents + fence' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $r = reg();
+
+    $r->register( 'vm-901-disk-0', 'b901' );
+    $r->update_meta( 'vm-901-disk-0', protected => 1 );
+    eval { $P->free_image( 'store1', {}, 'vm-901-disk-0' ) };
+    like( $@, qr/marked protected/, 'protected volume refused' );
+
+    $r->register( 'base-902-disk-0', 'b902' );
+    $r->register( 'vm-903-disk-0', 'b903', parent_volname => 'base-902-disk-0' );
+    eval { $P->free_image( 'store1', {}, 'base-902-disk-0' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'volume with dependents refused' );
+
+    # Vendor §7 fence: a subclass whose safe_delete_precheck returns 0 blocks free.
+    package T::FencedPlugin;
+    use parent -norequire, 'T::Plugin';
+    our $FENCED_FAKE;
+    sub _build_driver { return $FENCED_FAKE //= T::FakeDriver->new }
+    sub safe_delete_precheck { 0 }
+
+    package main;
+    local $T::FencedPlugin::FENCED_FAKE = T::FakeDriver->new;
+    T::FencedPlugin->deactivate_storage( 'store1', {} );
+    reg()->register( 'vm-904-disk-0', 'b904' );
+    eval { T::FencedPlugin->free_image( 'store1', {}, 'vm-904-disk-0' ) };
+    like( $@, qr/safe-delete precheck/, 'fence refusal blocks free before any destructive op' );
+    is( $T::FencedPlugin::FENCED_FAKE->{calls}{delete_lu}, undef, 'no delete_lu after a fence refusal' );
+};
+
+subtest 'volume_resize grows + commits; rejects shrink' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    # alloc_image $size is KiB (PVE), volume_resize $size is bytes (PVE) — 1 GiB.
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 905, 'raw', undef, 1024 * 1024 );
+
+    ok( $P->volume_resize( {}, 'store1', $name, 2 << 30, 1 ), 'resize grows' );
+    is( $T::Plugin::FAKE->{calls}{resize_lu}, 1, 'driver resize_lu called' );
+    is( $T::Plugin::CONN->{calls}{flush},  1, 'pre-resize flush (running)' );
+    is( $T::Plugin::CONN->{calls}{resize}, 1, 'host-side resize' );
+    my ( undef, $meta ) = reg()->lookup($name);
+    is( $meta->{size_mb}, 2048, 'registry size committed to the grown size' );
+
+    eval { $P->volume_resize( {}, 'store1', $name, 1 << 30, 0 ) };
+    like( $@, qr/cannot shrink/, 'shrink refused' );
+};
+
+subtest 'qemu_blockdev_options + volume_size_info' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 906, 'raw', undef, 1024 * 1024 );
+
+    my $bd = $P->qemu_blockdev_options( {}, 'store1', $name, undef, {} );
+    is( $bd->{driver}, 'host_device', 'host_device driver (raw block)' );
+    like( $bd->{filename}, qr{^/dev/mapper/3}, 'absolute dm path' );
+
+    my ( $size, $fmt, $used, $parent ) = $P->volume_size_info( {}, 'store1', $name );
+    is( $size, 1024 * 1024 * 1024, 'size from registry' );
+    is( $fmt,  'raw', 'format raw' );
+    is( $used, $size, 'fully provisioned: used == size' );
 };
 
 done_testing();

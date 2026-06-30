@@ -364,6 +364,117 @@ sub path {
     return $class->filesystem_path( $scfg, $volname, $storeid, $snapname );
 }
 
+sub free_image {
+    my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ( $backend_id, $meta ) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    # Refuse to delete a protected volume (#15) — cleared via update_volume_attribute.
+    die "cannot delete '$volname': it is marked protected; clear the protected flag first\n"
+        if $meta->{protected};
+
+    # Refuse while linked clones (CoW children) still depend on this volume as their
+    # source — deleting it would corrupt them.
+    my $deps = $reg->find_dependents($volname);
+    die "cannot delete '$volname': linked clone(s) depend on it: " . join( ', ', sort @$deps ) . "\n"
+        if @$deps;
+
+    # §7 destructive-op fence (registry membership is primary — we looked it up; a
+    # vendor MAY add a stricter check, e.g. Hitachi ldev_range). Fail fast.
+    $class->safe_delete_precheck( $scfg, $backend_id )
+        or die "refusing to free '$volname' (backend '$backend_id'): failed the safe-delete precheck\n";
+
+    my $d = $class->_driver( $storeid, $scfg );
+
+    # Delete this volume's own snapshot pairs first (capability-gated). NOTE: the
+    # linked-clone P-VOL pair release (#23 — when THIS volume is a clone S-VOL) is
+    # wired with clone_image in the snapshot/clone slice (4D).
+    if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'snapshot', 'single' ) ) {
+        eval {
+            for my $s ( @{ $d->list_snapshots($backend_id) } ) {
+                $d->delete_snapshot( $s->{snap_id} );
+            }
+        };
+        warn "FCLU: snapshot cleanup warning: $@" if $@;
+    }
+
+    # Tear the host side down (detach the device + unmap THIS node) before deleting
+    # on the array — reuses the deactivate path (idempotent).
+    $class->deactivate_volume( $storeid, $scfg, $volname );
+
+    $d->delete_lu($backend_id);
+    $reg->unregister($volname);
+
+    return undef;
+}
+
+sub volume_resize {
+    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ( $backend_id, $meta ) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $d = $class->_driver( $storeid, $scfg );
+
+    # Block-storage resize is grow-only.
+    my $cur = $d->get_lu($backend_id);
+    die "cannot shrink volume '$volname'\n" if $size < $cur->{size_bytes};
+
+    my $identity = $meta->{identity};
+    my $conn     = $class->_connector;
+
+    # Flush host buffers before the expand (safety for a running guest).
+    if ( $running && $identity ) {
+        eval { $conn->flush($identity) };
+        warn "FCLU: pre-resize flush warning: $@" if $@;
+    }
+
+    # Grow on the array, then resize the multipath device on the host.
+    $d->resize_lu( $backend_id, $size );
+    if ($identity) {
+        eval { $conn->resize($identity) };
+        warn "FCLU: host-side resize warning: $@" if $@;
+    }
+
+    # Commit the real (post-grow) size to the registry.
+    my $grown = $d->get_lu($backend_id);
+    $reg->update_meta( $volname, size_mb => ceil( $grown->{size_bytes} / ( 1024 * 1024 ) ) );
+
+    return 1;
+}
+
+# PVE 9 -blockdev attachment (APIVER 14, #14): our volumes are always raw, fully
+# provisioned block devices (/dev/mapper/<wwid>), so declare host_device
+# unconditionally — bypassing the inherited path()+stat() qcow2-chain heuristic
+# that does not apply to a raw block volume.
+sub qemu_blockdev_options {
+    my ($class, $scfg, $storeid, $volname, $machine_version, $options) = @_;
+
+    my ($path) = $class->path( $scfg, $volname, $storeid, $options->{'snapshot-name'} );
+    die "qemu_blockdev_options: expected an absolute device path, got "
+        . ( defined($path) ? "'$path'" : 'undef' ) . "\n"
+        if !defined($path) || $path !~ m{^/};
+
+    return { driver => 'host_device', filename => $path };
+}
+
+# Size straight from the registry instead of shelling out to qemu-img on a raw
+# block device. A raw block volume is fully provisioned: used == size.
+sub volume_size_info {
+    my ($class, $scfg, $storeid, $volname, $timeout) = @_;
+
+    my ( $backend_id, $meta ) = $class->_registry($storeid)->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $size   = ( $meta->{size_mb} || 0 ) * 1024 * 1024;
+    my $parent = $meta->{parent_volname} ? "$storeid:$meta->{parent_volname}" : undef;
+
+    return wantarray ? ( $size, 'raw', $size, $parent ) : $size;
+}
+
 # ── Volume name parsing (§7, vendor-neutral) ──
 
 sub vmid_from_volname {

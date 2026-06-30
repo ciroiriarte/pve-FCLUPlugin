@@ -110,10 +110,16 @@ a time.
       Vendor hooks added: `_alloc_backend_id` (default undef→auto-assign),
       `safe_delete_precheck` (§7 fence, default allow), `_qos_from_scfg`,
       `_make_label` (length from driver profile). Test: `t/unit/plugin.t` (fake
-      driver + fake connector). **Deferred:** `free_image` (joins the snapshot
-      slice — shares teardown + snapshot cleanup + the safe-delete fence),
-      snapshot/clone orchestration, `volume_size_info`/`volume_resize`,
-      `qemu_blockdev_options`, `volume_export`/`import`.
+      driver + fake connector). **Slice 4C done:** `free_image` (guards: not-found
+      / protected (#15) / linked-clone dependents → the §7 `safe_delete_precheck`
+      FENCE, now wired → capability-gated snapshot cleanup → `deactivate_volume`
+      host teardown → driver `delete_lu` → unregister; the #23 clone-pair release
+      is deferred to 4D), `volume_resize` (shrink-guard → connector flush when
+      running → driver `resize_lu` → connector `resize` → commit real size),
+      `qemu_blockdev_options` (host_device, #14), `volume_size_info` (registry).
+      **Deferred (4D):** snapshot/clone orchestration (volume_snapshot/rollback/
+      info, clone_image incl the #24 host-context flow + #23 pair release,
+      create_base, `volume_export`/`import`, rename/manage/migrate/orphans).
 - [ ] Add profile detection + quirk handling behind the driver (§4); delete
       scattered platform/microcode conditionals.
 - [ ] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`
