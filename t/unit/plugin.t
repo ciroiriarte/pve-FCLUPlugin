@@ -310,7 +310,10 @@ subtest 'free_image refuses protected + dependents + fence' => sub {
     reg()->register( 'vm-904-disk-0', 'b904' );
     eval { T::FencedPlugin->free_image( 'store1', {}, 'vm-904-disk-0' ) };
     like( $@, qr/safe-delete precheck/, 'fence refusal blocks free before any destructive op' );
-    is( $T::FencedPlugin::FENCED_FAKE->{calls}{delete_lu}, undef, 'no delete_lu after a fence refusal' );
+    # The fence must gate before ANY destructive op, not just delete_lu.
+    is( $T::FencedPlugin::FENCED_FAKE->{calls}{delete_lu},      undef, 'no delete_lu after a fence refusal' );
+    is( $T::FencedPlugin::FENCED_FAKE->{calls}{list_snapshots}, undef, 'no snapshot touch after a fence refusal' );
+    is( $T::FencedPlugin::FENCED_FAKE->{calls}{unpublish_lu},   undef, 'no host teardown after a fence refusal' );
 };
 
 subtest 'volume_resize grows + commits; rejects shrink' => sub {
