@@ -5,9 +5,12 @@ use warnings;
 
 use base qw(PVE::Storage::Plugin);
 
+use POSIX qw(ceil);
+
 use PVE::Storage::FCLU::Registry;
 use PVE::Storage::FCLU::Credentials;
 use PVE::Storage::FCLU::Capabilities;
+use PVE::Storage::FCLU::Label;
 
 # The generic, vendor-neutral PVE Storage plugin base (ARCHITECTURE.md §5/§7).
 # Almost every method body lives here; a per-vendor subclass is a thin shim that
@@ -148,6 +151,204 @@ sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
     my ( $total, $free, $used ) = $class->_driver( $storeid, $scfg )->storage_status;
     return ( $total, $free, $used, 1 );
+}
+
+# ── Volume lifecycle: provision + map (§5/§7) ──
+#
+# alloc creates the array LU and commits it to the registry LAST (so a mid-flight
+# failure rolls back cleanly); the host mapping is deferred to activate_volume,
+# which PVE calls before any use. activate publishes the LU to THIS node (driver)
+# then attaches the multipath device (connector) by the driver-reported canonical
+# identity — no host-side WWID synthesis. deactivate is the strict reverse: tear
+# the host device down FIRST, then unmap on the array.
+
+# Vendor hooks (overridable by the subclass) ----------------------------------
+
+# Allocate the backend id the driver should create (Hitachi: next free id in
+# ldev_range). Default: undef => let the array auto-assign (§12.2).
+sub _alloc_backend_id { return undef }
+
+# Destructive-op safety fence (§7): may we unmap/delete this backend id? The
+# registry membership is the primary fence (free_image looks the volume up first);
+# a vendor MAY add a stricter check (Hitachi: ldev_range). Default: allow.
+sub safe_delete_precheck { return 1 }
+
+# Map QoS storage.cfg knobs to the driver's qos hash (generic field names).
+sub _qos_from_scfg {
+    my ($class, $scfg) = @_;
+    my %qos;
+    $qos{upper_iops}        = $scfg->{qos_upper_iops} if $scfg->{qos_upper_iops};
+    $qos{upper_mbps}        = $scfg->{qos_upper_mbps} if $scfg->{qos_upper_mbps};
+    $qos{lower_iops}        = $scfg->{qos_lower_iops} if $scfg->{qos_lower_iops};
+    $qos{lower_mbps}        = $scfg->{qos_lower_mbps} if $scfg->{qos_lower_mbps};
+    $qos{response_priority} = $scfg->{qos_priority}   if $scfg->{qos_priority};
+    return \%qos;
+}
+
+# Ownership label, clamped to the driver's advertised max length (§7 — not a
+# hardcoded 32 in the core; the constraint comes from the driver profile).
+sub _make_label {
+    my ($class, $storeid, $volname, $driver) = @_;
+    my $max = $driver->detect_profile->{max_label_len};
+    return PVE::Storage::FCLU::Label->make_label( $storeid, $volname, $max );
+}
+
+# Seams: the host connector and this node's name (overridable in tests).
+sub _connector { return $_[0]->connector_class->new }
+
+sub _nodename {
+    my ($class) = @_;
+    my $n = eval { require PVE::INotify; PVE::INotify::nodename() };
+    die "cannot determine the local PVE node name\n" unless defined $n && length $n;
+    return $n;
+}
+
+# Resolve (volname, optional snapname) to its backend id + entry. $mode 'die'
+# raises on a missing volume; 'soft' returns () (idempotent teardown path).
+sub _resolve_backend {
+    my ($class, $storeid, $scfg, $volname, $snapname, $mode) = @_;
+    my ( $backend_id, $entry ) = $class->_registry($storeid)->lookup($volname);
+
+    if ($snapname) {
+        # Snapshot S-VOL resolution lands with the snapshot slice; for now a
+        # snapshot's own backend id is read from the snapshot subregistry if present.
+        my $snap = $class->_registry($storeid)->lookup_snapshot( $volname, $snapname );
+        $backend_id = $snap->{svol} if $snap && defined $snap->{svol};
+    }
+
+    if ( !defined $backend_id ) {
+        return () if ( $mode // 'die' ) eq 'soft';
+        die "volume '$volname'" . ( $snapname ? "\@$snapname" : '' ) . " not found in registry\n";
+    }
+    return ( $backend_id, $entry );
+}
+
+sub alloc_image {
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+    die "unsupported format '$fmt'\n" if $fmt && $fmt ne 'raw';
+
+    my $reg = $class->_registry($storeid);
+
+    # Reserve a unique name under the cluster lock unless PVE supplied one; reject
+    # an explicit name that already maps to a backend (never double-create).
+    my $reserved = 0;
+    if ( !$name ) {
+        $name = $reg->reserve_volname($vmid);
+        $reserved = 1;
+    } else {
+        $class->parse_volname($name);   # validate shape
+        die "volume '$name' already exists in registry\n" if defined $reg->lookup($name);
+    }
+
+    my $size_bytes = ( $size || 0 ) * 1024;   # PVE size is KiB; the driver clamps to its min
+    my $d = $class->_driver( $storeid, $scfg );
+
+    my ( $backend_id, $committed ) = ( undef, 0 );
+    eval {
+        my %opts = ( size_bytes => $size_bytes, pool_ref => $scfg->{pool_id} );
+        my $rid = $class->_alloc_backend_id( $storeid, $scfg, $d );
+        $opts{requested_id} = $rid if defined $rid;
+        $backend_id = $d->create_lu(%opts);
+
+        $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $name, $d ) );
+
+        # QoS is best-effort: a limit-set failure must not fail provisioning.
+        my $qos = $class->_qos_from_scfg($scfg);
+        if (%$qos) {
+            eval { $d->set_lu_qos( $backend_id, $qos ) };
+            warn "FCLU: QoS application warning: $@" if $@;
+        }
+
+        # Read the real (possibly min-clamped) size + canonical identity once, then
+        # commit to the registry LAST — the volume is now real and discoverable.
+        my $lu = $d->get_lu($backend_id);
+        $reg->register( $name, $backend_id,
+            identity => $lu->{identity},
+            size_mb  => ceil( $lu->{size_bytes} / ( 1024 * 1024 ) ),
+            pool_ref => $lu->{pool_ref},
+        );
+        $committed = 1;
+    };
+    if ( my $err = $@ ) {
+        eval { $d->delete_lu($backend_id) } if defined $backend_id;
+        eval { $reg->unregister($name) } if $reserved && !$committed;
+        die "failed to allocate volume '$name': $err";
+    }
+
+    return $name;
+}
+
+sub activate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($backend_id) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'die' );
+
+    my $d    = $class->_driver( $storeid, $scfg );
+    my $conn = $class->_connector;
+    my %hctx = %{ $conn->host_context( hostname => $class->_nodename ) };
+
+    # Ensure host-object/group setup, then map THIS node (both idempotent, §12.2).
+    $d->ensure_host_access(%hctx);
+    $d->publish_lu( $backend_id, %hctx );
+
+    # Attach the multipath device by the array-reported canonical identity (§3).
+    $conn->attach( $d->get_lu_identity($backend_id) );
+    return 1;
+}
+
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($backend_id) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'soft' );
+    return 1 unless defined $backend_id;
+
+    my $d    = $class->_driver( $storeid, $scfg );
+    my $conn = $class->_connector;
+
+    # Host side FIRST (flush + remove the multipath/SCSI device) so the array does
+    # not refuse the unmap with "the LU is executing host I/O", then unmap THIS
+    # node only (§12.2 live-migration rule).
+    my $identity = eval { $d->get_lu_identity($backend_id) };
+    eval { $conn->detach($identity) } if $identity;
+    warn "FCLU: device detach warning: $@" if $@;
+
+    my %hctx = %{ $conn->host_context( hostname => $class->_nodename ) };
+    eval { $d->unpublish_lu( $backend_id, %hctx ) };
+    warn "FCLU: unmap warning: $@" if $@;
+
+    return 1;
+}
+
+# Explicit map/unmap hooks (PVE 8+): the volume is a real block device, so map ==
+# activate + return the dm path; unmap == deactivate. Idempotent.
+sub map_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $hints) = @_;
+    $class->activate_volume( $storeid, $scfg, $volname, $snapname );
+    my ($path) = $class->filesystem_path( $scfg, $volname, $storeid, $snapname );
+    return $path;
+}
+
+sub unmap_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname) = @_;
+    $class->deactivate_volume( $storeid, $scfg, $volname, $snapname );
+    return 1;
+}
+
+# Canonical identity -> /dev/mapper path. Reads the identity recorded at alloc
+# (registry) so it needs no array session. PVE contract: the 3rd element is the
+# volume TYPE (vtype), not the format.
+sub filesystem_path {
+    my ($class, $scfg, $volname, $storeid, $snapname) = @_;
+    my ( $backend_id, $entry ) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'die' );
+
+    my $identity = $entry->{identity};
+    die "volume '$volname' has no recorded device identity\n" unless $identity;
+    my $path = $class->_connector->device_path($identity);
+
+    return wantarray ? ( $path, vmid_from_volname($volname), 'images' ) : $path;
+}
+
+sub path {
+    my ($class, $scfg, $volname, $storeid, $snapname) = @_;
+    return $class->filesystem_path( $scfg, $volname, $storeid, $snapname );
 }
 
 # ── Volume name parsing (§7, vendor-neutral) ──

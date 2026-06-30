@@ -98,8 +98,22 @@ a time.
       safety FENCE §7), `activate`/`deactivate_volume` map/unmap orchestration,
       snapshot/clone orchestration (incl the #24 linked-clone assign flow),
       `volume_export`/`import`, `create_base`/`rename`/`manage`/`migrate`/orphans.
-- [ ] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
+- [~] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
       one operation at a time, swapping direct REST calls for driver-contract calls.
+      **Slice 4B done:** the provision+map lifecycle — `alloc_image` (reserve →
+      driver `create_lu` (+`requested_id` from the `_alloc_backend_id` vendor hook)
+      → `set_lu_label` → best-effort `set_lu_qos` → register identity/size LAST,
+      with rollback), `activate_volume` (driver `ensure_host_access`+`publish_lu` →
+      connector `attach` by canonical identity), `deactivate_volume` (connector
+      `detach` first → driver `unpublish_lu`), `map`/`unmap_volume`,
+      `filesystem_path`/`path` (identity from the registry, no array session).
+      Vendor hooks added: `_alloc_backend_id` (default undef→auto-assign),
+      `safe_delete_precheck` (§7 fence, default allow), `_qos_from_scfg`,
+      `_make_label` (length from driver profile). Test: `t/unit/plugin.t` (fake
+      driver + fake connector). **Deferred:** `free_image` (joins the snapshot
+      slice — shares teardown + snapshot cleanup + the safe-delete fence),
+      snapshot/clone orchestration, `volume_size_info`/`volume_resize`,
+      `qemu_blockdev_options`, `volume_export`/`import`.
 - [ ] Add profile detection + quirk handling behind the driver (§4); delete
       scattered platform/microcode conditionals.
 - [ ] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`
