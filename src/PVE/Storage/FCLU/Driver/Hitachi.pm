@@ -86,8 +86,10 @@ sub new {
         # (they were scfg fields in the reference plugin).
         array_ports       => _as_list( $opts{array_ports} ),
         host_mode         => $opts{host_mode} // 'LINUX/IRIX',
-        host_mode_options => _as_list(
-            defined $opts{host_mode_options} ? $opts{host_mode_options} : '2,22,25,68' ),
+        # Numeric-only (HMO ids), mirroring the reference's grep — a malformed
+        # token must never reach the array (where int() would coerce it to 0).
+        host_mode_options => [ grep { /^\d+$/ } @{ _as_list(
+            defined $opts{host_mode_options} ? $opts{host_mode_options} : '2,22,25,68' ) } ],
         skip_unmap_io_check => $opts{skip_unmap_io_check} ? 1 : 0,
     }, $class;
 
@@ -513,6 +515,7 @@ sub unpublish_lu {
 
     # Remove ONLY this node's mapping (the host group matched by the node's WWNs);
     # other nodes' host groups are left intact (§12.2 live-migration rule).
+    my ( $attempted, $failed, $last_err ) = ( 0, 0, undef );
     for my $port ( @{ $self->{array_ports} } ) {
         my $hg = $self->_find_node_hg( $port, $wwns );
         next unless $hg;
@@ -522,12 +525,23 @@ sub unpublish_lu {
                 ldev_id => $backend_id );
         } );
         for my $l (@$luns) {
-            eval { $self->{rest}->unmap_lun( $l->{lunId} ) };
-            warn "FCLU Hitachi: unmap warning (lun $l->{lunId}): $@" if $@;
+            $attempted++;
+            unless ( eval { $self->{rest}->unmap_lun( $l->{lunId} ); 1 } ) {
+                $failed++;
+                $last_err = $@;
+                warn "FCLU Hitachi: unmap warning (lun $l->{lunId}): $@";
+            }
         }
     }
 
-    return 1;   # idempotent: no group/no luns => success
+    # If there were paths to remove and EVERY unmap failed, teardown made no
+    # progress — surface the (classified) cause so the core can retry/compensate
+    # (§12.4) instead of falsely reporting success. A partial failure stays a
+    # warn-only success, backstopped by list_lu_mappings at delete time.
+    die $self->_translate_rest_error($last_err)
+        if $attempted > 0 && $failed == $attempted;
+
+    return 1;   # idempotent: no group/no luns, or progress made => success
 }
 
 # AUTHORITATIVE per-LU mapping list (§2/§12.3): read from get_ldev->{ports}, NOT a

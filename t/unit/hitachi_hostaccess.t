@@ -211,6 +211,38 @@ subtest 'list_lu_mappings is authoritative from get_ldev->{ports}' => sub {
     is( $err->code, 'not_found', 'missing ldev => not_found' );
 };
 
+subtest 'list_lu_mappings never DROPS a mapping when the group name is unresolved' => sub {
+    # SAFETY: the sole authority for safe-unmap must not hide a node. Craft a port
+    # entry whose host group cannot be name-resolved (no hg record, get_host_group
+    # returns undef) — the mapping must still surface, keyed by the composite id.
+    my $f = FakeRest->new;
+    $f->{ldevs}{'77'} = 1;
+    push @{ $f->{luns} },
+        { lunId => 'L9', portId => 'CL1-A', hostGroupNumber => 5, ldevId => '77', lun => 3 };
+    my $d = drv($f);
+
+    my $maps = $d->list_lu_mappings('77');
+    is( scalar @$maps, 1, 'the unresolved mapping is still reported (not dropped)' );
+    is( $maps->[0]{access_ref}, 'CL1-A,5', 'falls back to the composite port,hgnum id' );
+    is( $maps->[0]{hostname},   'CL1-A,5', 'hostname falls back to the raw key (visible to safe-unmap)' );
+};
+
+subtest 'unpublish_lu surfaces the cause when EVERY unmap fails (§12.4)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->publish_lu( '42', ctx('node-a') );
+
+    # Make every unmap fail with a retryable array-busy.
+    no warnings 'redefine';
+    local *FakeRest::unmap_lun = sub { die "API request failed: DELETE /luns/x -> 503 Service Unavailable\n" };
+    local $SIG{__WARN__} = sub { };
+
+    my $err;
+    eval { $d->unpublish_lu( '42', ctx('node-a') ); 1 } or $err = $@;
+    isa_ok( $err, 'PVE::Storage::FCLU::Error', 'all-unmap-fail' );
+    is( $err->code, 'array_busy', 'classified from the underlying cause (retryable)' );
+};
+
 subtest 'target_ports surfaces configured ports (WWPN deferred to fabric §14)' => sub {
     my $d = drv( FakeRest->new, array_ports => [ 'CL1-A', 'CL2-A' ] );
     is_deeply( $d->target_ports, [ { port_id => 'CL1-A' }, { port_id => 'CL2-A' } ],
