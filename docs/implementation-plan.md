@@ -50,8 +50,19 @@ a time.
       (§12.1). `_wwid_from_identity` is the single identity→wwid translation.
       Synthesis-as-fallback is deferred to `Driver::Hitachi` (a private driver
       concern, not the host layer). Tests: `t/unit/{host_connector,fcmultipath}.t`.
-- [ ] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
-      the contract; transport untouched.
+- [~] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
+      the contract; transport untouched. **Slice A done:** transport vendored
+      byte-faithful (`Driver/Hitachi/RestClient.pm`, pkg rename only); driver spine
+      (`Driver/Hitachi.pm`): session, per-platform Profile incl the Ops Center CM
+      (23451) vs embedded GUM (443) port split (§4), `capabilities` (§6), the §13
+      error-translation boundary (RestClient bare-string die → classified
+      `FCLU::Error`), and the LU lifecycle/introspection/identity normalized to
+      §12.1 with §12.2 idempotency. Tests: `hitachi_restclient.t`,
+      `hitachi_driver.t`, `hitachi_lu.t`. **Deferred (slice B/C):** host-access
+      (ensure_host_access/publish/unpublish/list_lu_mappings/target_ports + the
+      host-group/HMO migration from `HitachiBlockPlugin.pm:1326-1505`),
+      snapshots/clones (Thin Image), and the stateful-fake `contract_hitachi.t`
+      parametrizing `FCLU::ContractTest`.
 - [ ] Introduce `FCLU::Plugin`; move read-only/common methods first
       (`status`, `list_images`, `volume_size_info`, shared `parse_volname`).
 - [ ] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
