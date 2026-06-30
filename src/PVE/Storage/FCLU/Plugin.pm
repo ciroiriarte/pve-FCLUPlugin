@@ -124,6 +124,8 @@ sub _driver {
 
 sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
+    # Tear down any stale cached session before replacing it (always-teardown).
+    if ( my $old = delete $DRIVERS{$storeid} ) { eval { $old->disconnect } }
     my $d = $class->_build_driver( $storeid, $scfg );
     $d->connect;
     $DRIVERS{$storeid} = $d;

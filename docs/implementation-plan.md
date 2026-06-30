@@ -87,8 +87,14 @@ a time.
       cloudinit-aware), `volume_has_feature` (role table), `get`/`update_volume_attribute`
       + notes (registry-backed), `list_images`, `status` (driver `storage_status`),
       `activate`/`deactivate_storage` (driver connect/disconnect). Tested under
-      BEGIN-stubbed PVE modules + a fake driver (`t/unit/plugin.t`). **Deferred
-      (later step-4 slices):** `alloc_image`/`free_image` (+ the core `ldev_range`
+      BEGIN-stubbed PVE modules + a fake driver (`t/unit/plugin.t`). **Slice-4A
+      follow-ups to wire in a later slice (architect review):** gate
+      `volume_has_feature`'s `snapshot`/`clone` on the driver `capabilities()`
+      (§6, via `Capabilities::pve_feature`) so a driver lacking a feature fails
+      soft — keep host/registry features (copy/sparseinit/template/rename/resize)
+      on the role table; cache `$scfg` alongside the cached driver (the reference's
+      `%_client_scfg`, #13) once `_driver` gets callers PVE may invoke without
+      `$scfg`. **Deferred (later step-4 slices):** `alloc_image`/`free_image` (+ the core `ldev_range`
       safety FENCE §7), `activate`/`deactivate_volume` map/unmap orchestration,
       snapshot/clone orchestration (incl the #24 linked-clone assign flow),
       `volume_export`/`import`, `create_base`/`rename`/`manage`/`migrate`/orphans.
