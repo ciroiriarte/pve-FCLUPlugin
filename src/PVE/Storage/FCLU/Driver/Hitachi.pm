@@ -80,6 +80,7 @@ sub new {
         platform => $platform,
         profile  => undef,                 # computed lazily / by detect_profile
         pool_id  => $opts{pool_id},        # the configured DP pool ref
+        snap_pool_id => $opts{snap_pool_id} // $opts{pool_id},   # Thin Image snapshot-data pool
         rest     => $opts{rest},           # dependency-injected for tests
         # Host-access config (§2). The array FC ports the per-node host groups live
         # on, and the host-mode knobs — all Hitachi-specific, hence driver-side
@@ -141,7 +142,7 @@ sub capabilities {
         copy     => { full => $c->{clone} ? 1 : 0, from_snapshot => 1, from_base => 1 },
         qos      => { per_lu => $c->{qos} ? 1 : 0 },
         resize   => { grow_online => 1, shrink => 0 },
-        transfer => { import => 0, migrate_pool => 1 },
+        transfer => { import => 0, migrate_pool => 0 },   # migrate_lu not implemented yet
         replication => {},   # gated behind the optional Replication mixin (§8)
     } );
 }
@@ -393,6 +394,217 @@ sub storage_status {
     $free = 0 if $free < 0;
 
     return ( $total, $free, $used );
+}
+
+# ── Snapshots / clones / QoS (§2, capability-gated) ──
+#
+# Thin Image (snapshots/linked-clone) and array QoS. Snapshots are array pairs
+# identified by an array-assigned snapshotId; the driver resolves a freshly-created
+# pair's id via a before/after list diff (the create job's resource id is not a
+# portable handle). The Hitachi #22 quirk (split/restore reject operationType) lives
+# inside the vendored RestClient, so the driver just calls split/restore.
+
+sub _normalize_snap {
+    my ($self, $s, $parent) = @_;
+    return {
+        snap_id           => "$s->{snapshotId}",
+        parent_backend_id => "$parent",
+        # Thin Image pairs carry no portable creation timestamp; the registry tracks
+        # it. Present (per §12.1) but may be undef.
+        created => $s->{createTime},
+        meta    => {
+            group  => $s->{snapshotGroupName},
+            status => $s->{status},
+            ( defined $s->{svolLdevId} ? ( svol => "$s->{svolLdevId}" ) : () ),
+        },
+    };
+}
+
+# Create one Thin Image pair on $pvol and return the new RAW snapshot object,
+# resolved by diffing the pvol's pair list before/after.
+sub _create_pair {
+    my ($self, $pvol, %opts) = @_;
+    $self->_err( 'invalid', 'no snap_pool_id configured' )
+        unless defined $self->{snap_pool_id};
+
+    my $before = $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $pvol ) } );
+    my %had = map {; "$_->{snapshotId}" => 1 } @$before;   # leading ; forces a block, not a hashref
+
+    $self->_call( sub {
+        $self->{rest}->create_snapshot(
+            pvol_ldev_id   => $pvol,
+            snap_pool_id   => $self->{snap_pool_id},
+            snapshot_group => $opts{snapshot_group} // 'pve_snap',
+            ( $opts{is_consistency_group} ? ( is_consistency_group => 1 ) : () ),
+        );
+    } );
+
+    my $after = $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $pvol ) } );
+    my ($new) = grep { !$had{"$_->{snapshotId}"} } @$after;
+    $self->_err( 'internal', "snapshot created on $pvol but not found in listing" )
+        unless $new;
+    return $new;
+}
+
+sub create_snapshot {
+    my ($self, $backend_id, %args) = @_;
+
+    # Re-assert (§12.2): a known snap_id already on this pvol is returned as success.
+    if ( defined $args{snap_id} ) {
+        my $snaps = $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $backend_id ) } );
+        my ($ex) = grep { "$_->{snapshotId}" eq "$args{snap_id}" } @$snaps;
+        return $self->_normalize_snap( $ex, $backend_id ) if $ex;
+    }
+
+    return $self->_normalize_snap(
+        $self->_create_pair( $backend_id, snapshot_group => $args{snapshot_group} ),
+        $backend_id );
+}
+
+sub delete_snapshot {
+    my ($self, $snap_id) = @_;
+    eval { $self->_call( sub { $self->{rest}->delete_snapshot($snap_id) } ); 1 }
+        and return 1;
+    my $e = $@;
+    return 1 if $self->_is_not_found($e);   # idempotent teardown (§12.2)
+    die $e;
+}
+
+sub restore_snapshot {
+    my ($self, $snap_id) = @_;
+
+    # Reverse-copy S-VOL -> P-VOL, then RE-SPLIT so the snapshot stays a usable,
+    # re-restorable PSUS pair (faithful to the reference #12 rollback: a restore
+    # left un-split makes a later rollback to the same snapshot a silent no-op).
+    $self->_call( sub { $self->{rest}->restore_snapshot($snap_id) } );
+    $self->_wait_snap_status( $snap_id, 'PAIR' )
+        or warn "FCLU Hitachi: restore of '$snap_id' did not settle to PAIR in time\n";
+
+    eval {
+        $self->_call( sub { $self->{rest}->split_snapshot($snap_id) } );
+        $self->_wait_snap_status( $snap_id, 'PSUS' )
+            or warn "FCLU Hitachi: re-split of '$snap_id' did not settle to PSUS in time\n";
+    };
+    warn "FCLU Hitachi: re-split after restore warning ($snap_id): $@" if $@;
+
+    return 1;
+}
+
+sub list_snapshots {
+    my ($self, $backend_id) = @_;
+    my $snaps = $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $backend_id ) } );
+    return [ map { $self->_normalize_snap( $_, $backend_id ) } @$snaps ];
+}
+
+sub create_cg_snapshot {
+    my ($self, $backend_ids, %args) = @_;
+    $self->_err( 'invalid', 'create_cg_snapshot needs an arrayref of backend_ids' )
+        unless ref $backend_ids eq 'ARRAY' && @$backend_ids;
+
+    # A consistency-group snapshot = one pair per LU sharing a group name with
+    # isConsistencyGroup set (the reference's CG approach).
+    my $group = $args{snapshot_group} // 'pve_cg';
+    my @out;
+    for my $bid (@$backend_ids) {
+        push @out, $self->_normalize_snap(
+            $self->_create_pair( $bid, snapshot_group => $group, is_consistency_group => 1 ),
+            $bid );
+    }
+    return \@out;
+}
+
+sub set_lu_qos {
+    my ($self, $backend_id, $qos) = @_;
+    $self->_err( 'invalid', 'qos must be a non-empty hashref' )
+        unless ref $qos eq 'HASH' && %$qos;
+    $self->_call( sub { $self->{rest}->set_ldev_qos( $backend_id, %$qos ) } );
+    return 1;
+}
+
+sub get_lu_qos {
+    my ($self, $backend_id) = @_;
+    return $self->_call( sub { $self->{rest}->get_ldev_qos($backend_id) } );
+}
+
+# Allocate an S-VOL ldev sized to $parent (exact block count) and return its id.
+sub _alloc_svol {
+    my ($self, $parent_ldev, %args) = @_;
+    my $blocks = $parent_ldev->{blockCapacity} // $parent_ldev->{numOfBlocks};
+    $self->_err( 'internal', 'parent ldev has no block capacity' ) unless defined $blocks;
+
+    my $res = $self->_call( sub {
+        $self->{rest}->create_ldev(
+            pool_id        => ( $args{pool_ref} // $self->{pool_id} ),
+            block_capacity => $blocks,
+            ( defined $args{requested_id} ? ( ldev_id => $args{requested_id} ) : () ),
+        );
+    } );
+    return defined $args{requested_id} ? "$args{requested_id}" : "$res->{resourceId}";
+}
+
+# Persistent CoW child — the PVE clone_image primitive (§6). Allocate an S-VOL and
+# bind it to the parent via an autoSplit Thin Image pair.
+#
+# REAL-ARRAY CAVEAT (#24): on E590H microcode the array rejects svolLdevId at pair
+# creation and requires the S-VOL to already have LU paths, so the production flow
+# is create-pair-without-svol -> map S-VOL -> assign_snapshot_volume. That needs a
+# host context the §2 create_linked_clone signature does not carry, so it is
+# orchestrated by FCLU::Plugin (which has it) using the RestClient's
+# assign_snapshot_volume; the driver here performs the array steps it can, and the
+# conformance simulator validates the contract shape.
+sub create_linked_clone {
+    my ($self, $backend_id, %args) = @_;
+    my $src = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
+    $self->_err( 'not_found', "no such ldev '$backend_id'" )
+        unless $self->_is_defined_ldev($src);
+
+    my $svol_id = $self->_alloc_svol( $src, %args );
+    $self->_call( sub {
+        $self->{rest}->create_snapshot(
+            pvol_ldev_id   => $backend_id,
+            snap_pool_id   => $self->{snap_pool_id},
+            svol_ldev_id   => $svol_id,
+            snapshot_group => $args{snapshot_group} // 'pve_clone',
+        );
+    } );
+    return $svol_id;
+}
+
+# Full (non-CoW) copy via clone_snapshot_to_ldev (isClone). Out-of-band / fclu-CLI
+# offload (§6), NOT wired to qm clone --full.
+sub create_full_clone {
+    my ($self, $backend_id, %args) = @_;
+    my $src = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
+    $self->_err( 'not_found', "no such ldev '$backend_id'" )
+        unless $self->_is_defined_ldev($src);
+
+    my $svol_id = $self->_alloc_svol( $src, %args );
+    $self->_call( sub {
+        $self->{rest}->clone_snapshot_to_ldev(
+            pvol_ldev_id   => $backend_id,
+            svol_ldev_id   => $svol_id,
+            snap_pool_id   => $self->{snap_pool_id},
+            snapshot_group => $args{snapshot_group} // 'pve_clone',
+        );
+    } );
+    return $svol_id;
+}
+
+# Bounded poll for a snapshot pair to reach $want status. interval<=0 probes once
+# (the test fast-path); returns 1 on convergence, 0 on timeout (caller warns).
+sub _wait_snap_status {
+    my ($self, $snap_id, $want) = @_;
+    my $budget   = $self->profile->{op_timeout_s} || 600;
+    my $interval = defined $self->{_snap_poll_interval} ? $self->{_snap_poll_interval} : 2;
+    my $elapsed  = 0;
+    while (1) {
+        my $s = eval { $self->{rest}->get_snapshot($snap_id) };
+        return 1 if ref $s eq 'HASH' && ( $s->{status} // '' ) eq $want;
+        last if $interval <= 0 || $elapsed >= $budget;
+        sleep($interval);
+        $elapsed += $interval;
+    }
+    return 0;
 }
 
 # ── Host access (§2) ──

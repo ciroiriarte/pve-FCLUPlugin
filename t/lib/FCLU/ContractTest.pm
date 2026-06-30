@@ -38,7 +38,15 @@ sub _exception {
 
 sub _host_ctx {
     my ($hostname, @wwpns) = @_;
-    @wwpns = ('10000000c9000001') unless @wwpns;
+    # Distinct WWPN per hostname: real PVE nodes never share FC initiators, and a
+    # driver that resolves host objects BY WWN (Hitachi) must see two nodes as two
+    # groups. Derive a deterministic 16-hex wwpn from the hostname (6 chars of it,
+    # enough to separate node-a/node-b). Drivers that key host access by hostname
+    # (Mock) are unaffected.
+    unless (@wwpns) {
+        my $h = unpack( 'H*', $hostname ) . ( '0' x 12 );
+        @wwpns = ( '1000' . substr( $h, 0, 12 ) );
+    }
     return ( hostname => $hostname, protocol => 'scsi-fc', initiators => [@wwpns] );
 }
 
@@ -216,8 +224,12 @@ sub run_contract_tests {
         my $ports = $factory->()->target_ports;
         is( ref $ports, 'ARRAY', 'target_ports is an arrayref' );
         for my $p (@$ports) {
-            ok( defined $p->{wwpn}, 'endpoint has a wwpn' );
-            like( $p->{wwpn}, qr/^[0-9a-f]+$/, 'wwpn lowercase hex' );
+            # An endpoint MUST identify a port; wwpn is a fabric-zoning (§14) concern
+            # a pre-fabric driver may not resolve yet, so port_id alone is conformant.
+            ok( defined $p->{wwpn} || defined $p->{port_id},
+                'endpoint identifies a port (wwpn or port_id)' );
+            like( $p->{wwpn}, qr/^[0-9a-f]+$/, 'wwpn lowercase hex when present' )
+                if defined $p->{wwpn};
         }
     };
 

@@ -50,8 +50,16 @@ a time.
       (§12.1). `_wwid_from_identity` is the single identity→wwid translation.
       Synthesis-as-fallback is deferred to `Driver::Hitachi` (a private driver
       concern, not the host layer). Tests: `t/unit/{host_connector,fcmultipath}.t`.
-- [~] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
-      the contract; transport untouched. **Slice A done:** transport vendored
+- [x] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
+      the contract; transport untouched. **COMPLETE (slices A+B+C).** Driver #1
+      now passes the parametrized §12.5 conformance suite (`contract_hitachi.t`
+      runs `FCLU::ContractTest` against the real driver backed by the stateful
+      `t/lib/FCLU/FakeHitachiRest.pm` simulator). Slice C added Thin Image
+      snapshots (create/delete/restore-with-re-split/list), CG snapshots,
+      linked/full clones, and QoS; `transfer.migrate_pool` left unadvertised until
+      `migrate_lu` lands; the real-array linked-clone S-VOL-assign-after-mapping
+      (#24) is Plugin-orchestrated. Tests: `hitachi_snapshots.t`,
+      `contract_hitachi.t`. **Slice A done:** transport vendored
       byte-faithful (`Driver/Hitachi/RestClient.pm`, pkg rename only); driver spine
       (`Driver/Hitachi.pm`): session, per-platform Profile incl the Ops Center CM
       (23451) vs embedded GUM (443) port split (§4), `capabilities` (§6), the §13
