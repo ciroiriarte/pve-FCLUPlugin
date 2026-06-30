@@ -81,6 +81,14 @@ sub new {
         profile  => undef,                 # computed lazily / by detect_profile
         pool_id  => $opts{pool_id},        # the configured DP pool ref
         rest     => $opts{rest},           # dependency-injected for tests
+        # Host-access config (§2). The array FC ports the per-node host groups live
+        # on, and the host-mode knobs — all Hitachi-specific, hence driver-side
+        # (they were scfg fields in the reference plugin).
+        array_ports       => _as_list( $opts{array_ports} ),
+        host_mode         => $opts{host_mode} // 'LINUX/IRIX',
+        host_mode_options => _as_list(
+            defined $opts{host_mode_options} ? $opts{host_mode_options} : '2,22,25,68' ),
+        skip_unmap_io_check => $opts{skip_unmap_io_check} ? 1 : 0,
     }, $class;
 
     # Build a real transport unless one was injected (tests inject a mock).
@@ -385,7 +393,216 @@ sub storage_status {
     return ( $total, $free, $used );
 }
 
+# ── Host access (§2) ──
+#
+# Migrated from the reference plugin's _ensure_host_groups / _map_lun_to_local /
+# _unmap_lun_from_local — Hitachi uses one Host Group named PVE_<hostname> per
+# configured FC port (WWNs + host-mode + HMO). The node's WWNs and hostname now
+# arrive in %host_ctx (the core no longer reaches into Multipath); the array ports
+# and host-mode knobs are driver config. Fatal RestClient failures translate to
+# FCLU::Error via _call; the additive reconcile steps stay best-effort (warn), as
+# in the reference, so a stray HMO/WWN hiccup never blocks activation.
+
+sub ensure_host_access {
+    my ($self, %ctx) = @_;
+    my $hostname = $self->_check_host_ctx(%ctx);
+    my $wwns     = $ctx{initiators};
+    my $hg_name  = "PVE_$hostname";
+
+    my @hmo = @{ $self->{host_mode_options} };
+    push @hmo, 91 if $self->{skip_unmap_io_check} && !grep { $_ == 91 } @hmo;
+
+    for my $port ( @{ $self->{array_ports} } ) {
+        # Idempotent: reuse an existing group (by our name, else by any of our
+        # WWNs); only create when truly absent, then re-look-up for the
+        # array-assigned hostGroupNumber.
+        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } );
+        if ( !$hg ) {
+            for my $wwn (@$wwns) {
+                $hg = $self->_call( sub { $self->{rest}->find_host_group_by_wwn( $port, $wwn ) } );
+                last if $hg;
+            }
+        }
+        if ( !$hg ) {
+            $self->_call( sub {
+                $self->{rest}->create_host_group(
+                    port_id => $port, host_group_name => $hg_name,
+                    host_mode => $self->{host_mode}, host_mode_options => \@hmo );
+            } );
+            $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } );
+            $self->_err( 'internal', "host group '$hg_name' not found on $port after creation" )
+                unless $hg;
+        }
+        my $hg_num = $hg->{hostGroupNumber};
+
+        # Reconcile host-mode options additively (best-effort) — only ADD missing
+        # options, never remove out-of-band ones; needed for groups predating an
+        # HMO change so UNMAP/discard gets enabled.
+        if (@hmo) {
+            eval {
+                my $info    = $self->{rest}->get_host_group("$port,$hg_num");
+                my @current = @{ $info->{hostModeOptions} || [] };
+                my %have    = map { $_ => 1 } @current;
+                if ( grep { !$have{$_} } @hmo ) {
+                    my @union = sort { $a <=> $b } keys %{ { map { $_ => 1 } ( @current, @hmo ) } };
+                    $self->{rest}->set_host_group_mode(
+                        host_group_id => "$port,$hg_num",
+                        host_mode => $self->{host_mode}, host_mode_options => \@union );
+                }
+            };
+            warn "FCLU Hitachi: HMO reconcile warning ($port,$hg_num): $@" if $@;
+        }
+
+        # Register any of our WWNs not already present (best-effort, idempotent).
+        my $existing = eval {
+            $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
+        } || [];
+        my %present = map { lc( $_->{hostWwn} ) => 1 } @$existing;
+        for my $wwn (@$wwns) {
+            next if $present{ lc $wwn };
+            eval {
+                $self->{rest}->add_wwn_to_host_group(
+                    port_id => $port, host_group_number => $hg_num, wwn => $wwn );
+            };
+            warn "FCLU Hitachi: WWN add warning ($port $wwn): $@" if $@;
+        }
+    }
+
+    return $hg_name;
+}
+
+sub publish_lu {
+    my ($self, $backend_id, %ctx) = @_;
+    my $hostname = $self->_check_host_ctx(%ctx);
+
+    # ensure_host_access is safe to call on every publish (§12.2) — the core holds
+    # no host-object state, the driver reconciles.
+    $self->ensure_host_access(%ctx);
+    my $wwns = $ctx{initiators};
+
+    my $lun;
+    for my $port ( @{ $self->{array_ports} } ) {
+        my $hg = $self->_find_node_hg( $port, $wwns );
+        next unless $hg;
+        my $hg_num = $hg->{hostGroupNumber};
+
+        my $luns = $self->_call( sub {
+            $self->{rest}->list_luns(
+                port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+        } );
+        if ( !@$luns ) {
+            $self->_call( sub {
+                $self->{rest}->map_lun(
+                    port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+            } );
+            $luns = $self->_call( sub {
+                $self->{rest}->list_luns(
+                    port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+            } );
+        }
+        $lun //= $luns->[0]{lun} if @$luns && defined $luns->[0]{lun};
+    }
+
+    return { hostname => $hostname, access_ref => "PVE_$hostname", lun => $lun };
+}
+
+sub unpublish_lu {
+    my ($self, $backend_id, %ctx) = @_;
+    my $hostname = $self->_check_host_ctx(%ctx);
+    my $wwns = $ctx{initiators};
+
+    # Remove ONLY this node's mapping (the host group matched by the node's WWNs);
+    # other nodes' host groups are left intact (§12.2 live-migration rule).
+    for my $port ( @{ $self->{array_ports} } ) {
+        my $hg = $self->_find_node_hg( $port, $wwns );
+        next unless $hg;
+        my $luns = $self->_call( sub {
+            $self->{rest}->list_luns(
+                port_id => $port, host_group_number => $hg->{hostGroupNumber},
+                ldev_id => $backend_id );
+        } );
+        for my $l (@$luns) {
+            eval { $self->{rest}->unmap_lun( $l->{lunId} ) };
+            warn "FCLU Hitachi: unmap warning (lun $l->{lunId}): $@" if $@;
+        }
+    }
+
+    return 1;   # idempotent: no group/no luns => success
+}
+
+# AUTHORITATIVE per-LU mapping list (§2/§12.3): read from get_ldev->{ports}, NOT a
+# host-group scan. Each port entry resolves to its host group name (carried on the
+# entry or fetched), and entries are folded into one Mapping descriptor per node.
+sub list_lu_mappings {
+    my ($self, $backend_id) = @_;
+    my $ldev = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
+    $self->_err( 'not_found', "no such ldev '$backend_id'" )
+        unless $self->_is_defined_ldev($ldev);
+
+    my $ports = $ldev->{ports} || [];
+    my %by_group;
+    for my $p (@$ports) {
+        my ( $pid, $hgn ) = ( $p->{portId}, $p->{hostGroupNumber} );
+        next unless defined $pid && defined $hgn;
+        my $key = "$pid,$hgn";
+
+        my $hgname = $p->{hostGroupName};
+        if ( !defined $hgname ) {
+            my $info = eval { $self->{rest}->get_host_group($key) };
+            $hgname = $info->{hostGroupName} if ref $info eq 'HASH';
+        }
+        $hgname //= $key;
+
+        my ($node) = $hgname =~ /^PVE_(.+)$/;
+        $node //= $hgname;   # non-PVE groups: surface the raw group name as the node key
+
+        $by_group{$hgname} //=
+            { hostname => $node, access_ref => $hgname, lun => $p->{lun} };
+    }
+
+    return [ map { $by_group{$_} } sort keys %by_group ];
+}
+
+# Array target ports for fabric zoning (§14). WWPN resolution needs a /ports REST
+# wrap that lands with the Fabric plane; until then we surface the configured port
+# ids without fabricating wwpn values.
+sub target_ports {
+    my ($self, %ctx) = @_;
+    return [ map { { port_id => $_ } } @{ $self->{array_ports} } ];
+}
+
 # ── Internal helpers ──
+
+# Normalize an arrayref-or-CSV config value to an arrayref of trimmed non-empty
+# tokens. A plain function (used in new() before the object exists).
+sub _as_list {
+    my ($v) = @_;
+    return []        unless defined $v;
+    return [ @$v ]   if ref $v eq 'ARRAY';
+    return [ grep { length } map { s/^\s+|\s+$//gr } split /,/, $v ];
+}
+
+sub _check_host_ctx {
+    my ($self, %ctx) = @_;
+    for my $k (qw(hostname protocol initiators)) {
+        $self->_err( 'invalid', "host_ctx missing '$k'" ) unless defined $ctx{$k};
+    }
+    $self->_err( 'invalid', "unsupported protocol '$ctx{protocol}'" )
+        unless $ctx{protocol} eq 'scsi-fc';
+    $self->_err( 'invalid', 'host_ctx initiators must be a non-empty arrayref' )
+        unless ref $ctx{initiators} eq 'ARRAY' && @{ $ctx{initiators} };
+    return $ctx{hostname};
+}
+
+# Find the node's host group on $port by any of its WWNs (translated _call).
+sub _find_node_hg {
+    my ($self, $port, $wwns) = @_;
+    for my $wwn (@$wwns) {
+        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_wwn( $port, $wwn ) } );
+        return $hg if $hg;
+    }
+    return undef;
+}
 
 sub _err {
     my ($self, $code, $message) = @_;
