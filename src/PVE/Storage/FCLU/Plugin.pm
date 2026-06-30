@@ -249,6 +249,7 @@ sub alloc_image {
         my $rid = $class->_alloc_backend_id( $storeid, $scfg, $d );
         $opts{requested_id} = $rid if defined $rid;
         $backend_id = $d->create_lu(%opts);
+        die "driver create_lu returned no backend_id\n" unless defined $backend_id;
 
         $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $name, $d ) );
 
@@ -290,14 +291,22 @@ sub activate_volume {
     $d->ensure_host_access(%hctx);
     $d->publish_lu( $backend_id, %hctx );
 
+    # Identity is MUST-be-set after publish_lu (§12.1). Persist it back to the
+    # registry so filesystem_path / deactivate_volume resolve the device with no
+    # array session — and so a driver whose NAA is only known POST-publish records
+    # it now (alloc-time identity may have been undef for such an array).
+    my $identity = $d->get_lu_identity($backend_id);
+    $class->_registry($storeid)->update_meta( $volname, identity => $identity )
+        if $identity && !$snapname;   # snapshot-S-VOL identity lands with the snapshot slice
+
     # Attach the multipath device by the array-reported canonical identity (§3).
-    $conn->attach( $d->get_lu_identity($backend_id) );
+    $conn->attach($identity);
     return 1;
 }
 
 sub deactivate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
-    my ($backend_id) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'soft' );
+    my ($backend_id, $entry) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'soft' );
     return 1 unless defined $backend_id;
 
     my $d    = $class->_driver( $storeid, $scfg );
@@ -305,8 +314,12 @@ sub deactivate_volume {
 
     # Host side FIRST (flush + remove the multipath/SCSI device) so the array does
     # not refuse the unmap with "the LU is executing host I/O", then unmap THIS
-    # node only (§12.2 live-migration rule).
-    my $identity = eval { $d->get_lu_identity($backend_id) };
+    # node only (§12.2 live-migration rule). Resolve the device identity from the
+    # REGISTRY (recorded at alloc), not a live array call — host teardown must work
+    # even when the array session is down (node fencing / array maintenance), which
+    # is exactly when it matters. (Snapshot-S-VOL identity lands with the snapshot
+    # slice via the snapshot subregistry.)
+    my $identity = $entry->{identity};
     eval { $conn->detach($identity) } if $identity;
     warn "FCLU: device detach warning: $@" if $@;
 

@@ -39,7 +39,7 @@ use PVE::Storage::FCLU::Plugin;
     }
     sub get_lu { my ( $s, $id ) = @_; $s->{lus}{$id} or die "API request failed: GET x -> 404\n"; return { %{ $s->{lus}{$id} } } }
     sub get_lu_identity { my ( $s, $id ) = @_; $s->{lus}{$id} or die "404\n"; return $s->{lus}{$id}{identity} }
-    sub set_lu_label { my ( $s, $id, $l ) = @_; $s->{calls}{set_lu_label}++; $s->{lus}{$id}{label} = $l if $s->{lus}{$id}; 1 }
+    sub set_lu_label { my ( $s, $id, $l ) = @_; $s->{calls}{set_lu_label}++; die "BOOM label\n" if $s->{fail_label}; $s->{lus}{$id}{label} = $l if $s->{lus}{$id}; 1 }
     sub set_lu_qos   { my ( $s ) = @_; $s->{calls}{set_lu_qos}++; 1 }
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
     sub ensure_host_access { my ( $s, %c ) = @_; $s->{calls}{ensure_host_access}++; "PVE_$c{hostname}" }
@@ -193,6 +193,19 @@ subtest 'alloc_image rolls back the array LU + reservation on failure' => sub {
     eval { $P->alloc_image( 'store1', { pool_id => '63' }, 999, 'raw', undef, 1024 ) };
     like( $@, qr/failed to allocate/, 'alloc failure surfaced' );
     is( reg()->lookup('vm-999-disk-1'), undef, 'name reservation rolled back' );
+};
+
+subtest 'alloc_image rolls back the ORPHAN LU on a post-create failure' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    $T::Plugin::FAKE->{fail_label} = 1;   # create_lu succeeds, then set_lu_label throws
+
+    eval { $P->alloc_image( 'store1', { pool_id => '63' }, 998, 'raw', undef, 1 << 30 ) };
+    like( $@, qr/failed to allocate/, 'alloc failure surfaced' );
+    is( $T::Plugin::FAKE->{calls}{create_lu}, 1, 'the LU was created' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'the orphan LU was deleted (rollback)' );
+    is_deeply( $T::Plugin::FAKE->{lus}, {}, 'no LU left on the array' );
+    is( reg()->lookup('vm-998-disk-1'), undef, 'name reservation rolled back' );
 };
 
 subtest 'activate_volume publishes + attaches; deactivate detaches + unpublishes' => sub {
