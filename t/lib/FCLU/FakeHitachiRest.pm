@@ -40,9 +40,10 @@ sub keepalive { $_[0]->_c('keepalive'); 1 }
 # ── ldev lifecycle ──
 sub create_ldev {
     my ($s, %o) = @_; $s->_c('create_ldev');
-    my $blocks =
-        defined $o{block_capacity} ? $o{block_capacity}
-      : ( ( $o{size_mb} // ( $o{byteFormatCapacity} =~ /^(\d+)/ ? $1 : 0 ) ) * MIB / 512 );
+    # The driver always passes size_mb (normal alloc) or block_capacity (clones).
+    my $blocks = defined $o{block_capacity}
+        ? $o{block_capacity}
+        : ( $o{size_mb} // 0 ) * MIB / 512;
     my $id = defined $o{ldev_id} ? "$o{ldev_id}" : '' . ( ++$s->{_ldev} );
     $s->{ldevs}{$id} = {
         ldevId => $id, blockCapacity => $blocks,
