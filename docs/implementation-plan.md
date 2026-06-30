@@ -36,8 +36,12 @@ Hitachi `Config.pm`).
 Each step keeps the (frozen) Hitachi plugin behaviourally green; seams move one at
 a time.
 
-- [ ] Extract state: `Config.pm` → `FCLU::Registry` + `FCLU::Credentials` +
-      `FCLU::Label` (no behaviour change).
+- [x] Extract state: `Config.pm` → `FCLU::Registry` + `FCLU::Credentials` +
+      `FCLU::Label` (vendor-neutral, generalized). `ldev_id`→opaque `backend_id`
+      (string identity), label `max_len` from the driver (no hardcoded 32),
+      `fclu-registry-<storeid>` lock domain, configurable `base_dir` for tests.
+      Hitachi-specific `platform_defaults`/`validate_config` deliberately NOT
+      moved — they stay in the driver. Tests: `t/unit/{credentials,registry,label}.t`.
 - [ ] Extract host side: `Multipath.pm` → `FCLU::Host::FCMultipath`; Hitachi WWID
       synthesis kept only as a private driver fallback during transition.
 - [ ] Wrap, don't rewrite: `RestClient.pm` → `FCLU::Driver::Hitachi` implementing
