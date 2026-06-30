@@ -123,6 +123,14 @@ subtest 'get_lu normalizes to the §12.1 descriptor' => sub {
     is( $lu->{identity}{ids}{naa}, '60060e8000abcd', 'naa lowercased from naaId' );
 };
 
+subtest 'identity emits canonical bare hex (strips page-83 prefixes)' => sub {
+    for my $raw ( 'naa.60060E8000ABCD', '0x60060e8000abcd', '60060E8000ABCD' ) {
+        my ( $d ) = mk( { get_ldev => { ldevId => 1, naaId => $raw } } );
+        is( $d->get_lu_identity('1')->{ids}{naa}, '60060e8000abcd',
+            "naaId '$raw' -> canonical bare hex" );
+    }
+};
+
 subtest 'get_lu / get_lu_identity raise not_found on absent or empty slot' => sub {
     my ( $d ) = mk( { get_ldev => { emulationType => 'NOT DEFINED', ldevId => 5 } } );
     my $err;
@@ -154,6 +162,16 @@ subtest 'storage_status returns bytes, with the E590H used-capacity fallback' =>
     my ( $d2 ) = mk( { get_pool => { totalPoolCapacity => 1000, availableVolumeCapacity => 600 } } );
     is_deeply( [ $d2->storage_status ], [ 1000 * MIB, 600 * MIB, 400 * MIB ],
         'used derived from availableVolumeCapacity when usedPoolCapacity absent' );
+
+    # Tier-3: usedCapacityRate percentage when neither absolute field is present.
+    my ( $d3 ) = mk( { get_pool => { totalPoolCapacity => 1000, usedCapacityRate => 40 } } );
+    is_deeply( [ $d3->storage_status ], [ 1000 * MIB, 600 * MIB, 400 * MIB ],
+        'used derived from usedCapacityRate (tier 3)' );
+
+    # Clamp: a quirky availableVolumeCapacity > total must not yield used<0/free>total.
+    my ( $d4 ) = mk( { get_pool => { totalPoolCapacity => 1000, availableVolumeCapacity => 1200 } } );
+    is_deeply( [ $d4->storage_status ], [ 1000 * MIB, 1000 * MIB, 0 ],
+        'over-report clamped: used floored at 0, free capped at total' );
 };
 
 subtest 'set_lu_label invokes the transport' => sub {

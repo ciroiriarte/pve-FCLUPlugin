@@ -360,16 +360,27 @@ sub storage_status {
 
     my $total = ( $pool->{totalPoolCapacity} || 0 ) * MIB;
     # usedPoolCapacity is absent on some microcode (E590H quirk
-    # used_pool_capacity_missing); fall back to total - availableVolumeCapacity.
+    # used_pool_capacity_missing). Mirror the reference's three derivation tiers:
+    #   1. usedPoolCapacity (direct, when present)
+    #   2. total - availableVolumeCapacity (documented free field; E590H path)
+    #   3. total * usedCapacityRate/100 (last-resort percentage)
     my $used;
     if ( defined $pool->{usedPoolCapacity} ) {
         $used = $pool->{usedPoolCapacity} * MIB;
     } elsif ( defined $pool->{availableVolumeCapacity} ) {
         $used = $total - $pool->{availableVolumeCapacity} * MIB;
+    } elsif ( defined $pool->{usedCapacityRate} ) {
+        $used = int( $total * $pool->{usedCapacityRate} / 100 );
     } else {
         $used = 0;
     }
+
+    # Clamp against quirky microcode values so the core never sees used>total or a
+    # negative free (matches the reference's defensive bounds).
+    $used = 0      if $used < 0;
+    $used = $total if $used > $total;
     my $free = $total - $used;
+    $free = 0 if $free < 0;
 
     return ( $total, $free, $used );
 }
@@ -413,13 +424,19 @@ sub _ldev_bytes {
 sub _ldev_identity {
     my ($self, $ldev) = @_;
     my $naa = $ldev->{naaId};
+    if ( defined $naa && length $naa ) {
+        # The driver is the single source of truth for identity (§12.1): emit the
+        # canonical bare lowercase hex, stripping any page-83 prefix the array
+        # reports (naa./0x), rather than leaning on the host connector to re-strip.
+        $naa =~ s/^naa\.//i;
+        $naa =~ s/^0x//i;
+        $naa = lc $naa;
+    } else {
+        $naa = undef;
+    }
     return {
         protocol => 'scsi-fc',
-        ids => {
-            naa  => ( defined $naa && length $naa ) ? lc($naa) : undef,
-            eui  => undef,
-            wwid => undef,
-        },
+        ids => { naa => $naa, eui => undef, wwid => undef },
     };
 }
 
