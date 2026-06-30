@@ -12,14 +12,24 @@ plugin. `Driver::Mock` + the parametrized contract suite become the definition o
 
 - [x] `FCLU::Error` — normalized error type, closed code vocabulary, default
       classification, admin-safe stringification (§13). Tests: `t/unit/error.t`.
-- [ ] `FCLU::Driver` — abstract array-backend contract: every §2 method present,
+- [x] `FCLU::Driver` — abstract array-backend contract: every §2 method present,
       `croak`-not-implemented by default; POD documents the §12 data shapes.
-- [ ] `FCLU::Capabilities` — normalize/merge the §6 capability object; the
-      `volume_has_feature` glue and "absent/unknown key ⇒ 0" rule.
-- [ ] `FCLU::Driver::Mock` — in-memory backend implementing the full v1 surface,
-      able to raise any error `code` on demand (§13.6) for retry/compensate tests.
-- [ ] Contract-test harness — one parametrized suite asserting the §12.2
-      idempotency/retry table and §12.1 data shapes against any driver.
+      `contract_methods`/`mandatory_methods`/`optional_methods` expose the canonical
+      surface. Tests: `t/unit/driver.t`.
+- [x] `FCLU::Capabilities` — normalize/merge the §6 capability object; the
+      `pve_feature` (`volume_has_feature`) glue and "absent/unknown key ⇒ 0" rule.
+      Tests: `t/unit/capabilities.t`.
+- [x] `FCLU::Driver::Mock` — in-memory backend implementing the full v1 surface,
+      `arm_fault`/`clear_faults` raise any error `code` on demand (§13.6) for
+      retry/compensate tests. Tests: `t/unit/mock.t`.
+- [x] Contract-test harness — `FCLU::ContractTest::run_contract_tests` (`t/lib/`),
+      one parametrized suite asserting the §12.2 idempotency/retry table and §12.1
+      data shapes against any driver; run against Mock in `t/unit/contract_mock.t`.
+      Each future driver adds its own `t/unit/contract_<vendor>.t` one-liner.
+
+**Phase 0 complete** — the contract, its executable reference, and the conformance
+suite are in place. Next: §9 Phase 1 (extract Registry/Credentials/Label from the
+Hitachi `Config.pm`).
 
 ## Phase 1+ — strangler-fig migration of the Hitachi reference (§9)
 
