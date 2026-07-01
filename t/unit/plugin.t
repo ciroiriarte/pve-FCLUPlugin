@@ -22,19 +22,21 @@ use PVE::Storage::FCLU::Plugin;
 # A stateful fake array driver (the §2 surface the plugin calls in slices 4A/4B).
 {
     package T::FakeDriver;
-    sub new { bless { connected => 0, status => $_[1], lus => {}, calls => {}, _seq => 0 }, $_[0] }
+    # Backend ids are globally monotonic (like real, unique array LDEV ids) so ids
+    # from different driver instances never collide in the shared registry tempdir.
+    our $SEQ = 1000;
+    sub new { bless { connected => 0, status => $_[1], lus => {}, calls => {} }, $_[0] }
     sub connect    { $_[0]{connected} = 1; $_[0] }
     sub disconnect { $_[0]{connected} = 0; 1 }
     sub storage_status { @{ $_[0]{status} // [ 1000, 600, 400 ] } }
     sub detect_profile { { max_label_len => 32 } }
-    sub _id { my $s = shift; my $n = $_[0]; my $bid = defined $n ? "$n" : '' . ( 1000 + ++$s->{_seq} );
-        return $bid; }
+    sub _id { my $s = shift; my $n = $_[0]; return defined $n ? "$n" : '' . ++$SEQ; }
     sub create_lu {
         my ( $s, %o ) = @_; $s->{calls}{create_lu}++;
         die "BOOM create\n" if $s->{fail_create};
         my $bid = $s->_id( $o{requested_id} );
         $s->{lus}{$bid} = { backend_id => $bid, size_bytes => $o{size_bytes}, pool_ref => $o{pool_ref},
-            identity => { protocol => 'scsi-fc', ids => { naa => '60060e80' . sprintf( '%08x', $s->{_seq} ) } } };
+            identity => { protocol => 'scsi-fc', ids => { naa => '60060e80' . sprintf( '%08x', $SEQ ) } } };
         return $bid;
     }
     sub get_lu { my ( $s, $id ) = @_; $s->{lus}{$id} or die "API request failed: GET x -> 404\n"; return { %{ $s->{lus}{$id} } } }
@@ -44,9 +46,42 @@ use PVE::Storage::FCLU::Plugin;
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
     sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
         $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
-    sub capabilities { { snapshot => { single => 1 }, clone => {}, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
-    sub list_snapshots { my ( $s ) = @_; $s->{calls}{list_snapshots}++; [] }
-    sub delete_snapshot { my ( $s ) = @_; $s->{calls}{delete_snapshot}++; 1 }
+    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1 }, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    # Stateful snapshots: $s->{snaps}{$pvol} = [ { snap_id, group, svol, status } ].
+    sub _snap_descr { my ( $s, $bid, $p ) = @_;
+        { snap_id => $p->{snap_id}, parent_backend_id => "$bid", created => undef,
+          meta => { group => $p->{group}, status => $p->{status}, svol => $p->{svol} } } }
+    sub create_snapshot {
+        my ( $s, $bid, %o ) = @_; $s->{calls}{create_snapshot}++;
+        my $svol = '' . ++$SEQ;
+        my $p = { snap_id => "$bid," . scalar( @{ $s->{snaps}{$bid} // [] } ),
+            group => $o{snapshot_group}, svol => $svol, status => 'PSUS' };
+        push @{ $s->{snaps}{$bid} }, $p;
+        return $s->_snap_descr( $bid, $p );
+    }
+    sub list_snapshots { my ( $s, $bid ) = @_; $s->{calls}{list_snapshots}++;
+        [ map { $s->_snap_descr( $bid, $_ ) } @{ $s->{snaps}{$bid} // [] } ] }
+    sub delete_snapshot { my ( $s, $sid ) = @_; $s->{calls}{delete_snapshot}++;
+        for my $bid ( keys %{ $s->{snaps} } ) {
+            @{ $s->{snaps}{$bid} } = grep { $_->{snap_id} ne $sid } @{ $s->{snaps}{$bid} };
+        }
+        1 }
+    sub restore_snapshot { my ( $s ) = @_; $s->{calls}{restore_snapshot}++; 1 }
+    sub create_linked_clone {
+        my ( $s, $src, %o ) = @_; $s->{calls}{create_linked_clone}++;
+        $s->{last_clone_hctx} = $o{host_ctx};
+        die "BOOM clone\n" if $s->{fail_clone};
+        my $svol = $s->_id( $o{requested_id} );
+        # Back the clone with a CoW pair on the source carrying this svol, so the
+        # core can discover the backing pair (meta.svol) for the #23 release.
+        push @{ $s->{snaps}{$src} }, { snap_id => "$src,lc$SEQ",
+            group => "pve_lc_$svol", svol => $svol, status => 'PSUS' };
+        $s->{lus}{$svol} = { backend_id => $svol,
+            size_bytes => ( $s->{lus}{$src} ? $s->{lus}{$src}{size_bytes} : 1 << 30 ),
+            pool_ref => $o{pool_ref}, identity => { protocol => 'scsi-fc',
+                ids => { naa => '60060e80' . sprintf( '%08x', $SEQ ) } } };
+        return $svol;
+    }
     sub ensure_host_access { my ( $s, %c ) = @_; $s->{calls}{ensure_host_access}++; "PVE_$c{hostname}" }
     sub publish_lu   { my ( $s, $id, %c ) = @_; $s->{calls}{publish_lu}++; { hostname => $c{hostname}, access_ref => "PVE_$c{hostname}" } }
     sub unpublish_lu { my ( $s ) = @_; $s->{calls}{unpublish_lu}++; 1 }
@@ -348,6 +383,196 @@ subtest 'qemu_blockdev_options + volume_size_info' => sub {
     is( $size, 1024 * 1024 * 1024, 'size from registry' );
     is( $fmt,  'raw', 'format raw' );
     is( $used, $size, 'fully provisioned: used == size' );
+};
+
+subtest 'snapshot lifecycle: create/info/rename/rollback/delete + dependent guards' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 910, 'raw', undef, 1 << 30 );
+
+    is( $P->volume_snapshot( {}, 'store1', $name, 'snap1' ), undef, 'volume_snapshot returns undef' );
+    is( $T::Plugin::FAKE->{calls}{create_snapshot}, 1, 'driver create_snapshot called' );
+    my $sm = reg()->lookup_snapshot( $name, 'snap1' );
+    ok( $sm && defined $sm->{snap_id}, 'snapshot registered with a backend snap_id' );
+    ok( defined $sm->{svol}, 'snapshot S-VOL backend id recorded (linked-clone source)' );
+
+    $P->volume_snapshot( {}, 'store1', $name, 'snap2' );
+    my $info = $P->volume_snapshot_info( {}, 'store1', $name );
+    is( $info->{snap1}{parent}, undef, 'oldest snap has no parent' );
+    is( $info->{snap2}{parent}, 'snap1', 'chain: snap2 parent is snap1' );
+    is( $info->{current}{parent}, 'snap2', 'current parent is the newest snap' );
+    ok( $info->{snap2}{order} > $info->{snap1}{order}, 'monotonic creation order' );
+
+    ok( $P->volume_rollback_is_possible( {}, 'store1', $name, 'snap1' ), 'rollback possible' );
+    ok( $P->volume_snapshot_rollback( {}, 'store1', $name, 'snap1' ), 'rollback drives restore' );
+    is( $T::Plugin::FAKE->{calls}{restore_snapshot}, 1, 'driver restore_snapshot called' );
+
+    $P->rename_snapshot( {}, 'store1', $name, 'snap2', 'snap2b' );
+    ok( reg()->lookup_snapshot( $name, 'snap2b' ), 'snapshot renamed in registry' );
+    ok( !reg()->lookup_snapshot( $name, 'snap2' ), 'old snapshot name gone' );
+
+    # Dependent guards: a linked clone recorded off snap2b blocks its delete/rollback.
+    reg()->register( 'vm-911-disk-0', 'bdep', parent_volname => $name, parent_snap => 'snap2b' );
+    eval { $P->volume_snapshot_delete( {}, 'store1', $name, 'snap2b' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'snapshot delete refused while a clone depends on it' );
+    eval { $P->volume_rollback_is_possible( {}, 'store1', $name, 'snap2b' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'rollback blocked by dependents' );
+
+    ok( $P->volume_snapshot_delete( {}, 'store1', $name, 'snap1' ), 'snapshot delete' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'driver delete_snapshot called' );
+    ok( !reg()->lookup_snapshot( $name, 'snap1' ), 'snapshot unregistered' );
+
+    eval { $P->volume_snapshot_delete( {}, 'store1', $name, 'ghost' ) };
+    like( $@, qr/not found for volume/, 'deleting an unknown snapshot dies' );
+    eval { $P->volume_snapshot( {}, 'store1', 'vm-99999-disk-0', 'x' ) };
+    like( $@, qr/not found in registry/, 'snapshot of a missing volume dies' );
+};
+
+subtest 'volume_has_feature capability gating (fail soft when the driver lacks it)' => sub {
+    package T::NoSnapDriver;
+    our @ISA = ('T::FakeDriver');
+    sub capabilities { { snapshot => {}, clone => {} } }
+
+    package T::NoSnapPlugin;
+    use parent -norequire, 'T::Plugin';
+    our $D;
+    sub _build_driver { return $D //= T::NoSnapDriver->new }
+
+    package main;
+    local $T::NoSnapPlugin::D = T::NoSnapDriver->new;
+
+    T::NoSnapPlugin->deactivate_storage( 'store1', {} );
+    is( T::NoSnapPlugin->volume_has_feature( {}, 'snapshot', 'store1', 'vm-1-disk-0' ), undef,
+        'snapshot gated off when the driver does not advertise it' );
+    T::NoSnapPlugin->deactivate_storage( 'store1', {} );
+    is( T::NoSnapPlugin->volume_has_feature( {}, 'clone', 'store1', 'base-1-disk-0' ), undef,
+        'clone gated off when the driver lacks clone.linked' );
+    T::NoSnapPlugin->deactivate_storage( 'store1', {} );
+    is( T::NoSnapPlugin->volume_has_feature( {}, 'rename', 'store1', 'vm-1-disk-0' ), 1,
+        'rename stays available (host/registry feature, not array-gated)' );
+
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    is( $P->volume_has_feature( {}, 'snapshot', 'store1', 'vm-1-disk-0' ), 1, 'snapshot allowed with capability' );
+    is( $P->volume_has_feature( {}, 'clone', 'store1', 'base-1-disk-0' ), 1, 'clone allowed with capability' );
+};
+
+subtest 'clone_image: linked clone from a base + backing-pair release on free (#23)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    my $base = $P->alloc_image( 'store1', { pool_id => '63' }, 920, 'raw', 'base-920-disk-0', 1 << 30 );
+    my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $base, 921, undef, 0 );
+    like( $clone, qr/^vm-921-disk-\d+$/, 'clone returns a fresh volname' );
+    is( $T::Plugin::FAKE->{calls}{create_linked_clone}, 1, 'driver create_linked_clone called' );
+    ok( defined $T::Plugin::FAKE->{last_clone_hctx}, 'host_ctx handed to the driver (#24)' );
+
+    my ( $cbid, $cmeta ) = reg()->lookup($clone);
+    ok( defined $cbid, 'clone committed to the registry' );
+    is( $cmeta->{parent_volname}, $base, 'parent linkage recorded' );
+    ok( $cmeta->{identity}{ids}{naa}, 'clone identity recorded' );
+    ok( defined $cmeta->{clone_backing_snap}, 'backing CoW pair id recorded (#23)' );
+
+    # The base cannot be freed while the clone depends on it.
+    eval { $P->free_image( 'store1', {}, $base ) };
+    like( $@, qr/linked clone\(s\) depend/, 'parent refused while a clone depends on it' );
+
+    # Freeing the clone releases the backing pair, then deletes the S-VOL.
+    is( $P->free_image( 'store1', {}, $clone ), undef, 'clone freed' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'backing CoW pair released (#23)' );
+    is( reg()->lookup($clone), undef, 'clone unregistered' );
+};
+
+subtest 'clone_image: from a snapshot uses the snapshot S-VOL as the CoW source' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 930, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 'snapA' );
+    my $sm = reg()->lookup_snapshot( $vol, 'snapA' );
+
+    my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $vol, 931, 'snapA', 0 );
+    my ( undef, $cmeta ) = reg()->lookup($clone);
+    is( $cmeta->{parent_volname}, $vol, 'parent volume recorded' );
+    is( $cmeta->{parent_snap}, 'snapA', 'parent snapshot recorded' );
+    ok( scalar @{ $T::Plugin::FAKE->{snaps}{ $sm->{svol} } // [] } >= 1,
+        'CoW pair created on the snapshot S-VOL, not the base LU' );
+};
+
+subtest 'clone_image rolls back the reservation on an in-create failure (nothing built yet)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $base = $P->alloc_image( 'store1', { pool_id => '63' }, 935, 'raw', 'base-935-disk-0', 1 << 30 );
+    $T::Plugin::FAKE->{fail_clone} = 1;   # create_linked_clone throws before any pair/S-VOL exists
+    eval { $P->clone_image( { pool_id => '63' }, 'store1', $base, 936, undef, 0 ) };
+    like( $@, qr/failed to clone/, 'clone failure surfaced' );
+    is( reg()->lookup('vm-936-disk-1'), undef, 'clone name reservation rolled back' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, undef, 'no pair to release (none was created)' );
+};
+
+subtest 'clone_image releases the backing pair + S-VOL on a POST-create failure (#23 rollback)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $base = $P->alloc_image( 'store1', { pool_id => '63' }, 937, 'raw', 'base-937-disk-0', 1 << 30 );
+    my ($src_bid) = reg()->lookup($base);
+
+    # create_linked_clone SUCCEEDS (pair + S-VOL built), then set_lu_label throws — the
+    # exact partial-failure window the commit-last pattern exists to unwind (#23).
+    $T::Plugin::FAKE->{fail_label} = 1;
+    eval { $P->clone_image( { pool_id => '63' }, 'store1', $base, 938, undef, 0 ) };
+    like( $@, qr/failed to clone/, 'post-create clone failure surfaced' );
+
+    is( $T::Plugin::FAKE->{calls}{create_linked_clone}, 1, 'the pair + S-VOL were created' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'the backing CoW pair was released FIRST (#23)' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'then the orphan S-VOL was deleted' );
+    is_deeply( $T::Plugin::FAKE->{snaps}{$src_bid}, [], 'no backing pair left on the source LU' );
+    is( reg()->lookup('vm-938-disk-1'), undef, 'clone name reservation rolled back' );
+};
+
+subtest 'create_base converts a live volume to a base image + guards' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 940, 'raw', undef, 1 << 30 );
+
+    my $base = $P->create_base( 'store1', {}, $vol );
+    is( $base, 'base-940-disk-1', 'base name derived from the disk index' );
+    ok( reg()->lookup($base), 'registry renamed to the base name' );
+    is( reg()->lookup($vol), undef, 'old volname gone' );
+    is( $T::Plugin::FAKE->{calls}{set_lu_label}, 2, 'LU relabelled (alloc + create_base)' );
+
+    eval { $P->create_base( 'store1', {}, $base ) };
+    like( $@, qr/not possible for base image/, 'a base image cannot be re-based' );
+
+    my $v2 = $P->alloc_image( 'store1', { pool_id => '63' }, 941, 'raw', undef, 1 << 30 );
+    reg()->register( 'vm-942-disk-0', 'bdep2', parent_volname => $v2 );
+    eval { $P->create_base( 'store1', {}, $v2 ) };
+    like( $@, qr/linked clone\(s\) depend/, 'a volume with dependents cannot be based' );
+};
+
+subtest 'free_image rediscovers a linked-clone backing pair from the parent (#23 fallback)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    # A clone committed WITHOUT clone_backing_snap (its pair was not observable at
+    # clone time) but WITH clone_parent_backend recorded; the array pair lives on the
+    # parent LU with the clone as its S-VOL.
+    my $parent = $P->alloc_image( 'store1', { pool_id => '63' }, 945, 'raw', 'base-945-disk-0', 1 << 30 );
+    my ($pbid) = reg()->lookup($parent);
+    my $clone  = $P->alloc_image( 'store1', { pool_id => '63' }, 946, 'raw', undef, 1 << 30 );
+    my ($cbid) = reg()->lookup($clone);
+    reg()->update_meta( $clone, parent_volname => $parent, clone_parent_backend => $pbid );
+    push @{ $T::Plugin::FAKE->{snaps}{$pbid} },
+        { snap_id => "$pbid,lcX", group => "pve_lc_$cbid", svol => $cbid, status => 'PSUS' };
+
+    is( $P->free_image( 'store1', {}, $clone ), undef, 'clone freed' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'backing pair rediscovered + released via the parent' );
+    is_deeply( $T::Plugin::FAKE->{snaps}{$pbid}, [], 'the rediscovered pair was removed' );
 };
 
 done_testing();

@@ -117,9 +117,20 @@ a time.
       is deferred to 4D), `volume_resize` (shrink-guard → connector flush when
       running → driver `resize_lu` → connector `resize` → commit real size),
       `qemu_blockdev_options` (host_device, #14), `volume_size_info` (registry).
-      **Deferred (4D):** snapshot/clone orchestration (volume_snapshot/rollback/
-      info, clone_image incl the #24 host-context flow + #23 pair release,
-      create_base, `volume_export`/`import`, rename/manage/migrate/orphans).
+      **Slice 4D done:** snapshot + linked-clone lifecycle — `volume_snapshot`
+      (capability-gated via `Capabilities::pve_feature`, snap_id+S-VOL recorded in
+      the registry snapshot subregistry with a monotonic `seq` for chain order),
+      `volume_snapshot_delete` (linked-clone-dependent guard), `volume_snapshot_info`
+      (linear chain), `rename_snapshot` (registry-only #34), `volume_rollback_is_possible`
+      + `volume_snapshot_rollback` (driver owns the RCPY→PAIR→re-split settle #12),
+      `clone_image` (base/snapshot source, `create_linked_clone(host_ctx)` for the
+      #24 mid-flow map, parentage+identity recorded, rollback releases the backing
+      pair before the S-VOL), the #23 backing-pair release wired into `free_image`
+      (opaque `snap_id` via the §2 `list_snapshots` contract + a parent-rediscovery
+      fallback — no ABI bump), `create_base`, and capability-gated `volume_has_feature`.
+      Test: `t/unit/plugin.t` (fake driver + connector).
+      **Deferred (4E):** storage-migration `volume_export`/`import`, and the
+      reassign/adopt tail `rename`/`manage`/`unmanage`.
 - [ ] Add profile detection + quirk handling behind the driver (§4); delete
       scattered platform/microcode conditionals.
 - [ ] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`

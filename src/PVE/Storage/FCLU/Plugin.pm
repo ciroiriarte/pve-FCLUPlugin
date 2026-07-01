@@ -388,9 +388,7 @@ sub free_image {
 
     my $d = $class->_driver( $storeid, $scfg );
 
-    # Delete this volume's own snapshot pairs first (capability-gated). NOTE: the
-    # linked-clone P-VOL pair release (#23 — when THIS volume is a clone S-VOL) is
-    # wired with clone_image in the snapshot/clone slice (4D).
+    # Delete this volume's own snapshot pairs first (capability-gated).
     if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'snapshot', 'single' ) ) {
         eval {
             for my $s ( @{ $d->list_snapshots($backend_id) } ) {
@@ -398,6 +396,26 @@ sub free_image {
             }
         };
         warn "FCLU: snapshot cleanup warning: $@" if $@;
+    }
+
+    # Release this volume's own backing CoW pair when it is itself a linked clone
+    # (#23): the pair lives on the PARENT's LU (not this S-VOL), so the own-snapshot
+    # cleanup above does not cover it. Prefer the id recorded at clone time; fall back
+    # to rediscovering the pair by S-VOL on the recorded parent LU (covers a clone
+    # committed before its pair was observable). Best-effort — a stale pair must not
+    # wedge the delete; the array frees the snapshot data and unassigns the S-VOL.
+    my $backing_snap = $meta->{clone_backing_snap};
+    if ( !defined $backing_snap && defined $meta->{clone_parent_backend} ) {
+        eval {
+            my ($pair) = grep { ( $_->{meta}{svol} // '' ) eq "$backend_id" }
+                @{ $d->list_snapshots( $meta->{clone_parent_backend} ) };
+            $backing_snap = $pair->{snap_id} if $pair;
+        };
+        warn "FCLU: linked-clone pair rediscovery warning: $@" if $@;
+    }
+    if ( defined $backing_snap ) {
+        eval { $d->delete_snapshot($backing_snap) };
+        warn "FCLU: linked-clone pair release warning: $@" if $@;
     }
 
     # Tear the host side down (detach the device + unmap THIS node) before deleting
@@ -475,6 +493,275 @@ sub volume_size_info {
     return wantarray ? ( $size, 'raw', $size, $parent ) : $size;
 }
 
+# ── Snapshots (§6, array-offloaded, capability-gated) ──
+#
+# The array driver owns the pair mechanics (Thin Image et al.) behind the §2
+# contract (create/delete/restore/list_snapshots); the core only orchestrates and
+# tracks per-volume snapshot metadata in the registry snapshot subregistry
+# (snap_id = the driver's opaque pair id; svol = the snapshot's S-VOL backend id,
+# needed as a linked-clone source). Migrated from the reference plugin's
+# volume_snapshot* family, with the direct REST/Config calls swapped for the
+# driver contract + Registry.
+
+# Does the array driver advertise an array-offloaded PVE feature (snapshot/clone)?
+# Callers gate on this to fail fast before driving the op onto a driver that lacks it.
+sub _driver_supports {
+    my ($class, $d, $feature) = @_;
+    return PVE::Storage::FCLU::Capabilities->new( $d->capabilities )->pve_feature($feature) ? 1 : 0;
+}
+
+sub volume_snapshot {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $d = $class->_driver( $storeid, $scfg );
+    die "storage '$storeid' does not support snapshots\n"
+        unless $class->_driver_supports( $d, 'snapshot' );
+
+    # Encode the volume's backend id into the group name so a name-based array
+    # fallback search can never resolve to another volume's pair sharing this
+    # snapshot name (the reference's #-collision guard).
+    my $group  = "pve_${storeid}_${backend_id}_${snap}";
+
+    # Monotonic 0-based creation index, so the snapshot chain stays correctly
+    # ordered even when two snapshots land in the same wall-clock second (the
+    # registry timestamp alone cannot disambiguate sub-second creations).
+    my $seq   = scalar keys %{ $reg->list_snapshots($volname) };
+    my $descr = $d->create_snapshot( $backend_id, snapshot_group => $group );
+
+    $reg->register_snapshot( $volname, $snap,
+        snap_id => $descr->{snap_id},
+        group   => $group,
+        seq     => $seq,
+        ( defined $descr->{meta}{svol} ? ( svol => $descr->{meta}{svol} ) : () ),
+    );
+
+    return undef;
+}
+
+sub volume_snapshot_delete {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    # Refuse while linked clones created FROM this snapshot still share its blocks —
+    # deleting the pair would corrupt them (promote/remove the clones first).
+    my $deps = $reg->find_snapshot_dependents( $volname, $snap );
+    die "cannot delete snapshot '$snap' of '$volname': linked clone(s) depend on it: "
+        . join( ', ', sort @$deps ) . "\n" if @$deps;
+
+    my $meta = $reg->lookup_snapshot( $volname, $snap );
+    die "snapshot '$snap' not found for volume '$volname'\n"
+        unless $meta && defined $meta->{snap_id};
+
+    $class->_driver( $storeid, $scfg )->delete_snapshot( $meta->{snap_id} );
+    $reg->unregister_snapshot( $volname, $snap );
+
+    return 1;
+}
+
+# PVE snapshot chain: {current} plus one entry per snapshot, oldest first, each
+# pointing at the previous one as its parent (the block-storage linear model). The
+# array carries no portable creation order, so we sort by the registry timestamp.
+sub volume_snapshot_info {
+    my ($class, $scfg, $storeid, $volname) = @_;
+
+    my $snaps = $class->_registry($storeid)->list_snapshots($volname);
+
+    my $info = { current => { description => '', parent => undef } };
+    my @ordered = sort {
+        ( $snaps->{$a}{seq} // 0 ) <=> ( $snaps->{$b}{seq} // 0 )
+            || ( $snaps->{$a}{timestamp} || 0 ) <=> ( $snaps->{$b}{timestamp} || 0 )
+    } keys %$snaps;
+
+    my $prev  = 'current';
+    my $order = 0;
+    for my $name (@ordered) {
+        $info->{$name} = {
+            description => '',
+            parent      => ( $prev eq 'current' ? undef : $prev ),
+            timestamp   => $snaps->{$name}{timestamp},
+            order       => $order++,
+        };
+        $prev = $name;
+    }
+    $info->{current}{parent} = $prev eq 'current' ? undef : $prev;
+    $info->{current}{order}  = $order;
+
+    return $info;
+}
+
+# Registry-only rename (#34): every op resolves the pair via the recorded snap_id,
+# so the array group label may keep the old name — renaming the key is sufficient.
+sub rename_snapshot {
+    my ($class, $scfg, $storeid, $volname, $source, $target) = @_;
+    $class->_registry($storeid)->rename_snapshot( $volname, $source, $target );
+    return;
+}
+
+# Thin-Image-style snapshots are independent pairs, so restoring one does NOT
+# destroy newer snapshots — we allow rollback to ANY existing snapshot (unlike
+# ZFS/LVM-thin). A snapshot with dependent linked clones is blocked, mirroring the
+# deletion guard, since restoring it disturbs the shared base.
+sub volume_rollback_is_possible {
+    my ($class, $scfg, $storeid, $volname, $snap, $blockers) = @_;
+    $blockers //= [];
+
+    my $reg = $class->_registry($storeid);
+    die "can't rollback, snapshot '$snap' does not exist on '$volname'\n"
+        unless $reg->lookup_snapshot( $volname, $snap );
+
+    my $deps = $reg->find_snapshot_dependents( $volname, $snap );
+    if (@$deps) {
+        push @$blockers, @$deps;
+        die "can't rollback to '$snap': linked clone(s) depend on this snapshot: "
+            . join( ', ', sort @$deps ) . "\n";
+    }
+    return 1;
+}
+
+sub volume_snapshot_rollback {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $meta = $reg->lookup_snapshot( $volname, $snap );
+    die "snapshot '$snap' not found for volume '$volname'\n"
+        unless $meta && defined $meta->{snap_id};
+
+    # The driver owns the reverse-copy + re-split settle (#12): restore_snapshot
+    # MUST leave the snapshot a usable, re-restorable pair before returning.
+    $class->_driver( $storeid, $scfg )->restore_snapshot( $meta->{snap_id} );
+
+    return 1;
+}
+
+# ── Clones (§6, array-offloaded linked clone = PVE's clone_image primitive) ──
+#
+# clone_image is PVE's LINKED-clone primitive: a CoW child that shares blocks with
+# its source (a base image or a snapshot). Full copies do NOT come through here —
+# PVE copies host-side via alloc_image + the device path (§6). The array driver owns
+# the pair mechanics behind create_linked_clone; the core resolves the CoW source,
+# drives the driver, and records parentage + the backing-pair id so free_image can
+# release it (#23). %host_ctx is handed to the driver for arrays that must map the
+# S-VOL mid-flow before binding it to the pair (the E590H #24 sequence).
+sub clone_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snap, $running, $target) = @_;
+
+    # Source must be a base image or a snapshot AND the driver must advertise the
+    # linked-clone capability — volume_has_feature enforces both (role + capability).
+    die "clone_image only supports a base image or a snapshot as the source\n"
+        unless $class->volume_has_feature( $scfg, 'clone', $storeid, $volname, $snap );
+
+    my $reg = $class->_registry($storeid);
+    my ( $src_backend, $src_meta ) = $reg->lookup($volname);
+    die "source volume '$volname' not found in registry\n" unless defined $src_backend;
+
+    # The CoW parent: the snapshot's S-VOL when cloning from a snapshot, else the
+    # (base) volume's own LU.
+    my $clone_source = $src_backend;
+    if ($snap) {
+        my $sm = $reg->lookup_snapshot( $volname, $snap );
+        die "snapshot '$snap' not found for volume '$volname'\n" unless $sm;
+        die "snapshot '$snap' has no S-VOL backend id\n" unless defined $sm->{svol};
+        $clone_source = $sm->{svol};
+    }
+
+    my $d        = $class->_driver( $storeid, $scfg );
+    my $new_name = $reg->reserve_volname($vmid);
+    my %hctx     = %{ $class->_connector->host_context( hostname => $class->_nodename ) };
+
+    # $pair is resolved inside the eval but MUST be visible to the rollback: a linked
+    # clone is a split CoW pair, so undoing a partial build has to release that pair
+    # before the S-VOL LU can be deleted (a real array refuses to delete an LDEV that
+    # is still assigned to a pair — the reference's #23 hazard).
+    my ( $svol, $pair, $committed ) = ( undef, undef, 0 );
+    eval {
+        my $rid = $class->_alloc_backend_id( $storeid, $scfg, $d );
+        $svol = $d->create_linked_clone( $clone_source,
+            ( defined $rid ? ( requested_id => $rid ) : () ),
+            host_ctx => \%hctx,
+        );
+        die "driver create_linked_clone returned no backend_id\n" unless defined $svol;
+
+        # Find the backing CoW pair (its S-VOL is our new clone) so both rollback and
+        # free_image can release it before deleting the S-VOL (#23). Discovered through
+        # the §2 list_snapshots contract, so no vendor-specific call leaks into the core.
+        # §12.2 requires create_linked_clone to leave the pair observable on return, so
+        # a missing pair here means a non-conformant/slow driver — warn loudly rather
+        # than silently record no backing id (which would leave the clone unfreeable).
+        ($pair) = grep { ( $_->{meta}{svol} // '' ) eq "$svol" }
+            @{ $d->list_snapshots($clone_source) };
+        warn "FCLU: linked clone '$new_name' (svol=$svol): backing CoW pair not found on"
+            . " source '$clone_source' — free_image will rediscover it from the parent\n"
+            unless $pair;
+
+        $d->set_lu_label( $svol, $class->_make_label( $storeid, $new_name, $d ) );
+
+        # Commit LAST: identity + size + parentage (so the source can't be deleted
+        # while this clone shares its blocks) + the backing-pair id AND its P-VOL, so
+        # free_image can release the pair by id, or rediscover it from the P-VOL (#23).
+        my $lu = $d->get_lu($svol);
+        $reg->register( $new_name, $svol,
+            identity              => $d->get_lu_identity($svol),
+            size_mb               => $src_meta->{size_mb},
+            pool_ref              => $lu->{pool_ref},
+            parent_volname        => $volname,
+            clone_parent_backend  => $clone_source,
+            ( $snap ? ( parent_snap => $snap ) : () ),
+            ( $pair ? ( clone_backing_snap => $pair->{snap_id} ) : () ),
+        );
+        $committed = 1;
+    };
+    if ( my $err = $@ ) {
+        # Reverse order: release the backing pair FIRST (frees the snapshot data and
+        # unassigns the S-VOL), else delete_lu on the still-assigned S-VOL fails and
+        # leaks both the S-VOL and its pair on a shared pool.
+        eval { $d->delete_snapshot( $pair->{snap_id} ) } if $pair;
+        eval { $d->delete_lu($svol) } if defined $svol;
+        eval { $reg->unregister($new_name) } unless $committed;
+        die "failed to clone '$volname' to '$new_name': $err";
+    }
+
+    return $new_name;
+}
+
+# ── Base / template images (§7) ──
+#
+# Convert a live volume into a base image: relabel the LU and atomically rename the
+# registry entry to base-<vmid>-disk-<n>. No data copy — the base IS the volume, now
+# read-only per the role table (clones spring from it via clone_image).
+sub create_base {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    my ( undef, $name, $vmid, undef, undef, $isBase ) = $class->parse_volname($volname);
+    die "create_base not possible for base image '$volname'\n" if $isBase;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $deps = $reg->find_dependents($volname);
+    die "cannot convert '$volname' to a base image: linked clone(s) depend on it: "
+        . join( ', ', sort @$deps ) . "\n" if @$deps;
+
+    my ($disk) = $name =~ /-disk-(\d+)$/;
+    my $base_name = "base-${vmid}-disk-${disk}";
+
+    my $d = $class->_driver( $storeid, $scfg );
+    $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $base_name, $d ) );
+    $reg->rename_volume( $volname, $base_name );
+
+    return $base_name;
+}
+
 # ── Volume name parsing (§7, vendor-neutral) ──
 
 sub vmid_from_volname {
@@ -518,8 +805,22 @@ sub volume_has_feature {
     my $isBase = ( $class->parse_volname($volname) )[5];
     my $key = $snapname ? 'snap' : ( $isBase ? 'base' : 'current' );
 
-    return 1 if $features->{$feature} && $features->{$feature}{$key};
-    return undef;
+    return undef unless $features->{$feature} && $features->{$feature}{$key};
+
+    # Array-offloaded features (snapshot/clone) ALSO require the driver to advertise
+    # the matching capability (§6, via Capabilities::pve_feature). Fail SOFT: only
+    # downgrade to "unsupported" when the driver POSITIVELY lacks it — a driver
+    # build/connection hiccup must not make PVE think a normally-supported feature
+    # vanished, so any lookup error falls through to the role-table "yes". Host and
+    # registry features (copy/sparseinit/template/rename/resize) are not array-gated.
+    if ( defined $storeid && ( $feature eq 'snapshot' || $feature eq 'clone' ) ) {
+        my $gated = eval {
+            $class->_driver_supports( $class->_driver( $storeid, $scfg ), $feature );
+        };
+        return undef if defined $gated && !$gated;
+    }
+
+    return 1;
 }
 
 # ── Image listing ──
