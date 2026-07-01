@@ -7,3 +7,9 @@
 # into the per-binary packages (pve-fclu-core / pve-fclu-hitachi).
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp
+
+# Ship the qemu-pr-helper units (opt-in SCSI-3 PR) but DO NOT enable or start
+# them: PR is opt-in, so the operator enables qemu-pr-helper.socket per node only
+# when using persistent_reservations. dh_installsystemd still wires clean removal.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start

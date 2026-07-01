@@ -534,9 +534,9 @@ reference plugin's Debian binary name) and its `type: hitachiblock` storage
 definitions must survive the rename (§0). The Hitachi package carries
 `Provides: pve-storage-hitachiblock`, `Replaces: pve-storage-hitachiblock`,
 `Conflicts: pve-storage-hitachiblock` so `apt upgrade` swaps them cleanly and existing
-`storage.cfg` keeps working verbatim. (The swap removes the old package wholesale, so
-its GUI panel / `hitachiblock-repl` / opt-in SCSI-3 PR units are dropped until re-shipped
-under `pve-fclu-hitachi`; the data path is preserved.)
+`storage.cfg` keeps working verbatim. (The swap removes the old package wholesale;
+`pve-fclu-hitachi` re-ships its web UI panel and the opt-in SCSI-3 PR systemd units, so
+only the `hitachiblock-repl` replication CLI remains to be re-shipped.)
 
 Cost is only more `debian/*.install` control files and CI matrix entries; OBS builds
 multiple binaries from one source natively. Benefits: core stays dependency-light, a

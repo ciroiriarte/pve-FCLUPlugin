@@ -1,0 +1,3 @@
+# Re-run postinst (case `triggered`) whenever pve-manager rewrites its index
+# template, so our web UI <script> tag is re-injected after a PVE upgrade.
+interest-noawait /usr/share/pve-manager/index.html.tpl

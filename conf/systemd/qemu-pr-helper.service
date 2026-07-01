@@ -1,0 +1,15 @@
+[Unit]
+Description=QEMU Persistent Reservation Helper
+Documentation=https://www.qemu.org/docs/master/system/pr-manager.html
+# Socket-activated by qemu-pr-helper.socket. Shipped by pve-fclu-hitachi
+# (GitHub #2); the binary comes from pve-qemu-kvm. Installed DISABLED — see the
+# socket unit. Do not enable this service directly; enable the .socket instead.
+Requires=qemu-pr-helper.socket
+
+[Service]
+ExecStart=/usr/bin/qemu-pr-helper
+# Runs as root: the helper issues SG_IO PERSISTENT RESERVE ioctls against the
+# guest's backing block device on its behalf, which requires raw device access.
+
+# No [Install]: this service is socket-activated. Enable qemu-pr-helper.socket,
+# not this service directly.

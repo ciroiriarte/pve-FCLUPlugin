@@ -94,6 +94,8 @@ systemctl restart pvedaemon
 ```
 
 `apt install pve-fclu-hitachi` supersedes the standalone `pve-storage-hitachiblock`
-package; existing `type: hitachiblock` storage.cfg entries keep working. (This alpha
-does not yet re-ship the old package's ExtJS GUI panel, `hitachiblock-repl`, or the
-SCSI-3 PR systemd units — see the `debian/changelog` upgrade note.)
+package; existing `type: hitachiblock` storage.cfg entries keep working. It re-ships
+the web UI storage panel and the opt-in SCSI-3 PR systemd units (installed disabled);
+only the `hitachiblock-repl` replication CLI remains deferred (it needs a rewrite
+against the FCLU internals). Restart `pvedaemon`/`pveproxy` after install so the
+plugin and its UI panel register.

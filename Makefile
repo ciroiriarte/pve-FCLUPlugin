@@ -12,6 +12,11 @@ PREFIX=/usr
 PERL_VENDORLIB=$(PREFIX)/share/perl5
 FCLU=$(DESTDIR)$(PERL_VENDORLIB)/PVE/Storage/FCLU
 CUSTOM=$(DESTDIR)$(PERL_VENDORLIB)/PVE/Storage/Custom
+PVE_MANAGER_JS=$(DESTDIR)$(PREFIX)/share/pve-manager/js
+SYSTEMD_UNIT_DIR=$(DESTDIR)/lib/systemd/system
+HITACHI_DOC=$(DESTDIR)$(PREFIX)/share/doc/pve-fclu-hitachi
+INDEX_TPL=$(PREFIX)/share/pve-manager/index.html.tpl
+GUI_JS=pve-fclu-hitachi.js
 
 .PHONY: all test clean install deb
 
@@ -43,6 +48,27 @@ install:
 	install -m0644 src/PVE/Storage/FCLU/Driver/Hitachi/RestClient.pm $(FCLU)/Driver/Hitachi/
 	install -d $(CUSTOM)
 	install -m0644 src/PVE/Storage/Custom/HitachiBlockPlugin.pm $(CUSTOM)/
+	# --- pve-fclu-hitachi: web UI panel, opt-in SCSI-3 PR units, config examples ---
+	install -d $(PVE_MANAGER_JS)
+	install -m0644 src/www/manager6/hitachiblock.js $(PVE_MANAGER_JS)/$(GUI_JS)
+	# qemu-pr-helper units ship DISABLED (dh_installsystemd --no-enable --no-start,
+	# see debian/rules); the operator enables the socket only for persistent_reservations.
+	install -d $(SYSTEMD_UNIT_DIR)
+	install -m0644 conf/systemd/qemu-pr-helper.socket  $(SYSTEMD_UNIT_DIR)/
+	install -m0644 conf/systemd/qemu-pr-helper.service $(SYSTEMD_UNIT_DIR)/
+	install -d $(HITACHI_DOC)
+	install -m0644 conf/storage.cfg.example                    $(HITACHI_DOC)/
+	install -m0644 conf/multipath.conf.d/hitachiblock-vsp.conf $(HITACHI_DOC)/
+	# Source installs (empty DESTDIR) wire the UI <script> into the live index
+	# template; the .deb does this via debian/pve-fclu-hitachi.{postinst,triggers}.
+	@if [ -z "$(DESTDIR)" ] && [ -f "$(INDEX_TPL)" ]; then \
+	  if grep -q '$(GUI_JS)' "$(INDEX_TPL)"; then \
+	    sed -i 's#$(GUI_JS)?ver=[^"]*#$(GUI_JS)?ver=$(VERSION)#' "$(INDEX_TPL)"; \
+	  else \
+	    sed -i '\#pvemanagerlib.js#a\        <script type="text/javascript" src="/pve2/js/$(GUI_JS)?ver=$(VERSION)"></script>' "$(INDEX_TPL)"; \
+	  fi; \
+	  echo "Wired the FCLU Hitachi UI panel into $(INDEX_TPL) (reload the web UI with Ctrl-Shift-R)."; \
+	fi
 
 deb:
 	dpkg-buildpackage -us -uc -b

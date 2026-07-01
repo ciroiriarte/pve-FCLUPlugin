@@ -1,0 +1,48 @@
+# Example storage.cfg stanza for Hitachi Block Storage Plugin
+#
+# Add this to /etc/pve/storage.cfg after installing the plugin.
+# Credentials are stored separately via: pvesm set <storeid> --username <user> --password <pass>
+
+hitachiblock: myarray
+    mgmt_ip 10.0.1.100
+    storage_id 836000123456
+    pool_id 0
+    snap_pool_id 1
+    target_ports CL1-A,CL2-A
+    host_mode LINUX/IRIX
+    platform vsp_one
+    shared 1
+    content images
+    nodes node1,node2,node3
+    # Optional: verify the Configuration Manager TLS certificate (off by default
+    # for the appliance's self-signed cert). Provide a CA bundle when enabling.
+    # tls_verify 1
+    # tls_ca_file /etc/pve/priv/hitachiblock/ca.pem
+
+# VSP G series example (uses Ops Center API Config Manager)
+# hitachiblock: vspg-array
+#     mgmt_ip 10.0.1.200
+#     storage_id 410000123456
+#     pool_id 0
+#     snap_pool_id 1
+#     target_ports CL1-A,CL2-A,CL3-A,CL4-A
+#     host_mode LINUX/IRIX
+#     platform vsp_g
+#     mgmt_port 23451
+#     shared 1
+#     content images
+
+# VSP E series example (e.g. E590H) — embedded/direct Configuration Manager REST
+# API on the controller GUM (port 443). storage_id is the 12-digit storageDeviceId.
+# mgmt_ip lists BOTH controllers' GUM IPs for management-plane failover (use a
+# single IP/VIP instead if your array presents one floating management address).
+# hitachiblock: vspe-array
+#     mgmt_ip 10.0.1.210,10.0.1.211
+#     storage_id 716000123456
+#     pool_id 0
+#     snap_pool_id 1
+#     target_ports CL1-A,CL2-A
+#     host_mode LINUX/IRIX
+#     platform vsp_e
+#     shared 1
+#     content images

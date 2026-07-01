@@ -1,3 +1,8 @@
 usr/share/perl5/PVE/Storage/FCLU/Driver/Hitachi.pm
 usr/share/perl5/PVE/Storage/FCLU/Driver/Hitachi/RestClient.pm
 usr/share/perl5/PVE/Storage/Custom/HitachiBlockPlugin.pm
+usr/share/pve-manager/js/pve-fclu-hitachi.js
+lib/systemd/system/qemu-pr-helper.socket
+lib/systemd/system/qemu-pr-helper.service
+usr/share/doc/pve-fclu-hitachi/storage.cfg.example
+usr/share/doc/pve-fclu-hitachi/hitachiblock-vsp.conf

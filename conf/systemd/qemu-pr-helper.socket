@@ -1,0 +1,17 @@
+[Unit]
+Description=QEMU Persistent Reservation Helper socket
+Documentation=https://www.qemu.org/docs/master/system/pr-manager.html
+# Shipped by pve-fclu-hitachi for opt-in SCSI-3 PR on clustered/shared
+# guest disks (GitHub #2). The qemu-pr-helper BINARY ships with pve-qemu-kvm, but
+# Proxmox does not package the systemd units — so this plugin provides them.
+# Installed DISABLED: enable per node only when you use persistent_reservations
+# (`systemctl enable --now qemu-pr-helper.socket`). Enabling the socket makes
+# /run/qemu-pr-helper.sock listen immediately (socket activation starts the
+# service on first connection from QEMU).
+
+[Socket]
+ListenStream=/run/qemu-pr-helper.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Remove the FCLU Hitachi web UI <script> tag from the PVE manager template when
+# the package is removed. (Not on upgrade — postinst re-injects there.)
+set -e
+
+TPL=/usr/share/pve-manager/index.html.tpl
+MARKER='pve-fclu-hitachi.js'
+
+case "$1" in
+    remove)
+        if [ -f "$TPL" ]; then
+            sed -i "\\#${MARKER}#d" "$TPL"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,38 @@
+#!/bin/sh
+# Wire the FCLU Hitachi web UI module into the Proxmox VE manager.
+#
+# PVE has no supported external-JS hook, so we inject a <script> tag into
+# /usr/share/pve-manager/index.html.tpl, right after the pvemanagerlib.js
+# include. The matching `interest-noawait` trigger (debian/pve-fclu-hitachi.triggers)
+# re-runs this script whenever pve-manager rewrites that template (e.g. on upgrade),
+# so the integration survives PVE updates.
+set -e
+
+TPL=/usr/share/pve-manager/index.html.tpl
+MARKER='pve-fclu-hitachi.js'
+
+inject() {
+    [ -f "$TPL" ] || return 0
+    ver="$(dpkg-query -f '${Version}' -W pve-fclu-hitachi 2>/dev/null || echo 0)"
+    if grep -q "$MARKER" "$TPL"; then
+        # Tag already present — refresh its ?ver= cache-buster to the current
+        # package version so browsers reload the JS after an upgrade (the file on
+        # disk changed). Without this the query string stays frozen and clients
+        # keep serving stale cached JS.
+        sed -i "s#${MARKER}?ver=[^\"]*#${MARKER}?ver=${ver}#" "$TPL"
+        return 0
+    fi
+    line="<script type=\"text/javascript\" src=\"/pve2/js/${MARKER}?ver=${ver}\"></script>"
+    # Append our tag on the line after the pvemanagerlib.js include.
+    sed -i "\\#pvemanagerlib.js#a\\${line}" "$TPL"
+}
+
+case "$1" in
+    configure|triggered)
+        inject
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
