@@ -577,20 +577,82 @@ sub _alloc_svol {
 # conformance simulator validates the contract shape.
 sub create_linked_clone {
     my ($self, $backend_id, %args) = @_;
+
     my $src = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
     $self->_err( 'not_found', "no such ldev '$backend_id'" )
         unless $self->_is_defined_ldev($src);
+    my $blocks = $src->{blockCapacity} // $src->{numOfBlocks};
+    $self->_err( 'internal', 'source ldev has no block capacity' ) unless defined $blocks;
 
-    my $svol_id = $self->_alloc_svol( $src, %args );
-    $self->_call( sub {
-        $self->{rest}->create_snapshot(
-            pvol_ldev_id   => $backend_id,
-            snap_pool_id   => $self->{snap_pool_id},
-            svol_ldev_id   => $svol_id,
-            snapshot_group => $args{snapshot_group} // 'pve_clone',
-        );
-    } );
+    # #24 (verified live on the E590H): the array REJECTS a Thin Image pair created
+    # WITH svolLdevId — "the snapshot S-VOL does not have LU paths". The real flow is:
+    #   1. create the S-VOL as a Thin Image VIRTUAL volume (poolId -1),
+    #   2. create a DATA-ONLY autoSplit pair on the source (no svolLdevId) — snapshot
+    #      data captured, pair in PSUS,
+    #   3. MAP the S-VOL so it has LU paths (needs host context — the §2 signature now
+    #      carries host_ctx precisely for this),
+    #   4. assign the S-VOL to the pair → a persistent host-R/W copy-on-write child.
+    # (`isClone` is never set — that would full-copy then auto-delete the pair.)
+    my %hctx = %{ $args{host_ctx} || {} };
+    $self->_err( 'invalid',
+        'create_linked_clone requires host_ctx — the #24 S-VOL must be mapped before assign' )
+        unless %hctx;
+
+    # 1. S-VOL as a Thin Image virtual volume (poolId -1), explicit id when requested.
+    my $svol_id;
+    if ( defined $args{requested_id} ) {
+        $svol_id = "$args{requested_id}";
+        $self->_call( sub {
+            $self->{rest}->create_ldev( pool_id => -1, block_capacity => $blocks, ldev_id => int($svol_id) );
+        } );
+    } else {
+        my $res = $self->_call( sub { $self->{rest}->create_ldev( pool_id => -1, block_capacity => $blocks ) } );
+        $svol_id = "$res->{resourceId}";
+    }
+
+    my $group   = "pve_lc_$svol_id";   # unique per clone → find this exact pair
+    my $pair_id = undef;
+    eval {
+        # 2. Data-only split pair on the source (NO svolLdevId).
+        $self->_call( sub {
+            $self->{rest}->create_snapshot(
+                pvol_ldev_id   => $backend_id,
+                snap_pool_id   => $self->{snap_pool_id},
+                snapshot_group => $group,
+                auto_split     => 1,
+            );
+        } );
+        $pair_id = $self->_find_pair_id( $backend_id, $group );
+        $self->_err( 'internal', "linked-clone pair '$group' not found after creation" )
+            unless defined $pair_id;
+
+        # 3. Map the S-VOL locally so it has LU paths (required before assign).
+        $self->ensure_host_access(%hctx);
+        $self->publish_lu( $svol_id, %hctx );
+
+        # 4. Attach the S-VOL to the pair's snapshot data → host-R/W CoW view (PSUS).
+        $self->_call( sub { $self->{rest}->assign_snapshot_volume( $pair_id, int($svol_id) ) } );
+    };
+    if ( my $err = $@ ) {
+        # Roll back in reverse so no S-VOL/pair is orphaned on a shared pool: release
+        # the pair (frees the snapshot data + unassigns the S-VOL), unmap, delete.
+        $pair_id //= eval { $self->_find_pair_id( $backend_id, $group ) };
+        eval { $self->{rest}->delete_snapshot($pair_id) } if defined $pair_id;
+        eval { $self->unpublish_lu( $svol_id, %hctx ) };
+        eval { $self->{rest}->delete_ldev( int($svol_id) ) };
+        die ref $err ? $err : "create_linked_clone failed: $err";
+    }
+
     return $svol_id;
+}
+
+# Find the Thin Image pair id (snapshotId = "pvolLdevId,muNumber") on $pvol whose
+# snapshot group is exactly $group, or undef.
+sub _find_pair_id {
+    my ($self, $pvol, $group) = @_;
+    my $snaps = $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $pvol ) } );
+    my ($pair) = grep { ( $_->{snapshotGroupName} // '' ) eq $group } @$snaps;
+    return $pair ? $pair->{snapshotId} : undef;
 }
 
 # Full (non-CoW) copy via clone_snapshot_to_ldev (isClone). Out-of-band / fclu-CLI

@@ -83,18 +83,27 @@ subtest 'QoS round-trip' => sub {
     like( $@->message, qr/non-empty hashref/, 'empty qos rejected' );
 };
 
-subtest 'create_linked_clone allocates an S-VOL + binds a CoW pair' => sub {
+subtest 'create_linked_clone: #24 flow (TI vvol S-VOL, data-only pair, map, assign)' => sub {
     my ( $d, $f ) = setup();
     my $bid = $d->create_lu( size_bytes => GIB );
 
-    my $clone = $d->create_linked_clone($bid);
+    # host_ctx is REQUIRED (#24): the S-VOL must be mapped before assign_snapshot_volume.
+    my %hctx = ( hostname => 'node-a', protocol => 'scsi-fc', initiators => ['10000000c0a80001'] );
+    my $clone = $d->create_linked_clone( $bid, host_ctx => \%hctx );
     isnt( $clone, $bid, 'clone is a distinct LU' );
     ok( $d->get_lu($clone), 'clone ldev is gettable' );
-    # The clone S-VOL is sized to the parent.
     is( $d->get_lu($clone)->{size_bytes}, GIB, 'clone sized to parent' );
-    # A Thin Image pair binds parent -> clone.
+
+    # The S-VOL was created as a Thin Image virtual volume (poolId -1), NOT from a pool.
+    is( $f->{ldevs}{$clone}{poolId}, -1, 'S-VOL is a TI virtual volume (poolId -1)' );
+    # The pair was created data-only then the S-VOL assigned to it.
+    is( $f->{calls}{assign_snapshot_volume}, 1, 'S-VOL assigned to the pair (#24)' );
     my ($pair) = @{ $d->list_snapshots($bid) };
-    is( $pair->{meta}{svol}, $clone, 'pair S-VOL is the clone' );
+    is( $pair->{meta}{svol}, $clone, 'pair S-VOL is the clone after assign' );
+
+    # #24 requires host_ctx — refuse without it.
+    eval { $d->create_linked_clone($bid) };
+    like( $@, qr/host_ctx/, 'create_linked_clone without host_ctx is refused' );
 };
 
 subtest 'create_full_clone uses the clone (full-copy) path' => sub {

@@ -1,3 +1,18 @@
+pve-fclu (0.1.0~alpha7) stable; urgency=medium
+
+  * hitachi: implement the REAL #24 linked-clone flow in create_linked_clone
+    (the simulator flow was confirmed rejected live on the E590H: "the snapshot
+    S-VOL does not have LU paths"). New sequence: create the S-VOL as a Thin
+    Image VIRTUAL volume (poolId -1) -> create a DATA-ONLY autoSplit pair on the
+    source (no svolLdevId) -> MAP the S-VOL via ensure_host_access + publish_lu
+    (host_ctx, already passed by clone_image) so it has LU paths -> assign the
+    S-VOL to the pair. Internal reverse-order rollback (release pair, unmap,
+    delete S-VOL) so a mid-flow failure leaves no orphan on the shared pool.
+    host_ctx is now required. Conformance sim (FakeHitachiRest) + hitachi_snapshots
+    + ContractTest updated for the new flow.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 17:20:00 -0300
+
 pve-fclu (0.1.0~alpha6) stable; urgency=medium
 
   * FCMultipath: two fixes found during live E590H data-path testing (activate
