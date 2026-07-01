@@ -64,6 +64,96 @@ sub plugindata {
     };
 }
 
+# ── Configuration schema (§5) ──
+#
+# The vendor-neutral, safe-to-share subset only. A vendor subclass MERGES its own
+# typed properties over these (`{ %{ $class->SUPER::properties }, <vendor…> }`) and
+# NEVER redeclares `username`/`password`: PVE's base/other plugins already define
+# them, and a duplicate makes PVE::SectionConfig die "duplicate property" (§5). They
+# are referenced (not defined) in options() so PVE keeps `password` out of
+# storage.cfg and hands it to the add/update hooks via %sensitive.
+sub properties {
+    return {
+        mgmt_ip => {
+            description => "Management endpoint (IP/hostname) of the array's control-plane"
+                . " REST API. May be a comma-separated list for management-plane failover.",
+            type        => 'string',
+        },
+        pool_id => {
+            description => "Backend pool reference for volume (LU) allocation.",
+            type        => 'string',
+        },
+        snap_pool_id => {
+            description => "Pool reference for snapshot/clone allocation (defaults to pool_id).",
+            type        => 'string',
+            optional    => 1,
+        },
+        qos_upper_iops => {
+            description => "Default upper IOPS limit per volume (0 = unlimited).",
+            type        => 'integer', minimum => 0, optional => 1,
+        },
+        qos_upper_mbps => {
+            description => "Default upper throughput limit per volume in MB/s (0 = unlimited).",
+            type        => 'integer', minimum => 0, optional => 1,
+        },
+        qos_lower_iops => {
+            description => "Default lower IOPS guarantee per volume.",
+            type        => 'integer', minimum => 0, optional => 1,
+        },
+        qos_lower_mbps => {
+            description => "Default lower throughput guarantee per volume in MB/s.",
+            type        => 'integer', minimum => 0, optional => 1,
+        },
+        qos_priority => {
+            description => "Default QoS I/O response priority (1=high, 2=medium, 3=low).",
+            type        => 'integer', minimum => 1, maximum => 3, optional => 1,
+        },
+        tls_verify => {
+            description => "Verify the control-plane TLS certificate (default off for self-signed).",
+            type        => 'boolean', default => 0, optional => 1,
+        },
+        tls_ca_file => {
+            description => "CA bundle path used to verify the API certificate when tls_verify is on.",
+            type        => 'string', optional => 1,
+        },
+        lock_timeout => {
+            description => "Seconds to wait to ACQUIRE the per-storage cluster lock for"
+                . " provisioning (alloc/free/clone). Extends only the acquisition wait; pmxcfs"
+                . " still hard-caps the locked work at 60s.",
+            type        => 'integer', minimum => 10, default => 120, optional => 1,
+        },
+        debug => {
+            description => "Diagnostic logging verbosity (0 = off .. 3 = trace). Credentials are"
+                . " never logged at any level.",
+            type        => 'integer', minimum => 0, maximum => 3, default => 0, optional => 1,
+        },
+    };
+}
+
+sub options {
+    return {
+        mgmt_ip      => { fixed => 1 },
+        pool_id      => { fixed => 1 },
+        snap_pool_id => { optional => 1 },
+        qos_upper_iops => { optional => 1 },
+        qos_upper_mbps => { optional => 1 },
+        qos_lower_iops => { optional => 1 },
+        qos_lower_mbps => { optional => 1 },
+        qos_priority   => { optional => 1 },
+        tls_verify   => { optional => 1 },
+        tls_ca_file  => { optional => 1 },
+        lock_timeout => { optional => 1 },
+        debug        => { optional => 1 },
+        # Inherited PVE properties — referenced, never redeclared in properties().
+        nodes    => { optional => 1 },
+        shared   => { optional => 1 },
+        disable  => { optional => 1 },
+        content  => { optional => 1 },
+        username => { optional => 1 },
+        password => { optional => 1 },
+    };
+}
+
 # ── Abstract vendor hooks (the subclass provides these) ──
 
 sub _abstract {
@@ -151,6 +241,100 @@ sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
     my ( $total, $free, $used ) = $class->_driver( $storeid, $scfg )->storage_status;
     return ( $total, $free, $used, 1 );
+}
+
+# ── Registration lifecycle (§5) ──
+#
+# Credentials live in the cluster-private FCLU::Credentials store (0600). `username`
+# is a normal storage.cfg property; `password` is sensitive (§`sensitive-properties`)
+# and arrives via %sensitive, never persisted to storage.cfg.
+
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %sensitive) = @_;
+
+    my $username = $scfg->{username};
+    my $password = $sensitive{password};
+    die "$class: 'username' and 'password' are required\n"
+        if !defined $username || !defined $password;
+    $class->_credentials($storeid)->store( $username, $password );
+
+    # Connectivity probe: build a driver from this config, connect, reach the pool,
+    # and ALWAYS tear the session down (never leak an array session on validation).
+    my $d = $class->_build_driver( $storeid, $scfg );
+    eval {
+        $d->connect;
+        $d->storage_status;
+    };
+    my $err = $@;
+    eval { $d->disconnect };
+    if ($err) {
+        # Don't leave an orphan credential file for a storage PVE never created.
+        eval { $class->_credentials($storeid)->delete };
+        die "storage validation failed: $err";
+    }
+
+    return;
+}
+
+sub on_update_hook {
+    my ($class, $storeid, $scfg, %sensitive) = @_;
+
+    my $creds = $class->_credentials($storeid);
+
+    # Explicit password clear (`pvesm set --delete password`) removes stored creds.
+    if ( exists $sensitive{password} && !defined $sensitive{password} ) {
+        $creds->delete;
+        return;
+    }
+
+    my $username = $scfg->{username};
+    # Use the new password when (re)set, else keep the stored one so a username-only
+    # change still rewrites a complete credential file.
+    my $password = $sensitive{password};
+    $password = eval { ( $creds->read )[1] } if !defined $password;
+
+    $creds->store( $username, $password )
+        if defined $username && defined $password;
+
+    return;
+}
+
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+    $class->_credentials($storeid)->delete;
+    return;
+}
+
+# Our volumes are raw block LUNs; snapshots are taken array-side (Thin Image et al.),
+# transparently to a running guest — qemu never snapshots the disk itself.
+sub volume_qemu_snapshot_method {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    return 'storage';
+}
+
+# Per-storage lock ACQUISITION timeout (#10): PVE core wraps the mutating ops
+# (alloc/free/clone/rename) in cluster_lock_storage with NO explicit timeout, so the
+# pmxcfs default (~10s) applies — too short when many disks provision concurrently and
+# serialize here. Substitute the configured `lock_timeout` only when PVE passes undef;
+# an explicit caller timeout passes through. This extends only the wait to ACQUIRE the
+# lock — pmxcfs still hard-caps the locked work at 60s, which no setting can change.
+sub cluster_lock_storage {
+    my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
+
+    if ( !defined $timeout ) {
+        # PVE::Storage is fully loaded by lock time, so call it fully-qualified — a
+        # compile-time `use PVE::Storage` would create a circular dep in a custom
+        # plugin. The eval only guards reading storage.cfg before the cluster fs is up.
+        my $configured;
+        eval {
+            my $cfg = PVE::Storage::config();
+            $configured = $cfg->{ids}{$storeid}{lock_timeout};
+        };
+        warn "FCLU: lock_timeout lookup for '$storeid' failed, using default: $@" if $@;
+        $timeout = $configured // 120;
+    }
+
+    return $class->SUPER::cluster_lock_storage( $storeid, $shared, $timeout, $func, @param );
 }
 
 # ── Volume lifecycle: provision + map (§5/§7) ──

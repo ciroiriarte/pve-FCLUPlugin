@@ -18,8 +18,17 @@ BEGIN {
     sub read_common_header  { return $main::IMPORT_SIZE // 0; }
     # Free-name helper (inherited from PVE::Storage::Plugin in production).
     sub find_free_diskname { my ( $class, $storeid, $scfg, $vmid, $fmt ) = @_; return "vm-${vmid}-disk-7"; }
+    # SUPER::cluster_lock_storage stub: record the resolved timeout, then run $func.
+    our @LOCK_TIMEOUTS;
+    sub cluster_lock_storage {
+        my ( $class, $storeid, $shared, $timeout, $func, @param ) = @_;
+        push @LOCK_TIMEOUTS, $timeout;
+        return $func ? $func->(@param) : $timeout;
+    }
     package PVE::Storage;
     sub APIVER { 11 }
+    # storage.cfg accessor stub for cluster_lock_storage's lock_timeout lookup.
+    sub config { return { ids => ( $main::PVE_STORAGE_IDS // {} ) } }
     package PVE::Tools;
     $INC{'PVE/Tools.pm'} = 1;
     our @CMDS;
@@ -37,8 +46,8 @@ use PVE::Storage::FCLU::Plugin;
     our $SEQ = 1000;
     sub new { bless { connected => 0, status => $_[1], lus => {}, calls => {} }, $_[0] }
     sub connect    { $_[0]{connected} = 1; $_[0] }
-    sub disconnect { $_[0]{connected} = 0; 1 }
-    sub storage_status { @{ $_[0]{status} // [ 1000, 600, 400 ] } }
+    sub disconnect { $_[0]{calls}{disconnect}++; $_[0]{connected} = 0; 1 }
+    sub storage_status { my ($s) = @_; die "BOOM status\n" if $s->{fail_status}; @{ $s->{status} // [ 1000, 600, 400 ] } }
     sub detect_profile { { max_label_len => 32 } }
     sub _id { my $s = shift; my $n = $_[0]; return defined $n ? "$n" : '' . ++$SEQ; }
     sub create_lu {
@@ -129,6 +138,7 @@ my $P = 'T::Plugin';
 # Redirect the registry store to a tempdir for every test.
 my $dir = tempdir( CLEANUP => 1 );
 $PVE::Storage::FCLU::Plugin::REGISTRY_BASE_DIR = $dir;
+$PVE::Storage::FCLU::Plugin::CREDS_BASE_DIR    = $dir;
 
 sub reg { return PVE::Storage::FCLU::Registry->new( storeid => 'store1', base_dir => $dir ) }
 
@@ -668,6 +678,77 @@ subtest 'free_image rediscovers a linked-clone backing pair from the parent (#23
     is( $P->free_image( 'store1', {}, $clone ), undef, 'clone freed' );
     is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'backing pair rediscovered + released via the parent' );
     is_deeply( $T::Plugin::FAKE->{snaps}{$pbid}, [], 'the rediscovered pair was removed' );
+};
+
+subtest 'schema: properties() omits username/password; options() references them (§5 landmine)' => sub {
+    my $props = $P->properties;
+    ok( $props->{mgmt_ip} && $props->{pool_id}, 'generic properties declared' );
+    ok( !exists $props->{username}, 'username NOT redeclared in properties (avoids the duplicate-property die)' );
+    ok( !exists $props->{password}, 'password NOT redeclared in properties' );
+    is( $props->{qos_priority}{maximum}, 3, 'typed QoS property carries constraints' );
+
+    my $opts = $P->options;
+    ok( $opts->{username} && $opts->{password}, 'username/password referenced in options' );
+    ok( $opts->{mgmt_ip}{fixed} && $opts->{pool_id}{fixed}, 'mgmt_ip + pool_id are fixed' );
+};
+
+subtest 'on_add_hook stores creds + probes connectivity (session always torn down)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    $P->on_add_hook( 'store1', { username => 'u', pool_id => '63' }, password => 'secret' );
+    my ( $u, $pw ) = PVE::Storage::FCLU::Credentials->new( storeid => 'store1', base_dir => $dir )->read;
+    is( $u, 'u', 'username stored' );
+    is( $pw, 'secret', 'password stored' );
+    ok( $T::Plugin::FAKE->{calls}{disconnect}, 'probe session disconnected' );
+
+    eval { $P->on_add_hook( 'store1', { pool_id => '63' }, password => 'x' ) };
+    like( $@, qr/required/, 'missing username refused' );
+};
+
+subtest 'on_add_hook: a failing probe dies, tears the session down, and rolls back creds' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store_probe', {} );
+    $T::Plugin::FAKE->{fail_status} = 1;
+    eval { $P->on_add_hook( 'store_probe', { username => 'u', pool_id => '63' }, password => 's' ) };
+    like( $@, qr/storage validation failed/, 'a bad probe surfaces' );
+    ok( $T::Plugin::FAKE->{calls}{disconnect}, 'session torn down despite the failure' );
+    eval { PVE::Storage::FCLU::Credentials->new( storeid => 'store_probe', base_dir => $dir )->read };
+    like( $@, qr/not found/, 'orphan credentials rolled back on probe failure' );
+};
+
+subtest 'on_update_hook / on_delete_hook credential lifecycle' => sub {
+    my $creds = PVE::Storage::FCLU::Credentials->new( storeid => 'store2', base_dir => $dir );
+    $creds->store( 'olduser', 'oldpass' );
+
+    $P->on_update_hook( 'store2', { username => 'newuser' } );
+    my ( $u, $pw ) = $creds->read;
+    is( $u, 'newuser', 'username updated' );
+    is( $pw, 'oldpass', 'password preserved on a username-only change' );
+
+    $P->on_update_hook( 'store2', { username => 'newuser' }, password => undef );
+    eval { $creds->read };
+    like( $@, qr/not found/, 'explicit password clear removed the credential file' );
+
+    $creds->store( 'u', 'p' );
+    $P->on_delete_hook( 'store2', {} );
+    eval { $creds->read };
+    like( $@, qr/not found/, 'on_delete cleared creds' );
+};
+
+subtest 'volume_qemu_snapshot_method + cluster_lock_storage timeout resolution' => sub {
+    is( $P->volume_qemu_snapshot_method( 'store1', {}, 'vm-1-disk-0' ), 'storage', 'array-side snapshot method' );
+
+    local @PVE::Storage::Plugin::LOCK_TIMEOUTS = ();
+    $P->cluster_lock_storage( 'store1', 0, 45, sub { 1 } );
+    is( $PVE::Storage::Plugin::LOCK_TIMEOUTS[-1], 45, 'an explicit timeout passes through' );
+
+    local $main::PVE_STORAGE_IDS = { store1 => { lock_timeout => 300 } };
+    $P->cluster_lock_storage( 'store1', 0, undef, sub { 1 } );
+    is( $PVE::Storage::Plugin::LOCK_TIMEOUTS[-1], 300, 'configured lock_timeout used when PVE passes undef' );
+
+    local $main::PVE_STORAGE_IDS = {};
+    $P->cluster_lock_storage( 'store1', 0, undef, sub { 1 } );
+    is( $PVE::Storage::Plugin::LOCK_TIMEOUTS[-1], 120, 'default 120 when unconfigured' );
 };
 
 done_testing();
