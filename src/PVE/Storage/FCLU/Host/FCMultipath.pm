@@ -133,8 +133,8 @@ sub attach {
 sub detach {
     my ($self, $identity) = @_;
     # Tolerate a volume that was allocated but never activated (its identity carries
-    # no usable device id): nothing was ever mapped, so detach is a no-op success.
-    # Otherwise free_image of such a volume would fail on the missing wwid.
+    # no usable device id): nothing was ever mapped, so detach is a no-op success
+    # rather than a spurious per-free warning on the missing wwid.
     my $wwid = eval { $self->_wwid_from_identity($identity) };
     return 1 unless defined $wwid && length $wwid;
     return $self->remove_device($wwid);

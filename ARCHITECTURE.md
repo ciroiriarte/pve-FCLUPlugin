@@ -136,7 +136,7 @@ sub create_snapshot    { }
 sub delete_snapshot    { }
 sub restore_snapshot   { }
 sub list_snapshots     { }
-sub create_linked_clone{ }   # persistent CoW child (PVE clone_image primitive)
+sub create_linked_clone{ }   # persistent CoW child; takes host_ctx (#24: S-VOL mapped before assign)
 sub create_full_clone  { }   # optional
 sub create_cg_snapshot { }   # optional: consistency-group snapshot
 ```

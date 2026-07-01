@@ -568,13 +568,11 @@ sub _alloc_svol {
 # Persistent CoW child — the PVE clone_image primitive (§6). Allocate an S-VOL and
 # bind it to the parent via an autoSplit Thin Image pair.
 #
-# REAL-ARRAY CAVEAT (#24): on E590H microcode the array rejects svolLdevId at pair
-# creation and requires the S-VOL to already have LU paths, so the production flow
-# is create-pair-without-svol -> map S-VOL -> assign_snapshot_volume. That needs a
-# host context the §2 create_linked_clone signature does not carry, so it is
-# orchestrated by FCLU::Plugin (which has it) using the RestClient's
-# assign_snapshot_volume; the driver here performs the array steps it can, and the
-# conformance simulator validates the contract shape.
+# REAL-ARRAY FLOW (#24, verified live on the E590H): the array rejects svolLdevId at
+# pair creation ("the snapshot S-VOL does not have LU paths"), so the S-VOL must be
+# MAPPED before it can be bound to the pair. The §2 signature carries host_ctx for
+# exactly this — the driver creates the pair without an S-VOL, maps the S-VOL itself
+# (ensure_host_access + publish_lu), then assign_snapshot_volume. host_ctx is required.
 sub create_linked_clone {
     my ($self, $backend_id, %args) = @_;
 
@@ -634,12 +632,26 @@ sub create_linked_clone {
         $self->_call( sub { $self->{rest}->assign_snapshot_volume( $pair_id, int($svol_id) ) } );
     };
     if ( my $err = $@ ) {
-        # Roll back in reverse so no S-VOL/pair is orphaned on a shared pool: release
-        # the pair (frees the snapshot data + unassigns the S-VOL), unmap, delete.
+        # Reverse-order best-effort cleanup so no S-VOL/pair is orphaned on the shared
+        # pool: release the pair (frees snapshot data + unassigns the S-VOL) before
+        # deleting the LDEV (#23). Each step WARNS on failure — a silent failure would
+        # leak on shared production storage with no trail, the hardest leak to detect.
+        # Residual window: if create_snapshot took on the array but the pair is not yet
+        # visible to list_snapshots on both lookups (eventual consistency), the
+        # data-only pair can still orphan; the warn below is the operator's signal.
         $pair_id //= eval { $self->_find_pair_id( $backend_id, $group ) };
-        eval { $self->{rest}->delete_snapshot($pair_id) } if defined $pair_id;
+        if ( defined $pair_id ) {
+            eval { $self->{rest}->delete_snapshot($pair_id) };
+            warn "FCLU Hitachi: linked-clone rollback: releasing pair '$pair_id' failed: $@" if $@;
+        } else {
+            warn "FCLU Hitachi: linked-clone rollback: no pair found for group '$group' —"
+                . " a data-only Thin Image pair on pvol '$backend_id' may be orphaned\n";
+        }
         eval { $self->unpublish_lu( $svol_id, %hctx ) };
+        warn "FCLU Hitachi: linked-clone rollback: unmapping S-VOL '$svol_id' failed: $@" if $@;
         eval { $self->{rest}->delete_ldev( int($svol_id) ) };
+        warn "FCLU Hitachi: linked-clone rollback: deleting S-VOL '$svol_id' failed"
+            . " — LEAKED on the shared pool: $@" if $@;
         die ref $err ? $err : "create_linked_clone failed: $err";
     }
 
