@@ -48,6 +48,11 @@ install:
 	install -m0644 src/PVE/Storage/FCLU/Driver/Hitachi/RestClient.pm $(FCLU)/Driver/Hitachi/
 	install -d $(CUSTOM)
 	install -m0644 src/PVE/Storage/Custom/HitachiBlockPlugin.pm $(CUSTOM)/
+	# migration tool: reference pve-storage-hitachiblock store -> FCLU registry format
+	install -d $(FCLU)/Migrate
+	install -m0644 src/PVE/Storage/FCLU/Migrate/Hitachi.pm $(FCLU)/Migrate/
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m0755 bin/pve-fclu-migrate-hitachi $(DESTDIR)$(PREFIX)/bin/
 	# --- pve-fclu-hitachi: web UI panel, opt-in SCSI-3 PR units, config examples ---
 	install -d $(PVE_MANAGER_JS)
 	install -m0644 src/www/manager6/hitachiblock.js $(PVE_MANAGER_JS)/$(GUI_JS)

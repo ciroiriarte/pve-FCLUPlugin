@@ -1,0 +1,97 @@
+#!/usr/bin/perl
+#
+# pve-fclu-migrate-hitachi — migrate a reference pve-storage-hitachiblock store into
+# the FCLU on-disk format, so upgrading to pve-fclu-hitachi does not orphan existing
+# volumes. COPY mode: reads /etc/pve/priv/hitachiblock/<storeid>.{json,creds} and
+# writes /etc/pve/priv/fclu/<storeid>.{json,creds}; it NEVER deletes or mutates the
+# legacy store, so it is safe to run before swapping packages and re-runnable.
+#
+# Usage:
+#   pve-fclu-migrate-hitachi [options] <storeid> [<storeid> ...]
+#   pve-fclu-migrate-hitachi --all [options]
+#
+# Options:
+#   --all             migrate every store found under the legacy directory
+#   --dry-run         show what would be migrated; write nothing
+#   --legacy-dir DIR  legacy store dir (default /etc/pve/priv/hitachiblock)
+#   --fclu-dir DIR    FCLU store dir   (default /etc/pve/priv/fclu)
+#   --help
+#
+# Recommended flow (see docs/migration-hitachi.md):
+#   1. pve-fclu-migrate-hitachi --dry-run --all      # preview, no writes
+#   2. pve-fclu-migrate-hitachi --all                # copy into the FCLU store
+#   3. apt install pve-fclu-hitachi                  # swap the plugin
+#   4. pvesm status / verify guests resolve their disks
+#   (legacy /etc/pve/priv/hitachiblock is left intact as a rollback safety net)
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use PVE::Storage::FCLU::Migrate::Hitachi;
+
+sub usage {
+    print STDERR <<'USAGE';
+usage: pve-fclu-migrate-hitachi [--all] [--dry-run] [--legacy-dir DIR] [--fclu-dir DIR] [<storeid> ...]
+  COPY-mode migration of a reference pve-storage-hitachiblock store into the FCLU
+  format. Never touches the legacy store. Run --dry-run first.
+USAGE
+    exit(2);
+}
+
+my ( $all, $dry, $legacy_dir, $fclu_dir, $help );
+GetOptions(
+    'all'          => \$all,
+    'dry-run'      => \$dry,
+    'legacy-dir=s' => \$legacy_dir,
+    'fclu-dir=s'   => \$fclu_dir,
+    'help'         => \$help,
+) or usage();
+usage() if $help;
+
+my $legacy_base = $legacy_dir // $PVE::Storage::FCLU::Migrate::Hitachi::LEGACY_BASE;
+my $fclu_base   = $fclu_dir   // $PVE::Storage::FCLU::Migrate::Hitachi::FCLU_BASE;
+
+my @stores = @ARGV;
+if ($all) {
+    opendir( my $dh, $legacy_base ) or die "cannot read legacy dir '$legacy_base': $!\n";
+    @stores = sort map { /^(.+)\.json$/ ? ($1) : () } readdir($dh);
+    closedir($dh);
+    die "no legacy stores found under '$legacy_base'\n" unless @stores;
+}
+usage() unless @stores;
+
+my $failed = 0;
+for my $storeid (@stores) {
+    my $summary = eval {
+        PVE::Storage::FCLU::Migrate::Hitachi::migrate_store(
+            storeid     => $storeid,
+            legacy_base => $legacy_base,
+            fclu_base   => $fclu_base,
+            dry_run     => $dry,
+        );
+    };
+    if ( my $err = $@ ) {
+        chomp $err;
+        warn "migration of '$storeid' FAILED: $err\n";
+        $failed++;
+        next;
+    }
+
+    printf "%s '%s': %d volume(s), %d snapshot(s), credentials=%s%s\n",
+        ( $dry ? '[dry-run] would migrate' : 'migrated' ),
+        $storeid,
+        scalar @{ $summary->{volumes} },
+        $summary->{snapshots},
+        ( $summary->{creds} ? 'yes' : 'no' ),
+        ( $dry ? '' : " -> $fclu_base" );
+    printf "    %-28s -> backend %s\n", $_->{volname}, $_->{backend_id}
+        for @{ $summary->{volumes} };
+}
+
+if ( !$dry && !$failed ) {
+    print "\nDone. The legacy store under '$legacy_base' was left intact (rollback safety net).\n"
+        . "Next: 'apt install pve-fclu-hitachi', then verify 'pvesm status' and that guests resolve their disks.\n";
+}
+
+exit( $failed ? 1 : 0 );

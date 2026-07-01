@@ -139,10 +139,15 @@ cluster-wide. **New vs the reference — validate the §11 packaging.**
   only SAN): `storage.cfg` is cluster-wide, and a node missing the modules cannot resolve
   the `hitachiblock` type and silently drops the storage from its view. `nodes=` scopes
   activation separately.
-- B2. **Swap gate** (if the old package is present): confirm `apt install pve-fclu-hitachi`
-  cleanly removes `pve-storage-hitachiblock` (Conflicts/Replaces) with **no dpkg
-  file-overwrite error**, and any existing `type: hitachiblock` `storage.cfg` stanza keeps
-  working unchanged.
+- B2. **Swap gate — MIGRATE THE REGISTRY FIRST** (if the old package is present). The
+  reference and FCLU keep their volume→LU map in different stores and formats, so a naïve
+  swap orphans every existing volume. Follow `docs/migration-hitachi.md`: `apt install
+  pve-fclu-hitachi` (the running pvedaemon keeps the old plugin in memory; the legacy
+  `/etc/pve/priv/hitachiblock/` data survives) → `pve-fclu-migrate-hitachi --dry-run --all`
+  → `--all` → **only then** `systemctl restart pvedaemon pveproxy pvestatd`. Confirm the
+  swap has **no dpkg file-overwrite error**, `pvesm list` shows the **same** volumes before
+  and after, and existing guests resolve their disks. Rollback = reinstall the reference
+  package (the untouched legacy store is reused).
 - B3. **GUI gate:** `systemctl restart pvedaemon pveproxy`; in the web UI, Datacenter →
   Storage → Add shows **"Hitachi Block"**, the create dialog renders all fields, and the
   grid shows the friendly label. Confirm the `<script>` tag was injected into

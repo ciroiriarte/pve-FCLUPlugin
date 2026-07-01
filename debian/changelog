@@ -1,3 +1,21 @@
+pve-fclu (0.1.0~alpha4) stable; urgency=medium
+
+  * hitachi: add the pve-fclu-migrate-hitachi tool + PVE::Storage::FCLU::Migrate::
+    Hitachi module to migrate a reference pve-storage-hitachiblock on-disk store
+    into the FCLU registry format BEFORE swapping plugins — otherwise the swap
+    orphans existing volumes (FCLU::Registry reads /etc/pve/priv/fclu/, the
+    reference used /etc/pve/priv/hitachiblock/, and the two packages Conflict so
+    they can't coexist). COPY mode: it reads the legacy <storeid>.{json,creds} and
+    writes the FCLU store via FCLU::Registry/Credentials (guaranteed format,
+    atomic + 0600), never touching the legacy files (rollback safety net) and
+    idempotent. Maps ldev_id->backend_id (string), wwid->identity{naa},
+    pool_id->pool_ref, clone_snapshot_id/clone_pvol_ldev->clone_backing_snap/
+    clone_parent_backend (#23), and the snapshot subregistry. Validated on the
+    live lab store (13 volumes incl. a linked clone) in a dry run. See
+    docs/migration-hitachi.md. New t/unit/migrate_hitachi.t.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 15:00:00 -0300
+
 pve-fclu (0.1.0~alpha3) stable; urgency=medium
 
   * hitachiblock: wire the persistent_reservations validate-and-warn check into

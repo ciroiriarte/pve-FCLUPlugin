@@ -27,9 +27,27 @@ inject() {
     sed -i "\\#pvemanagerlib.js#a\\${line}" "$TPL"
 }
 
+# Warn (do NOT auto-migrate) when a reference pve-storage-hitachiblock registry is
+# present but no FCLU registry exists yet: swapping without migrating orphans volumes.
+warn_unmigrated() {
+    legacy=/etc/pve/priv/hitachiblock
+    fclu=/etc/pve/priv/fclu
+    [ -d "$legacy" ] || return 0
+    if ls "$legacy"/*.json >/dev/null 2>&1 && ! ls "$fclu"/*.json >/dev/null 2>&1; then
+        echo "" >&2
+        echo "pve-fclu-hitachi: a legacy pve-storage-hitachiblock registry was found and no" >&2
+        echo "  FCLU registry exists yet. Existing volumes will be INVISIBLE until you migrate:" >&2
+        echo "    pve-fclu-migrate-hitachi --dry-run --all   # preview" >&2
+        echo "    pve-fclu-migrate-hitachi --all             # then migrate" >&2
+        echo "  Run it BEFORE restarting pvedaemon. See docs/migration-hitachi.md." >&2
+        echo "" >&2
+    fi
+}
+
 case "$1" in
     configure|triggered)
         inject
+        warn_unmigrated
         ;;
 esac
 
