@@ -205,8 +205,12 @@ subtest 'host_context: scsi-fc + local initiators + hostname' => sub {
 subtest 'attach/detach/resize/flush translate identity -> bare wwid' => sub {
     my $mp = $P->new;
     my %got;
+    my @order;
     no warnings 'redefine';
-    local *PVE::Storage::FCLU::Host::FCMultipath::wait_for_device = sub { $got{attach} = $_[1]; '/dev/mapper/3x' };
+    # attach MUST rescan the SCSI hosts before waiting, else a just-published LUN
+    # never appears (live-found on the E590H).
+    local *PVE::Storage::FCLU::Host::FCMultipath::rescan_scsi_hosts = sub { push @order, 'rescan'; $got{rescan}++ };
+    local *PVE::Storage::FCLU::Host::FCMultipath::wait_for_device = sub { push @order, 'wait'; $got{attach} = $_[1]; '/dev/mapper/3x' };
     local *PVE::Storage::FCLU::Host::FCMultipath::remove_device   = sub { $got{detach} = $_[1]; 1 };
     local *PVE::Storage::FCLU::Host::FCMultipath::resize_device   = sub { $got{resize} = $_[1]; 1 };
     local *PVE::Storage::FCLU::Host::FCMultipath::flush_device    = sub { $got{flush}  = $_[1]; 1 };
@@ -220,6 +224,14 @@ subtest 'attach/detach/resize/flush translate identity -> bare wwid' => sub {
     is( $got{detach}, '60060e80ff', 'detach translated identity' );
     is( $got{resize}, '60060e80ff', 'resize translated identity' );
     is( $got{flush},  '60060e80ff', 'flush translated identity' );
+    is( $got{rescan}, 1, 'attach rescanned the SCSI hosts' );
+    is_deeply( \@order, [ 'rescan', 'wait' ], 'rescan happens BEFORE waiting for the device' );
+
+    # A volume allocated but never activated has no usable device id — detach must
+    # be a no-op success (so free_image can still tear it down).
+    delete $got{detach};
+    is( $mp->detach( { ids => {} } ), 1, 'detach of a null-identity volume is a no-op success' );
+    ok( !exists $got{detach}, 'no remove_device call for a null identity' );
 };
 
 subtest 'check_pr_ready validate-and-warn with vendor-neutral wording' => sub {

@@ -1,3 +1,16 @@
+pve-fclu (0.1.0~alpha6) stable; urgency=medium
+
+  * FCMultipath: two fixes found during live E590H data-path testing (activate
+    mapped the LUN array-side but the host device never appeared):
+    - attach() now rescan_scsi_hosts BEFORE wait_for_device — publish_lu adds the
+      LU paths array-side, but the host must rescan its SCSI/FC hosts before
+      multipathd can assemble /dev/mapper/3<naa>. Without it activate timed out.
+    - detach() is a no-op success when the identity carries no usable device id
+      (a volume allocated but never activated), so free_image can still tear it
+      down instead of dying on the missing wwid.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 16:40:00 -0300
+
 pve-fclu (0.1.0~alpha5) stable; urgency=medium
 
   * plugin: FIX a showstopper found during the live E590H cutover — the base

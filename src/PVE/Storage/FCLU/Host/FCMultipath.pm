@@ -121,12 +121,23 @@ sub device_path {
 
 sub attach {
     my ($self, $identity, $timeout) = @_;
-    return $self->wait_for_device( $self->_wwid_from_identity($identity), $timeout );
+    my $wwid = $self->_wwid_from_identity($identity);
+    # The driver added the LU paths array-side (publish_lu), but the host must rescan
+    # its SCSI/FC hosts before multipathd can see the new LUN and assemble the device.
+    # Without this the multipath node never appears and wait_for_device times out
+    # (found live on the E590H: publish_lu mapped ldev 267 but /dev/mapper never came up).
+    $self->rescan_scsi_hosts;
+    return $self->wait_for_device( $wwid, $timeout );
 }
 
 sub detach {
     my ($self, $identity) = @_;
-    return $self->remove_device( $self->_wwid_from_identity($identity) );
+    # Tolerate a volume that was allocated but never activated (its identity carries
+    # no usable device id): nothing was ever mapped, so detach is a no-op success.
+    # Otherwise free_image of such a volume would fail on the missing wwid.
+    my $wwid = eval { $self->_wwid_from_identity($identity) };
+    return 1 unless defined $wwid && length $wwid;
+    return $self->remove_device($wwid);
 }
 
 sub resize {
