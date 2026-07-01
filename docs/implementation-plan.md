@@ -137,12 +137,31 @@ a time.
       rollback never deletes it). **Step 4 orchestration complete (4A–4E).**
       Deferred to later steps: consistency-group snapshots and live-migration/orphan
       sweeps.
-- [ ] Add profile detection + quirk handling behind the driver (§4); delete
-      scattered platform/microcode conditionals.
-- [ ] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`
-      subclass (§5); GUI unchanged; `storage.cfg` backward-compatible.
+- [x] Add profile detection + quirk handling behind the driver (§4); delete
+      scattered platform/microcode conditionals. **Done in the Driver::Hitachi
+      slices:** the `%PLATFORM` table (`vsp_g`/`vsp_e`/`vsp_one` — port split,
+      `min_lu_mb`, `op_timeout_s`, `quirks`) with `profile()`/`detect_profile()`/
+      `capabilities()`; every platform/microcode delta is read *through* the profile
+      (`$self->profile->{…}`), not scattered.
+- [x] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`
+      subclass (§5); GUI unchanged; `storage.cfg` backward-compatible. **Slice 5A
+      done:** generic base surface on `FCLU::Plugin` — `properties()`/`options()`
+      (vendor-neutral subset; `username`/`password` referenced, never redeclared, to
+      dodge the SectionConfig duplicate-property die), `on_add`/`on_update`/
+      `on_delete_hook` (credential lifecycle via `FCLU::Credentials` + an
+      always-torn-down connectivity probe), `cluster_lock_storage` (configurable
+      `lock_timeout`, #10), `volume_qemu_snapshot_method`='storage'. **Slice 5B
+      done:** `src/PVE/Storage/Custom/HitachiBlockPlugin.pm` — `type`/`vendor`/
+      `driver_class`, `driver_config` (scfg→driver opts incl. `target_ports`→
+      `array_ports` and `rest_keepalive`→`sessionless`), vendor `properties()`/
+      `options()` merged over the base, the §7 `safe_delete_precheck` ldev_range
+      FENCE + `_alloc_backend_id` (next free in-range id via the new
+      `Driver::Hitachi::next_free_backend_id`, registry-reserved excluded),
+      `_parse_ldev_range`/CU-alignment hint. Tests: `t/unit/plugin.t` (5A),
+      `t/unit/hitachiblock_plugin.t` (5B), `t/unit/hitachi_lu.t` (driver hook).
 - [ ] Validate the abstraction with a **second** driver before trusting it (§10) —
-      target pending the maintainer's "Open decisions" (Pure FlashArray recommended).
+      maintainer chose the Hitachi Ops Center CM connector (23451 vs embedded 443) as
+      a Profile concern inside `Driver::Hitachi`, before foreign vendors.
 
 ## Notes
 - Tests: `make test` (`prove -Isrc -r t/unit/`).

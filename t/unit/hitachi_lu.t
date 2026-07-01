@@ -181,4 +181,22 @@ subtest 'set_lu_label invokes the transport' => sub {
     is_deeply( [ @{$lc}[ 1, 2 ] ], [ '42', 'newlabel' ], 'set_ldev_label(id,label)' );
 };
 
+subtest 'next_free_backend_id: first free in-range id, excluding defined + reserved' => sub {
+    my ( $d, $m ) = mk(
+        { list_defined_ldevs_in_range => sub { [ { ldevId => 1000 }, { ldevId => 1002 } ] } } );
+
+    # Array has 1000 + 1002 defined; the registry reserves 1001 -> first free is 1003.
+    is( $d->next_free_backend_id( min => 1000, max => 1005, reserved => ['1001'] ), '1003',
+        'skips array-defined (1000,1002) and reserved (1001)' );
+    my ($call) = $m->called('list_defined_ldevs_in_range');
+    is_deeply( [ @{$call}[ 1, 2 ] ], [ 1000, 1005 ], 'paged the configured range' );
+
+    my ( $d2, $m2 ) = mk( { list_defined_ldevs_in_range => sub { [ { ldevId => 1000 } ] } } );
+    eval { $d2->next_free_backend_id( min => 1000, max => 1000, reserved => [] ) };
+    like( $@, qr/no free LDEV id/, 'an exhausted range dies (out_of_space)' );
+
+    eval { $d->next_free_backend_id( min => 5, max => 1 ) };
+    like( $@, qr{min/max}, 'an inverted range is rejected (invalid)' );
+};
+
 done_testing();

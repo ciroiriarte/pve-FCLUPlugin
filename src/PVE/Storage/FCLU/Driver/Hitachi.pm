@@ -332,6 +332,29 @@ sub list_lus {
              grep { $self->_is_defined_ldev($_) } @$ldevs ];
 }
 
+# Vendor allocation hook — NOT part of the §2 contract. Return the first LDEV id in
+# [$min,$max] that is neither DEFINED on the array nor in the caller-supplied
+# `reserved` set (the registry's already-claimed ids). The paired FCLU::Plugin
+# subclass calls this for ldev_range-constrained allocation, so create_lu gets an
+# explicit in-range id and the §7 teardown fence stays valid (#20). Backend ids are
+# strings (§7); ids are compared as strings. The RestClient pages the range (the
+# GUM 503s on a whole-array count), skipping NOT DEFINED slots.
+sub next_free_backend_id {
+    my ($self, %args) = @_;
+    my ( $min, $max ) = @args{qw(min max)};
+    $self->_err( 'invalid', 'min/max are required and min must be <= max' )
+        unless defined $min && defined $max && $min <= $max;
+
+    my %used = map { ( "$_" => 1 ) } @{ $args{reserved} // [] };
+    my $defined = $self->_call( sub { $self->{rest}->list_defined_ldevs_in_range( $min, $max ) } );
+    $used{ "$_->{ldevId}" } = 1 for grep { defined $_->{ldevId} } @$defined;
+
+    for my $id ( $min .. $max ) {
+        return "$id" unless $used{"$id"};
+    }
+    $self->_err( 'out_of_space', "no free LDEV id in range $min-$max" );
+}
+
 sub set_lu_label {
     my ($self, $backend_id, $label) = @_;
     $self->_call( sub { $self->{rest}->set_ldev_label( $backend_id, $label ) } );
