@@ -98,7 +98,7 @@ a time.
       safety FENCE §7), `activate`/`deactivate_volume` map/unmap orchestration,
       snapshot/clone orchestration (incl the #24 linked-clone assign flow),
       `volume_export`/`import`, `create_base`/`rename`/`manage`/`migrate`/orphans.
-- [~] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
+- [x] Move orchestration (alloc/free/activate/snapshot/clone) into `FCLU::Plugin`
       one operation at a time, swapping direct REST calls for driver-contract calls.
       **Slice 4B done:** the provision+map lifecycle — `alloc_image` (reserve →
       driver `create_lu` (+`requested_id` from the `_alloc_backend_id` vendor hook)
@@ -129,8 +129,14 @@ a time.
       (opaque `snap_id` via the §2 `list_snapshots` contract + a parent-rediscovery
       fallback — no ABI bump), `create_base`, and capability-gated `volume_has_feature`.
       Test: `t/unit/plugin.t` (fake driver + connector).
-      **Deferred (4E):** storage-migration `volume_export`/`import`, and the
-      reassign/adopt tail `rename`/`manage`/`unmanage`.
+      **Slice 4E done:** storage-migration `volume_export`/`import`/`*_formats`
+      (raw+size stream via `filesystem_path` + `run_command(dd)`, `PVE::Tools`
+      `require`d lazily so the standalone compile-check needs no PVE install), and
+      the reassign/adopt tail — `rename_volume` (dependent guard + `find_free_diskname`
+      fallback), `manage_volume`/`unmanage_volume` (adopt/release an existing LU;
+      rollback never deletes it). **Step 4 orchestration complete (4A–4E).**
+      Deferred to later steps: consistency-group snapshots and live-migration/orphan
+      sweeps.
 - [ ] Add profile detection + quirk handling behind the driver (§4); delete
       scattered platform/microcode conditionals.
 - [ ] Cutover: `HitachiBlockPlugin` becomes the thin `type()='hitachiblock'`

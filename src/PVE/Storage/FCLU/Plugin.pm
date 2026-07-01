@@ -762,6 +762,192 @@ sub create_base {
     return $base_name;
 }
 
+# ── Storage migration (volume export / import, §5) ──
+#
+# Lets the volume ride PVE's storage_migrate path — offline `qm migrate` to a node
+# where this storage is not shared, cross-cluster `qm remote-migrate`, and
+# `pvesm export`/`import`. We stream the raw block device (`raw+size`), exactly like
+# the RBD plugin. Same-node/cluster "Move Storage" does NOT use these (qemu copies
+# through the device path). Array-offloaded snapshots are NOT in the stream: only
+# the active volume state transfers, so with_snapshots/incremental are unsupported.
+
+sub volume_export_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+    return $class->volume_import_formats(
+        $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots );
+}
+
+sub volume_import_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+    return () if $with_snapshots;          # array snapshots are not streamed
+    return () if defined($base_snapshot);  # no incremental streams
+    return () if defined($snapshot);       # no snapshot-specific export
+    return ('raw+size');
+}
+
+sub volume_export {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots)
+        = @_;
+
+    die "volume export format '$format' not available for $class\n" if $format ne 'raw+size';
+    die "cannot export volumes together with their snapshots in $class\n" if $with_snapshots;
+    die "cannot export a snapshot in $class\n"            if defined($snapshot);
+    die "cannot export an incremental stream in $class\n" if defined($base_snapshot);
+
+    # The LUN is already mapped and its device present on this node (the migration
+    # framework activates source volumes before export).
+    my $path   = $class->filesystem_path( $scfg, $volname, $storeid );
+    my ($size) = $class->volume_size_info( $scfg, $storeid, $volname );
+
+    require PVE::Tools;
+    PVE::Storage::Plugin::write_common_header( $fh, $size );
+    PVE::Tools::run_command(
+        [ 'dd', "if=$path", 'bs=4k', 'status=progress' ],
+        output  => '>&' . fileno($fh),
+        # dd draws progress with carriage returns; split into individual log lines.
+        errfunc => sub { print STDERR "$_[0]\n" },
+    );
+
+    return;
+}
+
+sub volume_import {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot,
+        $with_snapshots, $allow_rename) = @_;
+
+    die "volume import format '$format' not available for $class\n" if $format ne 'raw+size';
+    die "cannot import volumes together with their snapshots in $class\n" if $with_snapshots;
+    die "cannot import an incremental stream in $class\n" if defined($base_snapshot);
+
+    my ( undef, $name, $vmid, undef, undef, undef, $file_format ) = $class->parse_volname($volname);
+    die "cannot import format $format into a volume of format $file_format\n"
+        if $file_format ne 'raw';
+
+    my $reg = $class->_registry($storeid);
+    if ( defined $reg->lookup($volname) ) {
+        die "volume '$volname' already exists\n" if !$allow_rename;
+        warn "volume '$volname' already exists - importing with a different name\n";
+        $name = undef;   # let alloc_image reserve a fresh name under the cluster lock
+    }
+
+    require PVE::Tools;
+    # Header size is in bytes; alloc_image expects KiB.
+    my ($size)  = PVE::Storage::Plugin::read_common_header($fh);
+    my $size_kb = ceil( $size / 1024 );
+
+    my $new_volname;
+    eval {
+        # alloc creates + registers the LU (host mapping deferred); activate maps it
+        # to this node so the device path exists for the dd below.
+        $new_volname = $class->alloc_image( $storeid, $scfg, $vmid, 'raw', $name, $size_kb );
+        $class->activate_volume( $storeid, $scfg, $new_volname );
+        my $path = $class->filesystem_path( $scfg, $new_volname, $storeid )
+            or die "failed to resolve a path for the new volume '$new_volname'\n";
+        PVE::Tools::run_command(
+            [ 'dd', "of=$path", 'conv=sparse', 'bs=64k' ],
+            input => '<&' . fileno($fh),
+        );
+    };
+    if ( my $err = $@ ) {
+        eval { $class->free_image( $storeid, $scfg, $new_volname, 0, 'raw' ) }
+            if defined $new_volname;
+        warn $@ if $@;
+        die $err;
+    }
+
+    return "$storeid:$new_volname";
+}
+
+# ── Reassign + adopt/release (§7) ──
+
+# Reassign a volume to another VMID / name (PVE "Reassign disk", qm disk reassign):
+# relabel the LU and atomically rename the registry entry. No data movement.
+sub rename_volume {
+    my ($class, $scfg, $storeid, $source_volname, $target_vmid, $target_volname) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($source_volname);
+    die "volume '$source_volname' not found in registry\n" unless defined $backend_id;
+
+    # Renaming a parent would dangle its linked clones' parent_volname reference.
+    my $deps = $reg->find_dependents($source_volname);
+    die "cannot rename '$source_volname': linked clone(s) depend on it: "
+        . join( ', ', sort @$deps ) . "\n" if @$deps;
+
+    my $format = ( $class->parse_volname($source_volname) )[6];
+    $target_volname = $class->find_free_diskname( $storeid, $scfg, $target_vmid, $format )
+        if !$target_volname;
+
+    my $d = $class->_driver( $storeid, $scfg );
+    $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $target_volname, $d ) );
+    $reg->rename_volume( $source_volname, $target_volname );
+
+    return "${storeid}:${target_volname}";
+}
+
+# Adopt an existing, untracked array LU into PVE (LU import). The LU pre-exists, so
+# there is NO orphan-on-failure risk and we register before mapping; rollback clears
+# tracking + the label but NEVER deletes the LU.
+sub manage_volume {
+    my ($class, $storeid, $scfg, $backend_id, $vmid) = @_;
+
+    die "backend_id is required\n" unless defined $backend_id;
+    die "vmid is required\n"       unless defined $vmid;
+
+    my $reg = $class->_registry($storeid);
+    my $d   = $class->_driver( $storeid, $scfg );
+
+    my $lu = $d->get_lu($backend_id);   # verify it exists on the array (dies if not)
+
+    # Refuse to adopt an LU already tracked under another volname — else two volids
+    # would point at one LU.
+    if ( my $existing = $reg->find_volname_by_backend($backend_id) ) {
+        die "backend LU '$backend_id' is already managed as '$existing'\n";
+    }
+
+    my $name = $reg->reserve_volname($vmid);
+    eval {
+        $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $name, $d ) );
+        $reg->register( $name, $backend_id,
+            size_mb  => ceil( $lu->{size_bytes} / ( 1024 * 1024 ) ),
+            pool_ref => $lu->{pool_ref},
+        );
+        # Map to this node; activate_volume persists the canonical identity.
+        $class->activate_volume( $storeid, $scfg, $name );
+    };
+    if ( my $err = $@ ) {
+        eval { $class->deactivate_volume( $storeid, $scfg, $name ) };
+        eval { $d->set_lu_label( $backend_id, '' ) };
+        eval { $reg->unregister($name) };
+        die "failed to manage backend LU '$backend_id' as '$name': $err";
+    }
+
+    return $name;
+}
+
+# Release a volume from PVE tracking (LU un-import): tear the host side down, clear
+# the label, drop the registry entry — but leave the LU on the array intact.
+sub unmanage_volume {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    die "volname is required\n" unless $volname;
+
+    my $reg = $class->_registry($storeid);
+    my ($backend_id) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $backend_id;
+
+    my $d = $class->_driver( $storeid, $scfg );
+
+    eval { $class->deactivate_volume( $storeid, $scfg, $volname ) };
+    warn "FCLU: unmanage teardown warning: $@" if $@;
+    eval { $d->set_lu_label( $backend_id, '' ) };
+    warn "FCLU: unmanage label-clear warning: $@" if $@;
+
+    $reg->unregister($volname);
+
+    return $backend_id;
+}
+
 # ── Volume name parsing (§7, vendor-neutral) ──
 
 sub vmid_from_volname {

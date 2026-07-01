@@ -12,8 +12,18 @@ BEGIN {
     $INC{'PVE/Storage/Plugin.pm'} = 1;
     package PVE::Storage::Plugin;
     sub api { 0 }
+    # Storage-migration stream helpers (real ones live in PVE::Storage::Plugin).
+    our @HDR;
+    sub write_common_header { my ( $fh, $size ) = @_; push @HDR, $size; return; }
+    sub read_common_header  { return $main::IMPORT_SIZE // 0; }
+    # Free-name helper (inherited from PVE::Storage::Plugin in production).
+    sub find_free_diskname { my ( $class, $storeid, $scfg, $vmid, $fmt ) = @_; return "vm-${vmid}-disk-7"; }
     package PVE::Storage;
     sub APIVER { 11 }
+    package PVE::Tools;
+    $INC{'PVE/Tools.pm'} = 1;
+    our @CMDS;
+    sub run_command { my ( $cmd, %o ) = @_; push @CMDS, $cmd; return 0; }
 }
 
 use lib 'src';
@@ -552,6 +562,91 @@ subtest 'create_base converts a live volume to a base image + guards' => sub {
     reg()->register( 'vm-942-disk-0', 'bdep2', parent_volname => $v2 );
     eval { $P->create_base( 'store1', {}, $v2 ) };
     like( $@, qr/linked clone\(s\) depend/, 'a volume with dependents cannot be based' );
+};
+
+subtest 'export/import format negotiation + rejection guards' => sub {
+    is_deeply( [ $P->volume_export_formats( {}, 'store1', 'vm-1-disk-0', undef, undef, 0 ) ],
+        ['raw+size'], 'export raw+size for the active volume' );
+    is_deeply( [ $P->volume_import_formats( {}, 'store1', 'vm-1-disk-0', undef, undef, 0 ) ],
+        ['raw+size'], 'import raw+size for the active volume' );
+    is_deeply( [ $P->volume_export_formats( {}, 'store1', 'vm-1-disk-0', undef, undef, 1 ) ],
+        [], 'no format with_snapshots' );
+    is_deeply( [ $P->volume_import_formats( {}, 'store1', 'vm-1-disk-0', 'snap', undef, 0 ) ],
+        [], 'no format for a snapshot' );
+    is_deeply( [ $P->volume_import_formats( {}, 'store1', 'vm-1-disk-0', undef, 'base', 0 ) ],
+        [], 'no incremental format' );
+
+    eval { $P->volume_export( {}, 'store1', undef, 'vm-1-disk-0', 'qcow2', undef, undef, 0 ) };
+    like( $@, qr/not available/, 'export rejects a non raw+size format' );
+    eval { $P->volume_export( {}, 'store1', undef, 'vm-1-disk-0', 'raw+size', 'snap', undef, 0 ) };
+    like( $@, qr/cannot export a snapshot/, 'export rejects a snapshot' );
+    eval { $P->volume_export( {}, 'store1', undef, 'vm-1-disk-0', 'raw+size', undef, undef, 1 ) };
+    like( $@, qr/together with their snapshots/, 'export rejects with_snapshots' );
+    eval { $P->volume_import( {}, 'store1', undef, 'vm-1-disk-0', 'raw+size', undef, 'base', 0 ) };
+    like( $@, qr/incremental/, 'import rejects an incremental stream' );
+};
+
+subtest 'export streams the device; import allocs + dd + returns the volid' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    local @PVE::Storage::Plugin::HDR = ();
+    local @PVE::Tools::CMDS = ();
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 950, 'raw', undef, 1024 * 1024 );
+    $P->activate_volume( 'store1', {}, $name );
+
+    open my $out, '>', \my $buf or die "open: $!";
+    is( $P->volume_export( {}, 'store1', $out, $name, 'raw+size', undef, undef, 0 ), undef, 'export returns' );
+    is( scalar @PVE::Storage::Plugin::HDR, 1, 'common header written once' );
+    is( $PVE::Storage::Plugin::HDR[0], 1024 * 1024 * 1024, 'header carries the volume size in bytes' );
+    like( "@{ $PVE::Tools::CMDS[-1] }", qr/\bdd\b.*\bif=/, 'dd read from the device path' );
+
+    local $main::IMPORT_SIZE = 512 * 1024 * 1024;   # bytes
+    open my $in, '<', \my $indata or die "open: $!";
+    my $volid = $P->volume_import(
+        { pool_id => '63' }, 'store1', $in, 'vm-960-disk-9', 'raw+size', undef, undef, 0, 0 );
+    is( $volid, 'store1:vm-960-disk-9', 'import returns storeid:volname' );
+    ok( reg()->lookup('vm-960-disk-9'), 'imported volume registered' );
+    like( "@{ $PVE::Tools::CMDS[-1] }", qr/\bdd\b.*\bof=/, 'dd wrote into the device path' );
+};
+
+subtest 'rename_volume reassigns + guards; manage/unmanage adopt/release without deleting the LU' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 970, 'raw', undef, 1 << 30 );
+
+    my $volid = $P->rename_volume( { pool_id => '63' }, 'store1', $vol, 971, 'vm-971-disk-0' );
+    is( $volid, 'store1:vm-971-disk-0', 'rename returns storeid:target' );
+    ok( reg()->lookup('vm-971-disk-0'), 'registry renamed' );
+    is( reg()->lookup($vol), undef, 'old name gone' );
+
+    my $volid2 = $P->rename_volume( { pool_id => '63' }, 'store1', 'vm-971-disk-0', 972, undef );
+    is( $volid2, 'store1:vm-972-disk-7', 'auto-derives a free name via find_free_diskname' );
+
+    reg()->register( 'vm-973-disk-0', 'bdep3', parent_volname => 'vm-972-disk-7' );
+    eval { $P->rename_volume( { pool_id => '63' }, 'store1', 'vm-972-disk-7', 974, 'vm-974-disk-0' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'rename refused while a clone depends on the source' );
+
+    # Unmanage the live volume: releases tracking, keeps the array LU.
+    my $cur = 'vm-972-disk-7';
+    my ($cur_bid) = reg()->lookup($cur);
+    my $released = $P->unmanage_volume( 'store1', {}, $cur );
+    is( $released, $cur_bid, 'unmanage returns the backend id' );
+    is( reg()->lookup($cur), undef, 'unmanaged: registry entry gone' );
+    ok( exists $T::Plugin::FAKE->{lus}{$cur_bid}, 'unmanage did NOT delete the array LU' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, undef, 'no delete_lu on unmanage' );
+
+    # Re-adopt the same LU under a fresh name.
+    my $adopted = $P->manage_volume( 'store1', { pool_id => '63' }, $cur_bid, 975 );
+    like( $adopted, qr/^vm-975-disk-\d+$/, 'manage adopts under a fresh volname' );
+    my ( $abid, $ameta ) = reg()->lookup($adopted);
+    is( $abid, $cur_bid, 'adopted the same backend LU' );
+    ok( $ameta->{identity}{ids}{naa}, 'identity recorded on adopt (via activate)' );
+
+    eval { $P->manage_volume( 'store1', { pool_id => '63' }, $cur_bid, 976 ) };
+    like( $@, qr/already managed/, 'manage refuses an already-tracked LU' );
 };
 
 subtest 'free_image rediscovers a linked-clone backing pair from the parent (#23 fallback)' => sub {
