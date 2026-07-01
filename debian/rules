@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+# Lay every shippable module into debian/tmp; debian/*.install partitions them
+# into the per-binary packages (pve-fclu-core / pve-fclu-hitachi).
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp

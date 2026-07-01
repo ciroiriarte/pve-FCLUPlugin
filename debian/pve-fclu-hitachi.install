@@ -1,0 +1,3 @@
+usr/share/perl5/PVE/Storage/FCLU/Driver/Hitachi.pm
+usr/share/perl5/PVE/Storage/FCLU/Driver/Hitachi/RestClient.pm
+usr/share/perl5/PVE/Storage/Custom/HitachiBlockPlugin.pm

@@ -1,0 +1,28 @@
+pve-fclu (0.1.0~alpha1) stable; urgency=medium
+
+  * Initial packaging of the vendor-neutral FCLU storage framework as a
+    multi-binary source package (ARCHITECTURE.md §11):
+    - pve-fclu-core: the generic PVE storage plugin base, the volname->LU
+      registry, the credential store, the capability model, the abstract
+      driver contract (Provides: fclu-driver-api-1), and the FC multipath host
+      connector. Names no vendor.
+    - pve-fclu-hitachi: the Hitachi VSP driver + Configuration Manager REST
+      transport + the thin type()='hitachiblock' plugin. Depends on
+      pve-fclu-core (= ${binary:Version}) and the fclu-driver-api-1 contract.
+      Provides/Replaces/Conflicts the standalone pve-storage-hitachiblock so an
+      upgrade swaps cleanly and existing type: hitachiblock storage.cfg entries
+      keep working verbatim.
+    - pve-fclu: optional convenience metapackage (Depends core, Recommends the
+      packaged vendor drivers).
+    Pure Perl; the unit suite (164 tests) runs at build time via dh_auto_test.
+    FCLU/Driver/Mock.pm is the test-only reference driver and is not shipped.
+  * UPGRADE NOTE: replacing pve-storage-hitachiblock is a clean data-path swap —
+    the type: hitachiblock storage plugin and its multipath data path are
+    preserved — but because pve-fclu-hitachi Conflicts the old package, apt
+    removes it wholesale. This alpha does NOT yet re-ship the old package's
+    extras: the ExtJS GUI add/edit panel, the hitachiblock-repl CLI, and the
+    opt-in SCSI-3 PR (qemu-pr-helper) systemd units. Storage keeps working via
+    storage.cfg + pvesm/API; the web-UI edit dialog and those helpers return in
+    a later slice. Configure/verify storage from the CLI until then.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 00:00:00 -0300

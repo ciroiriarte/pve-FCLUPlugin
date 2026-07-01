@@ -529,11 +529,14 @@ refuses to install against new core instead of failing at runtime inside pvedaem
 While it is still core + Hitachi only, the stricter `Depends: pve-fclu-core
 (= ${binary:Version})` lockstep is fine; relax to the `api-N` floor once driver #2 lands.
 
-**Backward-compat rename.** The deployed `pve-HitachiBlockPlugin` package and its
-`type: hitachiblock` storage definitions must survive the rename (§0). The Hitachi
-package carries `Provides: pve-hitachiblockplugin`, `Replaces: pve-hitachiblockplugin`,
-`Conflicts: pve-hitachiblockplugin` so `apt upgrade` swaps them cleanly and existing
-`storage.cfg` keeps working verbatim.
+**Backward-compat rename.** The deployed `pve-storage-hitachiblock` package (the
+reference plugin's Debian binary name) and its `type: hitachiblock` storage
+definitions must survive the rename (§0). The Hitachi package carries
+`Provides: pve-storage-hitachiblock`, `Replaces: pve-storage-hitachiblock`,
+`Conflicts: pve-storage-hitachiblock` so `apt upgrade` swaps them cleanly and existing
+`storage.cfg` keeps working verbatim. (The swap removes the old package wholesale, so
+its GUI panel / `hitachiblock-repl` / opt-in SCSI-3 PR units are dropped until re-shipped
+under `pve-fclu-hitachi`; the data path is preserved.)
 
 Cost is only more `debian/*.install` control files and CI matrix entries; OBS builds
 multiple binaries from one source natively. Benefits: core stays dependency-light, a

@@ -4,6 +4,17 @@
 *.changes
 build/
 
+# debhelper build artifacts (dpkg-buildpackage / make deb) — the tracked
+# debian/*.install and debian/pve-fclu-*.install files are NOT matched (no slash).
+debian/.debhelper/
+debian/tmp/
+debian/files
+debian/debhelper-build-stamp
+debian/*.substvars
+debian/pve-fclu-core/
+debian/pve-fclu-hitachi/
+debian/pve-fclu/
+
 # CLI scratch output (joint-review runs, etc.)
 *.err
 

@@ -1,0 +1,69 @@
+Source: pve-fclu
+Section: admin
+Priority: optional
+Maintainer: Ciro Iriarte <ciro.iriarte+software@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               perl,
+               libwww-perl,
+               libjson-perl
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/ciroiriarte/pve-FCLUPlugin
+
+Package: pve-fclu-core
+Architecture: all
+Depends: ${misc:Depends},
+         ${perl:Depends},
+         proxmox-ve (>= 8.0),
+         libjson-perl,
+         multipath-tools
+Provides: fclu-driver-api-1
+Description: Proxmox VE FCLU storage framework — vendor-neutral core
+ FCLU (First-class Logical Unit) is a vendor-neutral Proxmox VE storage
+ framework: one array LUN per virtual disk over Fibre Channel, with
+ snapshots/clones/QoS/replication offloaded to the array.
+ .
+ This package ships the vendor-neutral core — the generic PVE storage plugin
+ base, the volname->LU registry, credential store, capability model, the
+ abstract driver contract (Provides: fclu-driver-api-1), and the FC multipath
+ host connector. It names no vendor; install a per-vendor driver package
+ (e.g. pve-fclu-hitachi) to talk to an actual array.
+ .
+ ALPHA: not yet validated against a live array or cluster.
+
+Package: pve-fclu-hitachi
+Architecture: all
+Depends: ${misc:Depends},
+         ${perl:Depends},
+         pve-fclu-core (= ${binary:Version}),
+         fclu-driver-api-1,
+         libwww-perl,
+         libjson-perl,
+         multipath-tools
+Recommends: pve-qemu-kvm
+Provides: pve-storage-hitachiblock
+Replaces: pve-storage-hitachiblock
+Conflicts: pve-storage-hitachiblock
+Description: Proxmox VE FCLU storage framework — Hitachi block driver
+ Hitachi VSP driver for the FCLU framework: the array backend (Configuration
+ Manager REST) plus the thin type()='hitachiblock' storage plugin over
+ pve-fclu-core. Supports VSP G series (Ops Center Configuration Manager) and
+ VSP One Block / VSP E series (embedded REST), with array-offloaded snapshots,
+ linked clones, QoS, and online resize — one LUN per virtual disk.
+ .
+ This package supersedes the standalone pve-storage-hitachiblock package; an
+ upgrade swaps them cleanly and existing type: hitachiblock storage.cfg entries
+ keep working unchanged.
+ .
+ ALPHA: not yet validated against a live array or cluster.
+
+Package: pve-fclu
+Architecture: all
+Depends: ${misc:Depends},
+         pve-fclu-core (= ${binary:Version})
+Recommends: pve-fclu-hitachi
+Description: Proxmox VE FCLU storage framework — metapackage
+ Convenience metapackage pulling in the FCLU core and, via Recommends, the
+ currently packaged vendor drivers. Prefer installing the specific
+ pve-fclu-<vendor> package(s) for the array(s) your nodes actually talk to, so
+ each node ships only the driver it needs.
