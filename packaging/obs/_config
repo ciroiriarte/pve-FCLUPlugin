@@ -1,0 +1,3 @@
+# Project build config for home:ciriarte:pve-FCLUPlugin
+# Debian source package build; publish an apt-consumable repository.
+Repotype: debian

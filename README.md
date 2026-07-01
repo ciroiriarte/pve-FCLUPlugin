@@ -3,10 +3,15 @@
 *Bring enterprise SAN features — zero-copy cloning, hardware snapshots, per-VM storage
 policies — natively into the Proxmox VE ecosystem.*
 
-> **📝 DRAFT.** This is an early-stage draft. The repository currently holds a
-> **design proposal only** — no implementation. Everything here (interfaces, naming,
-> layering, decisions) is provisional and expected to change as the design is reviewed
-> and the migration begins. Do not treat it as stable or final.
+[![OBS build (PVE 9)](https://build.opensuse.org/projects/home:ciriarte:pve-FCLUPlugin/packages/pve-fclu/badge.svg?type=default)](https://build.opensuse.org/package/show/home:ciriarte:pve-FCLUPlugin/pve-fclu)
+
+> ### ⚠️ Project status: alpha
+>
+> The framework is **implemented and packaged** — the generic core, the Hitachi
+> reference driver, the `type: hitachiblock` plugin (`FCLU::Plugin` cutover), and the
+> multi-binary Debian packaging are in place with a green unit suite. It has **not**
+> yet been validated against a live array or cluster; treat it as lab/test only until
+> verified on real hardware.
 
 A vendor-neutral [Proxmox VE](https://www.proxmox.com/) storage framework that
 delivers **first-class per-virtual-disk volume** service over Fibre Channel: **one array LUN per virtual
@@ -20,13 +25,32 @@ PowerMax/PowerStore, Pure Storage FlashArray, IBM FlashSystem, NetApp, and other
 added as drivers that reuse the generic orchestration, registry, and host-side FC
 connector.
 
-> ### ⚠️ Project status: design phase
->
-> This repository currently contains the **architecture proposal only** — no
-> implementation yet. The reference implementation lives in `pve-HitachiBlockPlugin`
-> and will be refactored into this framework following the staged migration in
-> [`ARCHITECTURE.md`](ARCHITECTURE.md) §9, keeping the Hitachi driver working and its
-> tests green throughout.
+## Quick start
+
+Install from the [OBS](https://build.opensuse.org/package/show/home:ciriarte:pve-FCLUPlugin/pve-fclu)
+repository on each PVE 9 node (Debian 13 / Trixie base) — pick the driver package for
+your array; it pulls `pve-fclu-core` transitively:
+
+```bash
+echo 'deb http://download.opensuse.org/repositories/home:/ciriarte:/pve-FCLUPlugin/PVE_9/ /' \
+  > /etc/apt/sources.list.d/pve-fclu.list
+curl -fsSL 'https://download.opensuse.org/repositories/home:/ciriarte:/pve-FCLUPlugin/PVE_9/Release.key' \
+  | gpg --dearmor > /etc/apt/trusted.gpg.d/home_ciriarte_pve-fclu.gpg
+apt update && apt install pve-fclu-hitachi
+systemctl restart pvedaemon
+```
+
+`pve-fclu-hitachi` supersedes the standalone `pve-storage-hitachiblock` package;
+existing `type: hitachiblock` storage.cfg entries keep working. It currently ships an
+**alpha** build — see the status note above and
+[`docs/packaging-obs.md`](docs/packaging-obs.md) for packaging details.
+
+Or build and install from source on each node:
+
+```bash
+make install    # or: make deb && dpkg -i ../pve-fclu-*_all.deb
+systemctl restart pvedaemon
+```
 
 ## Start here
 

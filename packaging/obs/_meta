@@ -1,0 +1,25 @@
+<project name="home:ciriarte:pve-FCLUPlugin">
+  <title>Proxmox VE FCLU storage framework (ALPHA)</title>
+  <description>
+    Vendor-neutral Proxmox VE storage framework providing first-class per-virtual-
+    disk volume services over Fibre Channel block storage: one array LUN per virtual
+    disk, with snapshots, clones, QoS, and replication offloaded to the array.
+    Per-vendor drivers (Hitachi today; Dell, Pure, IBM, NetApp planned) plug into a
+    shared generic core. Generalizes the single-vendor pve-HitachiBlockPlugin.
+
+    Binary packages: pve-fclu-core (the vendor-neutral spine), pve-fclu-hitachi (the
+    Hitachi VSP driver plus the thin type()='hitachiblock' plugin, superseding
+    pve-storage-hitachiblock), and the optional pve-fclu metapackage.
+
+    ALPHA: not yet validated against a live array or cluster. Lab/test use only
+    until verified on real hardware.
+
+    The repository is named after the Proxmox VE release (PVE_9) rather than the
+    Debian base (Debian 13 / Trixie) to avoid confusion.
+  </description>
+  <person userid="ciriarte" role="maintainer"/>
+  <repository name="PVE_9">
+    <path project="Debian:13" repository="standard"/>
+    <arch>x86_64</arch>
+  </repository>
+</project>
