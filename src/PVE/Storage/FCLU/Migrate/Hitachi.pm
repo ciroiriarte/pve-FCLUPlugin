@@ -52,8 +52,16 @@ sub _transform_entry {
     croak "legacy entry '$volname' has no wwid"
         unless defined $e->{wwid} && length $e->{wwid};
 
+    # Canonicalize the NAA the same way Driver::Hitachi does at alloc time (strip a
+    # naa./0x prefix, lowercase), so the migrated identity is byte-identical to what a
+    # fresh alloc_image would record.
+    my $naa = "$e->{wwid}";
+    $naa =~ s/^naa\.//i;
+    $naa =~ s/^0x//i;
+    $naa = lc $naa;
+
     my %meta = (
-        identity => { protocol => 'scsi-fc', ids => { naa => "$e->{wwid}" } },
+        identity => { protocol => 'scsi-fc', ids => { naa => $naa } },
         size_mb  => $e->{size_mb},
     );
     $meta{pool_ref} = "$e->{pool_id}" if defined $e->{pool_id};

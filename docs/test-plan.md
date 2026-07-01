@@ -141,13 +141,16 @@ cluster-wide. **New vs the reference — validate the §11 packaging.**
   activation separately.
 - B2. **Swap gate — MIGRATE THE REGISTRY FIRST** (if the old package is present). The
   reference and FCLU keep their volume→LU map in different stores and formats, so a naïve
-  swap orphans every existing volume. Follow `docs/migration-hitachi.md`: `apt install
-  pve-fclu-hitachi` (the running pvedaemon keeps the old plugin in memory; the legacy
-  `/etc/pve/priv/hitachiblock/` data survives) → `pve-fclu-migrate-hitachi --dry-run --all`
-  → `--all` → **only then** `systemctl restart pvedaemon pveproxy pvestatd`. Confirm the
-  swap has **no dpkg file-overwrite error**, `pvesm list` shows the **same** volumes before
-  and after, and existing guests resolve their disks. Rollback = reinstall the reference
-  package (the untouched legacy store is reused).
+  swap orphans every existing volume. Use the **zero-window** flow in
+  `docs/migration-hitachi.md`: from a source checkout, `perl -Isrc
+  bin/pve-fclu-migrate-hitachi --dry-run --all` then `--all` to populate the FCLU registry
+  **before** any swap → then `apt install pve-fclu-hitachi` + `systemctl restart pvedaemon
+  pveproxy pvestatd` on each node (node order irrelevant). Confirm **no dpkg file-overwrite
+  error**, `pvesm list` shows the **same** volumes before and after, and guests resolve
+  their disks. ⚠️ If instead you install-then-migrate, do NOT reboot / run backup·HA /
+  invoke `pvesm`·`qm` in the gap — an involuntary daemon restart there orphans volumes for
+  new operations. Rollback = reinstall the reference package (the untouched legacy store is
+  reused).
 - B3. **GUI gate:** `systemctl restart pvedaemon pveproxy`; in the web UI, Datacenter →
   Storage → Add shows **"Hitachi Block"**, the create dialog renders all fields, and the
   grid shows the friendly label. Confirm the `<script>` tag was injected into

@@ -37,39 +37,54 @@ Two facts make a zero-orphan swap possible:
 So the migration reads the surviving legacy data and populates the FCLU registry
 **before** `pvedaemon` reloads with the new plugin.
 
-## Procedure (per cluster — the registry lives in the shared pmxcfs)
+## Procedure — populate the FCLU registry BEFORE the swap (recommended, zero-window)
 
-Run on **one** node (`/etc/pve/priv` is cluster-wide). Do a change window; back up
-nothing else is needed because the migration is non-destructive.
+The registry lives in the shared pmxcfs (`/etc/pve/priv` is cluster-wide), so the
+migration runs **once on one node** and applies cluster-wide. The package swap is
+per-node, but because the FCLU registry is already populated first, **node order is
+irrelevant** and there is no window in which a node comes up on FCLU with an empty
+registry.
 
 ```bash
 # 0. Record the current state to compare against afterwards.
-pvesm list <storeid>            # note the volume count
+pvesm list <storeid>            # note the volumes
 pvesm status                    # note the storage is 'active'
 
-# 1. Install the FCLU packages. This removes pve-storage-hitachiblock (Conflicts) but
-#    the RUNNING pvedaemon still serves the array from the in-memory old plugin, and
-#    /etc/pve/priv/hitachiblock/ survives. DO NOT restart pvedaemon yet.
-apt install pve-fclu-hitachi    # pulls pve-fclu-core
+# 1. From a source checkout (the tool is pure Perl; it needs only the FCLU core
+#    modules, so it runs BEFORE pve-fclu-* is installed). Preview, then migrate.
+perl -Isrc bin/pve-fclu-migrate-hitachi --dry-run --all
+perl -Isrc bin/pve-fclu-migrate-hitachi --all     # copies hitachiblock/ -> fclu/
 
-# 2. Preview the migration (writes nothing), then run it.
-pve-fclu-migrate-hitachi --dry-run --all
-pve-fclu-migrate-hitachi --all          # copies hitachiblock/ -> fclu/
-
-# 3. Now reload the daemons so the FCLU plugin loads with the populated registry.
+# 2. Now swap the plugin on each node (order irrelevant — the FCLU registry is ready).
+apt install pve-fclu-hitachi                       # pulls pve-fclu-core; removes the reference
 systemctl restart pvedaemon pveproxy pvestatd
 
-# 4. Verify parity — the SAME volumes must be listed, storage still active.
+# 3. Verify parity — the SAME volumes must be listed, storage still active.
 pvesm list <storeid>            # same volumes as step 0
 pvesm status                    # 'active', capacity sane
 qm start <a-test-vmid>          # a guest resolves + boots from its disk
 ```
 
-> **Zero-window alternative** — if you prefer to populate the FCLU registry *before* the
-> swap, run the tool from a source checkout first (it is pure Perl and needs only the
-> FCLU core modules): `perl -Isrc bin/pve-fclu-migrate-hitachi --all`, verify, then
-> `apt install pve-fclu-hitachi` + restart. The FCLU registry is already populated, so
-> there is no dependence on daemon-restart timing.
+### Alternative — install then migrate (only in a strict change window)
+
+If you cannot run the tool from source and must use the packaged binary, install first
+(the tool ships in `pve-fclu-hitachi`; the legacy `/etc/pve/priv/hitachiblock/` data
+survives the removal and the *already-running* pvedaemon keeps serving from the
+in-memory old plugin), then migrate, then restart:
+
+```bash
+apt install pve-fclu-hitachi
+pve-fclu-migrate-hitachi --dry-run --all && pve-fclu-migrate-hitachi --all
+systemctl restart pvedaemon pveproxy pvestatd
+```
+
+> ⚠️ **Window hazard.** Once `pve-fclu-hitachi` is installed, *any fresh process* resolves
+> `type: hitachiblock` against the still-empty FCLU registry. Between the install and the
+> migrate, do **NOT** reboot the node, run backup/HA/replication jobs, or invoke
+> `pvesm`/`qm`; an involuntary `pvedaemon`/`pvestatd` restart in that gap makes existing
+> volumes unresolvable for *new* operations (already-running VMs keep their mapped
+> devices — this is an operation-time outage, not data loss). The recommended
+> migrate-from-source-first flow has no such window.
 
 ## Rollback
 
