@@ -1,3 +1,16 @@
+pve-fclu (0.1.0~alpha3) stable; urgency=medium
+
+  * hitachiblock: wire the persistent_reservations validate-and-warn check into
+    activate_volume, so the GUI checkbox / storage.cfg option is no longer
+    cosmetic. When enabled, activation now calls the connector's check_pr_ready
+    (guarded via can(), so a non-multipath transport skips it) and warns — never
+    blocks — with actionable guidance if this node's host-side SCSI-3 PR plumbing
+    (qemu-pr-helper socket + a multipath reservation_key) is not ready. Matches
+    the property description and mirrors how skip_unmap_io_check is wired. New
+    plugin.t coverage for the off / ready / not-ready paths.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 13:00:00 -0300
+
 pve-fclu (0.1.0~alpha2) stable; urgency=medium
 
   * pve-fclu-hitachi: re-ship the web UI + host-side extras dropped in the

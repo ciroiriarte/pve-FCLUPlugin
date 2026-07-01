@@ -485,6 +485,20 @@ sub activate_volume {
 
     # Attach the multipath device by the array-reported canonical identity (§3).
     $conn->attach($identity);
+
+    # Opt-in SCSI-3 PR readiness — validate-and-warn, NEVER blocks (§7 #2). When the
+    # storage enables persistent_reservations, check this node's host-side PR plumbing
+    # (qemu-pr-helper socket + a multipath reservation_key) and warn with actionable
+    # guidance if it is not ready. Connector-specific and best-effort: a transport
+    # whose connector has no PR concept simply skips it, keeping the core neutral.
+    if ( $scfg->{persistent_reservations} && $conn->can('check_pr_ready') ) {
+        my $pr = eval { $conn->check_pr_ready($identity) };
+        warn "FCLU: PR readiness check for '$volname' errored: $@" if $@;
+        if ( $pr && !$pr->{ok} ) {
+            warn "FCLU: SCSI-3 PR not ready for '$volname': $_\n" for @{ $pr->{issues} };
+        }
+    }
+
     return 1;
 }
 

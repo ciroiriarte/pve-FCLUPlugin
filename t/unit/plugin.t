@@ -116,6 +116,7 @@ use PVE::Storage::FCLU::Plugin;
     sub flush       { my ( $s ) = @_; $s->{calls}{flush}++; 1 }
     sub resize      { my ( $s ) = @_; $s->{calls}{resize}++; 1 }
     sub device_path { my ( $s, $id ) = @_; '/dev/mapper/3' . $id->{ids}{naa} }
+    sub check_pr_ready { my ( $s, $id ) = @_; $s->{calls}{check_pr_ready}++; return $s->{pr_result} // { ok => 1, issues => [] }; }
 }
 
 # A concrete vendor subclass providing the abstract hooks + injecting the fakes.
@@ -749,6 +750,31 @@ subtest 'volume_qemu_snapshot_method + cluster_lock_storage timeout resolution' 
     local $main::PVE_STORAGE_IDS = {};
     $P->cluster_lock_storage( 'store1', 0, undef, sub { 1 } );
     is( $PVE::Storage::Plugin::LOCK_TIMEOUTS[-1], 120, 'default 120 when unconfigured' );
+};
+
+subtest 'activate_volume: persistent_reservations drives a validate-and-warn PR check' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 915, 'raw', undef, 1 << 30 );
+
+    # PR opt-out: no readiness check at all.
+    ok( $P->activate_volume( 'store1', {}, $name ), 'activate without PR opt-in' );
+    is( $T::Plugin::CONN->{calls}{check_pr_ready}, undef, 'no PR check when persistent_reservations off' );
+
+    # PR opt-in + ready: check runs, activation succeeds, no warning.
+    ok( $P->activate_volume( 'store1', { persistent_reservations => 1 }, $name ), 'activate with PR opt-in (ready)' );
+    is( $T::Plugin::CONN->{calls}{check_pr_ready}, 1, 'PR readiness checked on activate' );
+
+    # PR opt-in + NOT ready: warns with guidance but does NOT block activation.
+    $T::Plugin::CONN->{pr_result} =
+        { ok => 0, issues => [ 'qemu-pr-helper is not running', 'multipath reservation_key is not configured' ] };
+    my @warns;
+    local $SIG{__WARN__} = sub { push @warns, $_[0] };
+    my $ok = $P->activate_volume( 'store1', { persistent_reservations => 1 }, $name );
+    is( $ok, 1, 'activation still succeeds when PR is not ready (validate-and-warn only)' );
+    ok( ( grep { /SCSI-3 PR not ready/ } @warns ), 'warns that PR is not ready' );
+    ok( ( grep { /qemu-pr-helper/ } @warns ), 'surfaces the actionable prerequisite' );
 };
 
 done_testing();
