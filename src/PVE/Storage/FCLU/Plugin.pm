@@ -28,7 +28,10 @@ use PVE::Storage::FCLU::Label;
 # reports the host's own APIVER clamped into this range so PVE loads us
 # warning-free across tested hosts and only warns (never refuses) outside it.
 use constant FCLU_MIN_APIVER => 10;
-use constant FCLU_MAX_APIVER => 12;
+# 14 = the PVE 9.2 storage APIVER (the frozen reference plugin validated against it,
+# and FCLU is a faithful port of the same PVE-facing surface); reporting a lower value
+# makes PVE log "implementing an older storage API". Raise as newer APIVERs are tested.
+use constant FCLU_MAX_APIVER => 14;
 
 # Per-storeid caches (PVE storage plugins are CLASS-based — no instance to hold
 # state), mirroring the reference's %_clients. Cleared by deactivate_storage.
