@@ -777,4 +777,13 @@ subtest 'activate_volume: persistent_reservations drives a validate-and-warn PR 
     ok( ( grep { /qemu-pr-helper/ } @warns ), 'surfaces the actionable prerequisite' );
 };
 
+subtest 'base _connector loads its connector_class (regression: missing require)' => sub {
+    # T::Plugin overrides _connector with a fake, so the real class-load path is never
+    # exercised by the other subtests — an unloaded connector_class only bit in
+    # production ("can't locate method new"). Drive the REAL base method: it must
+    # require the module before calling ->new.
+    my $conn = PVE::Storage::FCLU::Plugin->_connector;
+    isa_ok( $conn, 'PVE::Storage::FCLU::Host::FCMultipath', 'base _connector returns a loaded connector instance' );
+};
+
 done_testing();

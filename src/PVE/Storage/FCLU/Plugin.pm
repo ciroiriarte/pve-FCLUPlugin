@@ -202,7 +202,19 @@ sub _build_driver {
     my %opts = %{ $class->driver_config($scfg) };
     my ( $user, $pass ) = $class->_credentials($storeid)->read;
     my $dclass = $class->driver_class;
+    _load_class($dclass);
     return $dclass->new( %opts, username => $user, password => $pass );
+}
+
+# Load a class named by string before calling a method on it. driver_class /
+# connector_class are vendor-overridable strings, so the base cannot `use` them at
+# compile time — a missing load surfaces only at runtime as "can't locate method
+# new" (a real deployment bug the fake-injecting unit tests cannot see).
+sub _load_class {
+    my ($pkg) = @_;
+    ( my $file = "$pkg.pm" ) =~ s{::}{/}g;
+    require $file;
+    return $pkg;
 }
 
 # Return the cached connected driver for this storage, building (and caching) one
@@ -381,7 +393,7 @@ sub _make_label {
 }
 
 # Seams: the host connector and this node's name (overridable in tests).
-sub _connector { return $_[0]->connector_class->new }
+sub _connector { my ($class) = @_; my $cc = $class->connector_class; _load_class($cc); return $cc->new }
 
 sub _nodename {
     my ($class) = @_;

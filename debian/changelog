@@ -1,3 +1,17 @@
+pve-fclu (0.1.0~alpha5) stable; urgency=medium
+
+  * plugin: FIX a showstopper found during the live E590H cutover — the base
+    plugin never loaded connector_class / driver_class (vendor-overridable
+    strings the base cannot `use` at compile time), so activate/deactivate/
+    free/map died with "Can't locate object method new via package
+    PVE::Storage::FCLU::Host::FCMultipath". The unit tests missed it because
+    they inject fakes for both. _connector/_build_driver now _load_class the
+    module first; new regression test drives the REAL base _connector.
+  * plugin: report storage APIVER 14 (was clamped to 12), silencing PVE 9.2's
+    "implementing an older storage API" warning on every pvesm call.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 01 Jul 2026 16:00:00 -0300
+
 pve-fclu (0.1.0~alpha4) stable; urgency=medium
 
   * hitachi: add the pve-fclu-migrate-hitachi tool + PVE::Storage::FCLU::Migrate::
