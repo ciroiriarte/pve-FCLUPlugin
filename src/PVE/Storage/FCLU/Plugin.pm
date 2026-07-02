@@ -635,6 +635,18 @@ sub free_image {
     # on the array — reuses the deactivate path (idempotent).
     $class->deactivate_volume( $storeid, $scfg, $volname );
 
+    # deactivate_volume unmapped only THIS node. A leftover mapping from a crashed
+    # live-migration on another node would block delete_lu (the array refuses to delete
+    # an LDEV that still has LU paths) and leak the LU — this node's WWN-scoped
+    # unpublish_lu cannot reach a remote node's host group. Reap every remaining
+    # host-group mapping cluster-wide first. Optional driver capability; best-effort so
+    # a transient array error does not wedge the delete (a failed delete_lu below then
+    # leaves the registry entry for PVE to retry).
+    if ( $d->can('unpublish_lu_all') ) {
+        eval { $d->unpublish_lu_all($backend_id) };
+        warn "FCLU: cluster-wide unmap warning: $@" if $@;
+    }
+
     $d->delete_lu($backend_id);
     $reg->unregister($volname);
 

@@ -104,6 +104,7 @@ use PVE::Storage::FCLU::Plugin;
     sub ensure_host_access { my ( $s, %c ) = @_; $s->{calls}{ensure_host_access}++; "PVE_$c{hostname}" }
     sub publish_lu   { my ( $s, $id, %c ) = @_; $s->{calls}{publish_lu}++; { hostname => $c{hostname}, access_ref => "PVE_$c{hostname}" } }
     sub unpublish_lu { my ( $s ) = @_; $s->{calls}{unpublish_lu}++; 1 }
+    sub unpublish_lu_all { my ( $s, $id ) = @_; $s->{calls}{unpublish_lu_all}++; 1 }
 }
 
 # A fake host connector.
@@ -331,6 +332,7 @@ subtest 'free_image: guards, snapshot cleanup, teardown, delete, unregister' => 
     is( $T::Plugin::FAKE->{calls}{list_snapshots}, 1, 'capability-gated snapshot cleanup ran' );
     is( $T::Plugin::CONN->{calls}{detach}, 1, 'host detach (via deactivate)' );
     is( $T::Plugin::FAKE->{calls}{unpublish_lu}, 1, 'unpublish (via deactivate)' );
+    is( $T::Plugin::FAKE->{calls}{unpublish_lu_all}, 1, 'cluster-wide unmap before delete (4C)' );
     is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'array delete_lu' );
     is( reg()->lookup($name), undef, 'unregistered' );
 

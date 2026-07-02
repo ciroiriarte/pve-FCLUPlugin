@@ -195,6 +195,23 @@ subtest 'unpublish_lu removes only this node, idempotently' => sub {
     is( $f->{calls}{unmap_lun}, $before, 'no further unmap calls' );
 };
 
+subtest 'unpublish_lu_all reaps EVERY node mapping (crashed-migration cleanup)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
+    $d->publish_lu( '42', ctx( 'node-b', '10000000c9bb' ) );
+    is( scalar @{ $d->list_lu_mappings('42') }, 2, 'mapped on two nodes to start' );
+
+    # Cluster-wide reap (what this node's WWN-scoped unpublish_lu cannot do).
+    is( $d->unpublish_lu_all('42'), 1, 'unpublish_lu_all returns success' );
+    is( scalar @{ $d->list_lu_mappings('42') }, 0, 'ALL node mappings removed' );
+
+    # Idempotent: the ldev still exists but has no LU paths left.
+    my $before = $f->{calls}{unmap_lun};
+    is( $d->unpublish_lu_all('42'), 1, 'idempotent when nothing is mapped' );
+    is( $f->{calls}{unmap_lun}, $before, 'no further unmap calls' );
+};
+
 subtest 'list_lu_mappings is authoritative from get_ldev->{ports}' => sub {
     my $f = FakeRest->new;
     my $d = drv($f);

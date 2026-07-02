@@ -856,6 +856,46 @@ sub unpublish_lu {
 # AUTHORITATIVE per-LU mapping list (§2/§12.3): read from get_ldev->{ports}, NOT a
 # host-group scan. Each port entry resolves to its host group name (carried on the
 # entry or fetched), and entries are folded into one Mapping descriptor per node.
+# unpublish_lu_all($backend_id) — remove the LU's mapping from EVERY host group it is
+# currently mapped to (all nodes), not just this node's. free_image calls this before
+# delete_lu to reap a leftover mapping from a crashed live-migration on another node:
+# this node's WWN-scoped unpublish_lu cannot reach a remote node's host group, and the
+# array refuses to delete an LDEV that still has LU paths, so the LU would leak.
+# Idempotent (unknown/unmapped LU => success); best-effort per path (a partial failure
+# is a warn, a total failure surfaces the classified cause, mirroring unpublish_lu).
+# NOT a §2 contract method — an optional vendor teardown hook (cf. next_free_backend_id);
+# the core invokes it via can().
+sub unpublish_lu_all {
+    my ($self, $backend_id) = @_;
+    my $ldev = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
+    return 1 unless $self->_is_defined_ldev($ldev);
+
+    my ( $attempted, $failed, $last_err ) = ( 0, 0, undef );
+    for my $p ( @{ $ldev->{ports} || [] } ) {
+        my ( $pid, $hgn ) = ( $p->{portId}, $p->{hostGroupNumber} );
+        next unless defined $pid && defined $hgn;
+        # get_ldev's ports carry the LUN number but not the lunId path resource id
+        # that unmap_lun needs, so re-query this port+hg for this ldev to resolve it.
+        my $luns = $self->_call( sub {
+            $self->{rest}->list_luns(
+                port_id => $pid, host_group_number => $hgn, ldev_id => $backend_id );
+        } );
+        for my $l (@$luns) {
+            $attempted++;
+            unless ( eval { $self->{rest}->unmap_lun( $l->{lunId} ); 1 } ) {
+                $failed++;
+                $last_err = $@;
+                warn "FCLU Hitachi: cluster-wide unmap warning (lun $l->{lunId}): $@";
+            }
+        }
+    }
+
+    die $self->_translate_rest_error($last_err)
+        if $attempted > 0 && $failed == $attempted;
+
+    return 1;
+}
+
 sub list_lu_mappings {
     my ($self, $backend_id) = @_;
     my $ldev = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
