@@ -567,7 +567,23 @@ sub filesystem_path {
 
     my $identity = $entry->{identity};
     die "volume '$volname' has no recorded device identity\n" unless $identity;
-    my $path = $class->_connector->device_path($identity);
+
+    my $conn = $class->_connector;
+    my $path = eval { $conn->device_path($identity) };
+    if ( !defined $path ) {
+        # The recorded identity carries no usable device id: on arrays that only expose
+        # the device NAA once the LU is mapped (e.g. Hitachi), alloc records a null
+        # identity and activate_volume fills it in — so a path-only caller (e.g.
+        # `pvesm free`) on a volume that was never activated would otherwise die here.
+        # Resolve it live and persist it; only fail if it is genuinely unresolvable
+        # (never mapped, so there is no host device to name).
+        my $d    = $class->_driver( $storeid, $scfg );
+        my $live = eval { $d->get_lu_identity($backend_id) };
+        $path = eval { $conn->device_path($live) } if $live;
+        die "volume '$volname' has no resolvable device identity (never activated?)\n"
+            unless defined $path;
+        $class->_registry($storeid)->update_meta( $volname, identity => $live );
+    }
 
     return wantarray ? ( $path, vmid_from_volname($volname), 'images' ) : $path;
 }

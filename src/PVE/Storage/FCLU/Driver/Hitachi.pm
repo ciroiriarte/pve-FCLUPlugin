@@ -903,11 +903,11 @@ sub list_lu_mappings {
         unless $self->_is_defined_ldev($ldev);
 
     my $ports = $ldev->{ports} || [];
-    my %by_group;
+    my %by_path;
     for my $p (@$ports) {
         my ( $pid, $hgn ) = ( $p->{portId}, $p->{hostGroupNumber} );
         next unless defined $pid && defined $hgn;
-        my $key = "$pid,$hgn";
+        my $key = "$pid,$hgn";   # the array's UNIQUE per-port host-group id
 
         my $hgname = $p->{hostGroupName};
         if ( !defined $hgname ) {
@@ -917,13 +917,22 @@ sub list_lu_mappings {
         $hgname //= $key;
 
         my ($node) = $hgname =~ /^PVE_(.+)$/;
-        $node //= $hgname;   # non-PVE groups: surface the raw group name as the node key
+        $node //= $hgname;   # non-PVE groups: surface the raw group name as the node hint
 
-        $by_group{$hgname} //=
-            { hostname => $node, access_ref => $hgname, lun => $p->{lun} };
+        # Key by the (port, hostGroupNumber) COMPOSITE, never by hostGroupName: the array
+        # TRUNCATES long host group names, so two DIFFERENT nodes whose PVE_<hostname>
+        # share a prefix (e.g. dev-mp01-pve-03 / -04, both stored "PVE_dev-mp01-pve") end
+        # up with the SAME name. Grouping by name would COLLAPSE them and hide a live
+        # mapping — fatal for the sole safe-unmap authority (§2, §10). The composite is
+        # unique per array path so nothing is ever dropped; `hostname` is a best-effort
+        # hint (unreliable under truncation), while `port`/`host_group` are exact.
+        $by_path{$key} //= {
+            hostname => $node, access_ref => $hgname, lun => $p->{lun},
+            port => $pid, host_group => $hgn,
+        };
     }
 
-    return [ map { $by_group{$_} } sort keys %by_group ];
+    return [ map { $by_path{$_} } sort keys %by_path ];
 }
 
 # Array target ports for fabric zoning (§14). WWPN resolution needs a /ports REST

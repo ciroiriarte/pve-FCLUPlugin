@@ -200,7 +200,8 @@ subtest 'unpublish_lu_all reaps EVERY node mapping (crashed-migration cleanup)' 
     my $d = drv($f);
     $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
     $d->publish_lu( '42', ctx( 'node-b', '10000000c9bb' ) );
-    is( scalar @{ $d->list_lu_mappings('42') }, 2, 'mapped on two nodes to start' );
+    my %n0 = map { $_->{hostname} => 1 } @{ $d->list_lu_mappings('42') };
+    is( scalar keys %n0, 2, 'mapped on two nodes to start' );
 
     # Cluster-wide reap (what this node's WWN-scoped unpublish_lu cannot do).
     is( $d->unpublish_lu_all('42'), 1, 'unpublish_lu_all returns success' );
@@ -219,9 +220,11 @@ subtest 'list_lu_mappings is authoritative from get_ldev->{ports}' => sub {
     $d->publish_lu( '42', ctx( 'node-b', '10000000c9bb' ) );
 
     my $maps = $d->list_lu_mappings('42');
-    is_deeply( [ sort map { $_->{hostname} } @$maps ], [ 'node-a', 'node-b' ],
-        'one descriptor per node, hostname parsed from PVE_<host>' );
+    my @nodes = sort keys %{ { map { $_->{hostname} => 1 } @$maps } };
+    is_deeply( \@nodes, [ 'node-a', 'node-b' ],
+        'both nodes surface (deduped from the per-host-group-path entries)' );
     ok( defined $maps->[0]{access_ref}, 'access_ref present (MUST)' );
+    ok( defined $maps->[0]{host_group}, 'host_group number present (exact id, truncation-proof)' );
 
     my $err;
     eval { $d->list_lu_mappings('999'); 1 } or $err = $@;
@@ -242,6 +245,25 @@ subtest 'list_lu_mappings never DROPS a mapping when the group name is unresolve
     is( scalar @$maps, 1, 'the unresolved mapping is still reported (not dropped)' );
     is( $maps->[0]{access_ref}, 'CL1-A,5', 'falls back to the composite port,hgnum id' );
     is( $maps->[0]{hostname},   'CL1-A,5', 'hostname falls back to the raw key (visible to safe-unmap)' );
+};
+
+subtest 'list_lu_mappings does NOT collapse groups the array truncated to one name' => sub {
+    # The array truncates long host group names, so two DIFFERENT nodes can end up with
+    # the SAME stored name (PVE_dev-mp01-pve-03/-04 -> "PVE_dev-mp01-pve"). Keying by
+    # name would hide a node's mapping; the (port,hostGroupNumber) composite keeps both.
+    my $f = FakeRest->new;
+    $f->{ldevs}{'88'} = 1;
+    $f->{hgs}{'CL1-A,2'} = { portId => 'CL1-A', hostGroupNumber => 2, hostGroupName => 'PVE_trunc', wwns => {} };
+    $f->{hgs}{'CL1-A,3'} = { portId => 'CL1-A', hostGroupNumber => 3, hostGroupName => 'PVE_trunc', wwns => {} };
+    push @{ $f->{luns} },
+        { lunId => 'La', portId => 'CL1-A', hostGroupNumber => 2, ldevId => '88', lun => 1 },
+        { lunId => 'Lb', portId => 'CL1-A', hostGroupNumber => 3, ldevId => '88', lun => 2 };
+    my $d = drv($f);
+
+    my $maps = $d->list_lu_mappings('88');
+    is( scalar @$maps, 2, 'both truncated-name groups reported (NOT collapsed to one)' );
+    is_deeply( [ sort { $a <=> $b } map { $_->{host_group} } @$maps ], [ 2, 3 ],
+        'distinct host-group numbers preserved as the exact identifier' );
 };
 
 subtest 'unpublish_lu surfaces the cause when EVERY unmap fails (§12.4)' => sub {

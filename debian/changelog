@@ -1,3 +1,18 @@
+pve-fclu (0.1.0~alpha9) stable; urgency=medium
+
+  * hitachi: list_lu_mappings no longer collapses host-access paths that the array
+    truncated to the same name (found live: PVE_dev-mp01-pve-03/-04 both stored
+    "PVE_dev-mp01-pve"). Key on the (port, hostGroupNumber) COMPOSITE, not the
+    display name, so no live mapping is ever hidden from the safe-unmap authority;
+    the descriptor now carries exact port/host_group ids (hostname is a best-effort
+    hint). §2 contract note updated.
+  * plugin: filesystem_path/path resolve + persist a null device identity live — a
+    volume alloc'd but never activated (Hitachi only exposes the NAA post-publish)
+    could not be path-resolved, so `pvesm free` of one died. Now falls back to the
+    driver's live get_lu_identity and persists it; only fails if genuinely unmapped.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 14:00:00 -0300
+
 pve-fclu (0.1.0~alpha8) stable; urgency=medium
 
   * plugin: cluster-wide unpublish before delete_lu (4C) — free_image now reaps a

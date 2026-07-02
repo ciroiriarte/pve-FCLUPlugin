@@ -180,7 +180,10 @@ sub unpublish_lu { my ($self) = @_; $self->_nyi('unpublish_lu') }
 
 # list_lu_mappings($backend_id) -> [\%mapping, ...]. The SOLE authority for safe
 # unmap/delete (§12.3): the real per-LU mapping set as Mapping descriptors (§12.1),
-# never a filtered group scan.
+# never a filtered group scan. MUST NOT collapse distinct host-access paths — return
+# one descriptor per unique access path (the driver must key on an identifier the array
+# guarantees unique, e.g. Hitachi's port+hostGroupNumber, NOT a display name the array
+# may truncate) so no live mapping is ever hidden. `hostname` is a best-effort hint.
 sub list_lu_mappings { my ($self) = @_; $self->_nyi('list_lu_mappings') }
 
 # target_ports(%host_ctx?) -> [\%endpoint, ...]. Array target ports for fabric

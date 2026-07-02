@@ -116,7 +116,8 @@ use PVE::Storage::FCLU::Plugin;
     sub detach      { my ( $s ) = @_; $s->{calls}{detach}++; 1 }
     sub flush       { my ( $s ) = @_; $s->{calls}{flush}++; 1 }
     sub resize      { my ( $s ) = @_; $s->{calls}{resize}++; 1 }
-    sub device_path { my ( $s, $id ) = @_; '/dev/mapper/3' . $id->{ids}{naa} }
+    sub device_path { my ( $s, $id ) = @_; my $naa = $id->{ids}{naa};
+        die "no usable device id\n" unless defined $naa && length $naa; '/dev/mapper/3' . $naa }
     sub check_pr_ready { my ( $s, $id ) = @_; $s->{calls}{check_pr_ready}++; return $s->{pr_result} // { ok => 1, issues => [] }; }
 }
 
@@ -304,6 +305,22 @@ subtest 'filesystem_path resolves from the recorded identity (no array session)'
 
     my $scalar = $P->path( {}, $name, 'store1' );
     is( $scalar, $path, 'path() scalar form matches' );
+};
+
+subtest 'filesystem_path resolves + persists a null identity live (never-activated volume)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 950, 'raw', undef, 1 << 30 );
+
+    # Simulate an array whose NAA is only known post-publish: a volume alloc'd but never
+    # activated has a null recorded identity. device_path would die on it.
+    reg()->update_meta( $name, identity => { protocol => 'scsi-fc', ids => { naa => undef } } );
+
+    my $path = $P->filesystem_path( {}, $name, 'store1' );
+    like( $path, qr{^/dev/mapper/360060e80}, 'path resolved via the live-identity fallback' );
+    my ( undef, $meta ) = reg()->lookup($name);
+    ok( defined $meta->{identity}{ids}{naa}, 'the resolved identity is persisted back to the registry' );
 };
 
 subtest 'vendor hooks: _alloc_backend_id requested_id, safe_delete_precheck default' => sub {
