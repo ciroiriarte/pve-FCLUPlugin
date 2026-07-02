@@ -112,7 +112,7 @@ sub storage_status     { }   # ($total, $free, $used) for the configured pool/gr
 
 # --- LU lifecycle ---
 sub create_lu          { }   # (size_bytes, pool_ref, requested_id?, label?) -> $backend_id
-sub delete_lu          { }   # ($backend_id)
+sub delete_lu          { }   # ($backend_id); core unmaps all hosts first (#24 teardown symmetry)
 sub get_lu             { }   # ($backend_id) -> normalized {size,label,pool,...}
 sub list_lus           { }   # (%filter) -> for orphan scans & allocation fences
 sub set_lu_label       { }
