@@ -1,3 +1,20 @@
+pve-fclu (0.1.0~alpha8) stable; urgency=medium
+
+  * plugin: cluster-wide unpublish before delete_lu (4C) — free_image now reaps a
+    leftover mapping from a crashed live-migration on ANOTHER node (via the new
+    Driver::Hitachi::unpublish_lu_all, can()-guarded, best-effort) before deleting,
+    so the array does not refuse the delete and leak the LU on a shared pool.
+  * hitachi: warn on each best-effort #24 linked-clone rollback step (a silent
+    failure would leak an S-VOL/pair on the shared pool with no trail).
+  * multipath: align the shipped VSP stanza with the vendor/hwtable baseline —
+    product "OPEN-.*" (also claims OPEN-0V Thin Image v-vols, so linked-clone S-VOLs
+    get a /dev/mapper device), path_selector service-time 0, no_path_retry 10;
+    documented the user_friendly_names / reservation_key hazards.
+  * docs: delete_lu contract states it subsumes the create_linked_clone(host_ctx)
+    host unmap (teardown symmetry). No behavior change from the doc bits.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 10:00:00 -0300
+
 pve-fclu (0.1.0~alpha7) stable; urgency=medium
 
   * hitachi: implement the REAL #24 linked-clone flow in create_linked_clone
