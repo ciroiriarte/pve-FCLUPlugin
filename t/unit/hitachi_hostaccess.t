@@ -109,6 +109,7 @@ sub drv {
         array_ports => $o{array_ports} // [ 'CL1-A', 'CL2-A' ],
         host_mode_options => $o{hmo} // [ 2, 22, 25, 68 ],
         ( $o{skip_unmap} ? ( skip_unmap_io_check => 1 ) : () ),
+        ( defined $o{prefix} ? ( host_group_prefix => $o{prefix} ) : () ),
     );
 }
 sub ctx { my ( $h, @w ) = @_; return ( hostname => $h, protocol => 'scsi-fc', initiators => [ @w ? @w : ('10000000c9aa') ] ); }
@@ -162,6 +163,42 @@ subtest 'host_ctx validation' => sub {
     like( $@->message, qr/unsupported protocol/, 'bad protocol' );
     eval { $d->ensure_host_access( hostname => 'h', protocol => 'scsi-fc', initiators => [] ) };
     like( $@->message, qr/non-empty arrayref/, 'empty initiators' );
+};
+
+subtest 'host_group_prefix namespaces the host group name' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, prefix => 'clsX' );
+    my $ref = $d->ensure_host_access( ctx('node-a') );
+    is( $ref, 'clsX_node-a', 'access handle uses the configured prefix' );
+    ok( $f->find_host_group_by_name( 'CL1-A', 'clsX_node-a' ), 'group created with the prefixed name' );
+};
+
+subtest 'ensure_host_access REFUSES a group holding FOREIGN initiators (multi-cluster guard)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    # Our-named group, but seeded with another cluster node's (foreign) WWN.
+    $f->create_host_group( port_id => 'CL1-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->create_host_group( port_id => 'CL2-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->add_wwn_to_host_group( port_id => 'CL1-A', host_group_number => 0, wwn => '10000000dead' );
+    my $err;
+    eval { $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) ); 1 } or $err = $@;
+    ok( $err, 'ensure_host_access dies' );
+    is( ref $err && $err->code, 'conflict', 'error code is conflict' );
+    like( "$err", qr/foreign|not owned/i, 'message flags the foreign-initiator collision' );
+    ok( !$f->{hgs}{'CL1-A,0'}{wwns}{'10000000c9aa'}, 'this node WWN was NOT merged into the foreign group' );
+};
+
+subtest 'adopts a legacy PVE_<host> group by WWN under a new prefix (no rename, no duplicate)' => sub {
+    my $f = FakeRest->new;
+    $f->create_host_group( port_id => 'CL1-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->create_host_group( port_id => 'CL2-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->add_wwn_to_host_group( port_id => 'CL1-A', host_group_number => 0, wwn => '10000000c9aa' );
+    $f->add_wwn_to_host_group( port_id => 'CL2-A', host_group_number => 0, wwn => '10000000c9aa' );
+    my $d = drv( $f, prefix => 'clsX' );
+    my $ref = $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) );
+    is( $ref, 'PVE_node-a', 'adopted the legacy group name, not renamed to clsX_node-a' );
+    ok( !$f->find_host_group_by_name( 'CL1-A', 'clsX_node-a' ), 'no duplicate prefixed group created' );
+    is( $f->{calls}{create_host_group}, 2, 'no additional host groups created (only the 2 pre-existing)' );
 };
 
 subtest 'publish_lu maps the ldev per port, idempotently' => sub {

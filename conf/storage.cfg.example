@@ -18,6 +18,14 @@ hitachiblock: myarray
     # for the appliance's self-signed cert). Provide a CA bundle when enabling.
     # tls_verify 1
     # tls_ca_file /etc/pve/priv/hitachiblock/ca.pem
+    #
+    # SHARED ARRAY POOL across MULTIPLE PVE clusters: give each cluster a DISJOINT
+    # ldev_range and a distinct host_group_prefix so they never collide. Host groups
+    # are named <host_group_prefix>_<hostname>; the prefix defaults to the PVE cluster
+    # name. (A fail-loud guard refuses to merge into a host group holding another
+    # cluster's initiators regardless.)
+    # ldev_range 0x100-0x17F
+    # host_group_prefix clusterA
 
 # VSP G series example (uses Ops Center API Config Manager)
 # hitachiblock: vspg-array

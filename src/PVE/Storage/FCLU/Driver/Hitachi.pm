@@ -92,6 +92,12 @@ sub new {
         host_mode_options => [ grep { /^\d+$/ } @{ _as_list(
             defined $opts{host_mode_options} ? $opts{host_mode_options} : '2,22,25,68' ) } ],
         skip_unmap_io_check => $opts{skip_unmap_io_check} ? 1 : 0,
+        # Host group name prefix (§ multi-cluster). Namespaces this cluster's host
+        # groups on a SHARED array pool so two clusters do not collide on
+        # <prefix>_<hostname>. The plugin resolves it (explicit config, else the PVE
+        # cluster name); default 'PVE' preserves the legacy name for a single cluster.
+        host_group_prefix => ( defined $opts{host_group_prefix} && length $opts{host_group_prefix} )
+            ? $opts{host_group_prefix} : 'PVE',
     }, $class;
 
     # Build a real transport unless one was injected (tests inject a mock).
@@ -718,7 +724,8 @@ sub ensure_host_access {
     my ($self, %ctx) = @_;
     my $hostname = $self->_check_host_ctx(%ctx);
     my $wwns     = $ctx{initiators};
-    my $hg_name  = "PVE_$hostname";
+    my $hg_name  = $self->_hg_name($hostname);
+    my $access_ref;   # the REAL resolved name (canonical, or an adopted legacy group)
 
     my @hmo = @{ $self->{host_mode_options} };
     push @hmo, 91 if $self->{skip_unmap_io_check} && !grep { $_ == 91 } @hmo;
@@ -745,6 +752,9 @@ sub ensure_host_access {
                 unless $hg;
         }
         my $hg_num = $hg->{hostGroupNumber};
+        # The REAL name of the group we resolved — may be the canonical <prefix>_<host>
+        # we just created, OR a legacy PVE_<host> group adopted by WWN (never renamed).
+        $access_ref //= $hg->{hostGroupName};
 
         # Reconcile host-mode options additively (best-effort) — only ADD missing
         # options, never remove out-of-band ones; needed for groups predating an
@@ -769,6 +779,24 @@ sub ensure_host_access {
             $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
         } || [];
         my %present = map { lc( $_->{hostWwn} ) => 1 } @$existing;
+
+        # SAFETY (multi-cluster shared pool): refuse to add THIS node's WWNs to a host
+        # group that already holds FOREIGN initiators. On a shared array two clusters can
+        # collide on <prefix>_<hostname> (same prefix AND hostname), or a group can be
+        # mis-created; silently merging would expose this cluster's LUNs to the foreign
+        # node (concurrent-write corruption). Fail LOUD instead. A group holding only our
+        # own WWNs — normal re-bring-up, or a legacy PVE_<hostname> group adopted by WWN —
+        # passes. Relies on host_context listing ALL of this node's initiators.
+        my %ours = map { lc($_) => 1 } @$wwns;
+        my @foreign = sort grep { !$ours{$_} } keys %present;
+        $self->_err( 'conflict',
+            "host group '$access_ref' on $port (#$hg_num) already contains initiators not owned "
+            . "by node '$hostname' (foreign WWN(s): @foreign); refusing to add this node's WWNs "
+            . "— probable cross-cluster host-group collision. Give each cluster a distinct "
+            . "host_group_prefix + a disjoint ldev_range (or an array Resource Group)." )
+            if @foreign;
+
+        # Register any of our WWNs not already present (best-effort, idempotent).
         for my $wwn (@$wwns) {
             next if $present{ lc $wwn };
             eval {
@@ -779,7 +807,15 @@ sub ensure_host_access {
         }
     }
 
-    return $hg_name;
+    return $access_ref // $hg_name;
+}
+
+# Host group name for this node, namespaced by the (per-cluster) prefix so two PVE
+# clusters sharing an array pool do not collide on the same hostname. Default prefix
+# 'PVE' preserves the historical PVE_<hostname> name for a single cluster.
+sub _hg_name {
+    my ($self, $hostname) = @_;
+    return ( $self->{host_group_prefix} // 'PVE' ) . "_$hostname";
 }
 
 sub publish_lu {
@@ -791,10 +827,11 @@ sub publish_lu {
     $self->ensure_host_access(%ctx);
     my $wwns = $ctx{initiators};
 
-    my $lun;
+    my ( $lun, $access_ref );
     for my $port ( @{ $self->{array_ports} } ) {
         my $hg = $self->_find_node_hg( $port, $wwns );
         next unless $hg;
+        $access_ref //= $hg->{hostGroupName};   # the real group name (may be an adopted legacy name)
         my $hg_num = $hg->{hostGroupNumber};
 
         my $luns = $self->_call( sub {
@@ -814,7 +851,7 @@ sub publish_lu {
         $lun //= $luns->[0]{lun} if @$luns && defined $luns->[0]{lun};
     }
 
-    return { hostname => $hostname, access_ref => "PVE_$hostname", lun => $lun };
+    return { hostname => $hostname, access_ref => $access_ref // $self->_hg_name($hostname), lun => $lun };
 }
 
 sub unpublish_lu {

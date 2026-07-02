@@ -49,7 +49,7 @@ subtest 'driver_config maps storage.cfg to the Driver::Hitachi constructor opts'
         platform => 'vsp_e', pool_id => '63', snap_pool_id => '64', mgmt_ip => '10.0.0.1',
         storage_id => '900000012345', mgmt_port => 443, tls_verify => 1, tls_ca_file => '/ca',
         rest_keepalive => 1, target_ports => 'CL1-A,CL2-A', host_mode => 'LINUX/IRIX',
-        host_mode_options => '2,22,25,68', skip_unmap_io_check => 1,
+        host_mode_options => '2,22,25,68', skip_unmap_io_check => 1, host_group_prefix => 'clsX',
     } );
     is( $cfg->{platform}, 'vsp_e', 'platform' );
     is( $cfg->{array_ports}, 'CL1-A,CL2-A', 'target_ports -> array_ports' );
@@ -57,10 +57,12 @@ subtest 'driver_config maps storage.cfg to the Driver::Hitachi constructor opts'
     is( $cfg->{sessionless}, 0, 'rest_keepalive=1 -> sessionless=0' );
     is( $cfg->{snap_pool_id}, '64', 'snap_pool_id passed' );
     is( $cfg->{skip_unmap_io_check}, 1, 'skip_unmap_io_check passed' );
+    is( $cfg->{host_group_prefix}, 'clsX', 'explicit host_group_prefix passed through' );
 
     my $def = $HB->driver_config( {} );
     is( $def->{platform}, 'vsp_one', 'default platform vsp_one' );
     is( $def->{sessionless}, 1, 'default sessionless=1 (session-less)' );
+    is( $def->{host_group_prefix}, 'PVE', 'host_group_prefix derives to PVE when cluster name unavailable' );
     ok( !exists $def->{port}, 'no port when mgmt_port unset (driver uses profile default)' );
     ok( !exists $def->{tls_verify}, 'no tls_verify key when unset' );
 };
@@ -69,6 +71,7 @@ subtest 'properties/options merge over the base + avoid the SectionConfig landmi
     my $props = $HB->properties;
     ok( $props->{mgmt_ip} && $props->{pool_id} && $props->{lock_timeout}, 'inherited base properties' );
     ok( $props->{storage_id} && $props->{target_ports} && $props->{ldev_range}, 'vendor properties present' );
+    ok( $props->{host_group_prefix}, 'host_group_prefix property present (multi-cluster namespacing)' );
     is( $props->{platform}{enum}[0], 'vsp_g', 'platform enum declared' );
     ok( !exists $props->{username}, 'username NOT redeclared (avoids duplicate-property die)' );
     ok( !exists $props->{password}, 'password NOT redeclared' );

@@ -44,7 +44,27 @@ sub driver_config {
         host_mode           => $scfg->{host_mode},
         host_mode_options   => $scfg->{host_mode_options},
         skip_unmap_io_check => $scfg->{skip_unmap_io_check},
+        # Host group name prefix: explicit config, else auto-derived from the PVE
+        # cluster name so each cluster namespaces its host groups on a SHARED array
+        # pool. See on_add_hook for the shared-array caveat.
+        host_group_prefix   => $scfg->{host_group_prefix} // $class->_derive_cluster_prefix(),
     };
+}
+
+# Default host group name prefix when `host_group_prefix` is unset: the PVE cluster
+# name (so two clusters sharing an array pool namespace their host groups apart),
+# falling back to 'PVE' for a single node / when the cluster name is unavailable.
+# Sanitised to the host-group-name charset. Best-effort — never dies (config path).
+sub _derive_cluster_prefix {
+    my ($class) = @_;
+    my $name = eval {
+        require PVE::Cluster;
+        my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
+        $conf->{main}{totem}{cluster_name};
+    };
+    return 'PVE' unless defined $name && length $name;
+    $name =~ s/[^A-Za-z0-9]//g;
+    return length $name ? "PVE-$name" : 'PVE';
 }
 
 # ── Configuration schema (vendor deltas merged over the generic base) ──
@@ -116,7 +136,17 @@ sub properties {
             description => "Restrict LDEV ID allocation to a range (e.g. '1000-1999' or"
                 . " '0x3E8-0x7CF'). Also fences destructive ops: the plugin refuses to unmap"
                 . " or delete any LDEV outside the range, so it can never touch foreign"
-                . " volumes that merely share a target port.",
+                . " volumes that merely share a target port. On a pool shared by multiple PVE"
+                . " clusters, give each cluster a DISJOINT range.",
+            type        => 'string',
+            optional    => 1,
+        },
+        host_group_prefix => {
+            description => "Prefix for this cluster's per-node host group names"
+                . " (<prefix>_<hostname>). Namespaces host groups on an array pool SHARED by"
+                . " multiple PVE clusters so they never collide. Defaults to the PVE cluster"
+                . " name (or 'PVE' for a single node). Set an explicit, distinct value per"
+                . " cluster when the clusters share a pool and could share a hostname.",
             type        => 'string',
             optional    => 1,
         },
@@ -171,6 +201,7 @@ sub options {
         platform            => { optional => 1 },
         mgmt_port           => { optional => 1 },
         ldev_range          => { optional => 1 },
+        host_group_prefix   => { optional => 1 },
         discard_zero_page   => { optional => 1 },
         port_scheduler      => { optional => 1 },
         copy_speed          => { optional => 1 },
@@ -185,6 +216,7 @@ sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
     my $ret = $class->SUPER::on_add_hook( $storeid, $scfg, %sensitive );
     $class->_warn_if_ldev_range_misaligned( $scfg->{ldev_range} );
+    $class->_warn_if_hg_prefix_unset($scfg);
     return $ret;
 }
 
@@ -192,7 +224,20 @@ sub on_update_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
     my $ret = $class->SUPER::on_update_hook( $storeid, $scfg, %sensitive );
     $class->_warn_if_ldev_range_misaligned( $scfg->{ldev_range} );
+    $class->_warn_if_hg_prefix_unset($scfg);
     return $ret;
+}
+
+# Advisory: on a shared array pool the auto-derived prefix (PVE cluster name) only
+# namespaces clusters apart if their cluster NAMES differ — nudge the admin to set an
+# explicit, distinct host_group_prefix.
+sub _warn_if_hg_prefix_unset {
+    my ($class, $scfg) = @_;
+    return if defined $scfg->{host_group_prefix} && length $scfg->{host_group_prefix};
+    warn "host_group_prefix is not set; host groups will be named '"
+        . $class->_derive_cluster_prefix() . "_<hostname>' (from the PVE cluster name)."
+        . " If this array pool is SHARED with another PVE cluster, set a distinct"
+        . " host_group_prefix per cluster to prevent host-group collisions.\n";
 }
 
 # ── ldev_range: allocation hook + the §7 destructive-op safety fence ──
