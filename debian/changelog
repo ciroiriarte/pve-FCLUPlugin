@@ -1,3 +1,15 @@
+pve-fclu (0.1.0~alpha10) stable; urgency=medium
+
+  * hitachi: multi-cluster shared-pool safety. ensure_host_access now REFUSES to add
+    this node's WWNs to a host group that already holds foreign initiators (dies
+    'conflict' instead of silently merging two clusters into one masking group). New
+    optional host_group_prefix namespaces host groups as <prefix>_<hostname>
+    (defaults to the PVE cluster name); legacy PVE_<hostname> groups are adopted by
+    WWN, never renamed. Give each cluster a distinct host_group_prefix + a disjoint
+    ldev_range on a shared pool. No §2 contract change.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 16:30:00 -0300
+
 pve-fclu (0.1.0~alpha9) stable; urgency=medium
 
   * hitachi: list_lu_mappings no longer collapses host-access paths that the array
