@@ -786,14 +786,18 @@ sub ensure_host_access {
         # mis-created; silently merging would expose this cluster's LUNs to the foreign
         # node (concurrent-write corruption). Fail LOUD instead. A group holding only our
         # own WWNs — normal re-bring-up, or a legacy PVE_<hostname> group adopted by WWN —
-        # passes. Relies on host_context listing ALL of this node's initiators.
+        # passes. Relies on host_context listing ALL of this node's PRESENT initiators, so a
+        # stale WWN left by a REPLACED/REMOVED HBA on this node also trips it (still safe:
+        # fail-loud, remedy = delete the stale WWN from the host group).
         my %ours = map { lc($_) => 1 } @$wwns;
         my @foreign = sort grep { !$ours{$_} } keys %present;
         $self->_err( 'conflict',
-            "host group '$access_ref' on $port (#$hg_num) already contains initiators not owned "
-            . "by node '$hostname' (foreign WWN(s): @foreign); refusing to add this node's WWNs "
-            . "— probable cross-cluster host-group collision. Give each cluster a distinct "
-            . "host_group_prefix + a disjoint ldev_range (or an array Resource Group)." )
+            "host group '$hg->{hostGroupName}' on $port (#$hg_num) already contains initiators "
+            . "not owned by node '$hostname' (foreign WWN(s): @foreign); refusing to add this "
+            . "node's WWNs. Likely a cross-cluster host-group collision on a shared pool — give "
+            . "each cluster a distinct host_group_prefix + a disjoint ldev_range (or an array "
+            . "Resource Group). If instead an HBA on THIS node was replaced/removed, delete the "
+            . "stale WWN from the host group." )
             if @foreign;
 
         # Register any of our WWNs not already present (best-effort, idempotent).
@@ -953,7 +957,9 @@ sub list_lu_mappings {
         }
         $hgname //= $key;
 
-        my ($node) = $hgname =~ /^PVE_(.+)$/;
+        my $prefix = $self->{host_group_prefix} // 'PVE';
+        my ($node) = $hgname =~ /^\Q$prefix\E_(.+)$/;
+        ($node) = $hgname =~ /^PVE_(.+)$/ if !defined $node;   # legacy PVE_<host> groups
         $node //= $hgname;   # non-PVE groups: surface the raw group name as the node hint
 
         # Key by the (port, hostGroupNumber) COMPOSITE, never by hostGroupName: the array

@@ -1,3 +1,13 @@
+pve-fclu (0.1.0~alpha11) stable; urgency=medium
+
+  * hitachi: multi-cluster guard message polish (architect review) — the conflict
+    error names the actual port's group and notes that a stale WWN from a
+    replaced/removed HBA on THIS node also trips the guard (remedy: delete the stale
+    WWN), not only a cross-cluster collision. list_lu_mappings hostname hint now
+    strips the configured host_group_prefix (not just legacy PVE_). No behaviour change.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 17:00:00 -0300
+
 pve-fclu (0.1.0~alpha10) stable; urgency=medium
 
   * hitachi: multi-cluster shared-pool safety. ensure_host_access now REFUSES to add
