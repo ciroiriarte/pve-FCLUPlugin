@@ -399,6 +399,7 @@ sub create_host_group {
         if $opts{host_mode_options} && @{$opts{host_mode_options}};
 
     my $res = $self->_request('POST', $self->_url('/host-groups'), $body);
+    $self->_invalidate_hg_list_cache($opts{port_id});
     return $self->_wait_for_job($res);
 }
 
@@ -422,13 +423,31 @@ sub set_host_group_mode {
 
 sub list_host_groups {
     my ($self, %filter) = @_;
+    my $port = $filter{port_id};
+
+    # Per-instance cache of a port's host-group LIST (topology: names + numbers, NOT
+    # WWNs). find_host_group_by_name/by_wwn call this repeatedly in the clone
+    # host-mapping hot path; on slow CM REST re-fetching per lookup dominates. WWN
+    # membership is ALWAYS read fresh (list_host_wwns is never cached), so the
+    # multi-cluster WWN-ownership guard never sees stale initiators. Invalidated on
+    # create_host_group/delete_host_group (our own mutations); a group another node
+    # adds out-of-band that we haven't seen only means we resolve OUR group as usual.
+    return $self->{_hg_list_cache}{$port}
+        if defined $port && $self->{_hg_list_cache}{$port};
 
     my @params;
-    push @params, "portId=$filter{port_id}" if $filter{port_id};
+    push @params, "portId=$port" if $port;
     my $query = @params ? '?' . join('&', @params) : '';
-
     my $data = $self->_request('GET', $self->_url("/host-groups$query"));
-    return $data->{data} || [];
+    my $list = $data->{data} || [];
+    $self->{_hg_list_cache}{$port} = $list if defined $port;
+    return $list;
+}
+
+# Drop the cached host-group list for a port (after a create/delete on it).
+sub _invalidate_hg_list_cache {
+    my ($self, $port) = @_;
+    delete $self->{_hg_list_cache}{$port} if defined $port;
 }
 
 sub get_host_group {
@@ -490,22 +509,26 @@ sub find_host_group_by_name {
 
 sub find_host_group_by_wwn {
     my ($self, $port_id, $wwn) = @_;
+    my $target = lc($wwn);
 
-    my $groups = $self->list_host_groups(port_id => $port_id);
-    for my $hg (@$groups) {
-        my $wwns = eval {
-            $self->list_host_wwns(
-                port_id           => $port_id,
-                host_group_number => $hg->{hostGroupNumber},
-            );
-        } || [];
-        for my $w (@$wwns) {
-            if (lc($w->{hostWwn}) eq lc($wwn)) {
-                return $hg;
-            }
-        }
+    # ONE /host-wwns query for the whole port (each entry carries its hostGroupNumber)
+    # instead of a per-host-group query — O(1) round-trips, not O(host groups). This is
+    # the clone host-mapping hot path (resolve the node's host group by its initiator
+    # WWN); on slow CM REST the per-group scan was the dominant cost (GitHub perf).
+    my $wwns = $self->list_host_wwns( port_id => $port_id );
+    my $hgn;
+    for my $w (@$wwns) {
+        next unless lc( $w->{hostWwn} // '' ) eq $target;
+        $hgn = $w->{hostGroupNumber};
+        last;
     }
-    return undef;
+    return undef unless defined $hgn;
+
+    # Resolve the full host group object (name/mode) from the port's group list.
+    for my $hg ( @{ $self->list_host_groups( port_id => $port_id ) } ) {
+        return $hg if defined $hg->{hostGroupNumber} && $hg->{hostGroupNumber} == $hgn;
+    }
+    return { portId => $port_id, hostGroupNumber => $hgn };
 }
 
 # ── LUN Path Operations ──
@@ -887,6 +910,8 @@ sub delete_host_group {
     croak "host_group_id is required" unless defined $host_group_id;
 
     my $res = $self->_request('DELETE', $self->_url("/host-groups/$host_group_id"));
+    my ($port) = split /,/, $host_group_id;
+    $self->_invalidate_hg_list_cache($port);
     return $self->_wait_for_job($res);
 }
 

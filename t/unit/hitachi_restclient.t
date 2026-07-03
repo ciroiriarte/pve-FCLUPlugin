@@ -62,12 +62,37 @@ subtest 'constructor validates required fields and builds the CM base url' => su
 
     # Async-job poll budget is configurable (driven by the driver's op_timeout_s) so a
     # large Thin Image clone that runs past the default 300s does not time out.
-    my $c = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
+    my $cj = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
         mgmt_ip => '10.0.1.100', storage_id => 'x', username => 'u', password => 'p', job_timeout => 600 );
-    is( $c->{job_timeout}, 600, 'job_timeout honoured from opts' );
+    is( $cj->{job_timeout}, 600, 'job_timeout honoured from opts' );
     my $def = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
         mgmt_ip => '10.0.1.100', storage_id => 'x', username => 'u', password => 'p' );
     is( $def->{job_timeout}, 300, 'job_timeout falls back to the 300s default' );
+};
+
+subtest 'find_host_group_by_wwn: ONE /host-wwns query (no per-host-group scan)' => sub {
+    my $c = new_mock_client();
+    MockRestClient::clear_request_log();
+    MockRestClient::set_mock_responses(
+        # /host-wwns?portId=CL1-A -> every WWN on the port with its hostGroupNumber
+        { data => [
+            { portId => 'CL1-A', hostGroupNumber => 1, hostWwn => '10000000aaaa' },
+            { portId => 'CL1-A', hostGroupNumber => 2, hostWwn => '10000000bbbb' },
+            { portId => 'CL1-A', hostGroupNumber => 3, hostWwn => '10000000cccc' },
+        ] },
+        # /host-groups?portId=CL1-A -> the group objects (for the name/mode)
+        { data => [
+            { portId => 'CL1-A', hostGroupNumber => 1, hostGroupName => 'PVE_a' },
+            { portId => 'CL1-A', hostGroupNumber => 2, hostGroupName => 'PVE_b' },
+            { portId => 'CL1-A', hostGroupNumber => 3, hostGroupName => 'PVE_c' },
+        ] },
+    );
+    my $hg = $c->find_host_group_by_wwn( 'CL1-A', '10000000BBBB' );
+    is( $hg->{hostGroupNumber}, 2, 'resolved the WWN to its host group' );
+    is( $hg->{hostGroupName}, 'PVE_b', 'returned the full host group object (name preserved)' );
+
+    my @wwn_calls = grep { $_->{url} =~ m{/host-wwns} } MockRestClient::get_request_log();
+    is( scalar @wwn_calls, 1, 'exactly ONE /host-wwns query regardless of host-group count' );
 };
 
 subtest 'create_ldev: auto-assign body + job resourceId extraction' => sub {
