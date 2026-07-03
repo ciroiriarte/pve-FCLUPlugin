@@ -1,3 +1,12 @@
+pve-fclu (0.1.0~alpha12) stable; urgency=medium
+
+  * hitachi: the async CM REST job-poll timeout now follows the driver profile's
+    op_timeout_s (600s) instead of a hard-coded 300s, so a large Thin Image clone
+    (e.g. a 64G template disk) no longer fails with "array operation did not
+    converge in time". Configurable via the RestClient job_timeout opt.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 18:30:00 -0300
+
 pve-fclu (0.1.0~alpha11) stable; urgency=medium
 
   * hitachi: multi-cluster guard message polish (architect review) — the conflict
