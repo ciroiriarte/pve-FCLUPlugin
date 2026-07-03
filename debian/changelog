@@ -1,7 +1,9 @@
-pve-fclu (0.1.0~alpha13) stable; urgency=medium
+pve-fclu (0.1.0~alpha14) stable; urgency=medium
 
-  * hitachi: wire the debug property through to the RestClient (per-request syslog
-    logging was previously dead config). Diagnostic aid for the qm-clone timeout.
+  * hitachi: fix the qm-clone timeout root cause — the S-VOL host-mapping made ~90+
+    CM REST queries/clone (per-host-group /host-wwns scans). find_host_group_by_wwn
+    is now one /host-wwns query per port (O(1)), and list_host_groups is cached
+    (topology only; WWN reads stay fresh for the multi-cluster guard).
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 02 Jul 2026 19:30:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 06:30:00 -0300
 
