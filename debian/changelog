@@ -1,9 +1,10 @@
-pve-fclu (0.1.0~alpha14) stable; urgency=medium
+pve-fclu (0.1.0~alpha15) stable; urgency=medium
 
-  * hitachi: fix the qm-clone timeout root cause — the S-VOL host-mapping made ~90+
-    CM REST queries/clone (per-host-group /host-wwns scans). find_host_group_by_wwn
-    is now one /host-wwns query per port (O(1)), and list_host_groups is cached
-    (topology only; WWN reads stay fresh for the multi-cluster guard).
+  * hitachi: correct the qm-clone host-mapping fix (alpha14's single /host-wwns query
+    is rejected by CM REST, which requires hostGroupNumber). publish_lu now resolves
+    each port's host group by the name ensure_host_access already found (cached
+    host-group list) instead of re-scanning WWNs per group — eliminates the ~90
+    REST queries/clone. list_host_groups cache gains a 30s TTL.
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 06:30:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 07:00:00 -0300
 
