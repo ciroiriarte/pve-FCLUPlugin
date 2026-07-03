@@ -13,6 +13,10 @@ use Time::HiRes ();
 my $DEFAULT_TIMEOUT     = 30;
 my $JOB_POLL_INTERVAL   = 2;
 my $JOB_POLL_TIMEOUT    = 300;
+# TTL for the per-port host-group LIST cache. Long enough to absorb a clone burst
+# (the whole point), short enough that an out-of-band deletion of our own host group
+# self-heals within a long-lived pvedaemon instead of persisting until restart.
+my $HG_LIST_CACHE_TTL   = 30;
 my $MAX_RETRIES         = 3;
 my $RETRY_DELAY         = 2;
 my $RETRY_MAX_DELAY     = 30;   # hard cap on any single backoff (seconds)
@@ -432,15 +436,17 @@ sub list_host_groups {
     # multi-cluster WWN-ownership guard never sees stale initiators. Invalidated on
     # create_host_group/delete_host_group (our own mutations); a group another node
     # adds out-of-band that we haven't seen only means we resolve OUR group as usual.
-    return $self->{_hg_list_cache}{$port}
-        if defined $port && $self->{_hg_list_cache}{$port};
+    if ( defined $port ) {
+        my $c = $self->{_hg_list_cache}{$port};
+        return $c->{list} if $c && ( time - $c->{ts} ) < $HG_LIST_CACHE_TTL;
+    }
 
     my @params;
     push @params, "portId=$port" if $port;
     my $query = @params ? '?' . join('&', @params) : '';
     my $data = $self->_request('GET', $self->_url("/host-groups$query"));
     my $list = $data->{data} || [];
-    $self->{_hg_list_cache}{$port} = $list if defined $port;
+    $self->{_hg_list_cache}{$port} = { ts => time, list => $list } if defined $port;
     return $list;
 }
 
@@ -509,26 +515,26 @@ sub find_host_group_by_name {
 
 sub find_host_group_by_wwn {
     my ($self, $port_id, $wwn) = @_;
-    my $target = lc($wwn);
 
-    # ONE /host-wwns query for the whole port (each entry carries its hostGroupNumber)
-    # instead of a per-host-group query — O(1) round-trips, not O(host groups). This is
-    # the clone host-mapping hot path (resolve the node's host group by its initiator
-    # WWN); on slow CM REST the per-group scan was the dominant cost (GitHub perf).
-    my $wwns = $self->list_host_wwns( port_id => $port_id );
-    my $hgn;
-    for my $w (@$wwns) {
-        next unless lc( $w->{hostWwn} // '' ) eq $target;
-        $hgn = $w->{hostGroupNumber};
-        last;
+    # NOTE: the CM REST /host-wwns collection REQUIRES both portId AND hostGroupNumber
+    # (portId alone -> KART40044-E "Required parameters not specified"), so this must
+    # scan per host group. It is therefore O(host groups) and slow on a busy port —
+    # avoid it on the hot path (publish_lu resolves by the ensured name instead).
+    my $groups = $self->list_host_groups(port_id => $port_id);
+    for my $hg (@$groups) {
+        my $wwns = eval {
+            $self->list_host_wwns(
+                port_id           => $port_id,
+                host_group_number => $hg->{hostGroupNumber},
+            );
+        } || [];
+        for my $w (@$wwns) {
+            if (lc($w->{hostWwn}) eq lc($wwn)) {
+                return $hg;
+            }
+        }
     }
-    return undef unless defined $hgn;
-
-    # Resolve the full host group object (name/mode) from the port's group list.
-    for my $hg ( @{ $self->list_host_groups( port_id => $port_id ) } ) {
-        return $hg if defined $hg->{hostGroupNumber} && $hg->{hostGroupNumber} == $hgn;
-    }
-    return { portId => $port_id, hostGroupNumber => $hgn };
+    return undef;
 }
 
 # ── LUN Path Operations ──

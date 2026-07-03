@@ -830,14 +830,22 @@ sub publish_lu {
     my ($self, $backend_id, %ctx) = @_;
     my $hostname = $self->_check_host_ctx(%ctx);
 
-    # ensure_host_access is safe to call on every publish (§12.2) — the core holds
-    # no host-object state, the driver reconciles.
-    $self->ensure_host_access(%ctx);
+    # ensure_host_access is safe to call on every publish (§12.2) — the core holds no
+    # host-object state, the driver reconciles. It returns the node's RESOLVED host
+    # group name (canonical or an adopted legacy name); reuse it to resolve each port's
+    # group by NAME (a cheap, cached host-group list) instead of re-scanning every
+    # group's WWNs per port. find_host_group_by_wwn is O(host groups) and the CM REST
+    # /host-wwns requires a hostGroupNumber (can't be batched), so on a busy port that
+    # per-group scan is the dominant clone host-mapping cost — this was THE qm-clone
+    # REST amplifier. _find_node_hg stays as a fallback if a group name ever diverges
+    # per port.
+    my $hg_name = $self->ensure_host_access(%ctx);
     my $wwns = $ctx{initiators};
 
     my ( $lun, $access_ref );
     for my $port ( @{ $self->{array_ports} } ) {
-        my $hg = $self->_find_node_hg( $port, $wwns );
+        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
+            // $self->_find_node_hg( $port, $wwns );
         next unless $hg;
         $access_ref //= $hg->{hostGroupName};   # the real group name (may be an adopted legacy name)
         my $hg_num = $hg->{hostGroupNumber};

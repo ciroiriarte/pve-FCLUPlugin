@@ -70,29 +70,23 @@ subtest 'constructor validates required fields and builds the CM base url' => su
     is( $def->{job_timeout}, 300, 'job_timeout falls back to the 300s default' );
 };
 
-subtest 'find_host_group_by_wwn: ONE /host-wwns query (no per-host-group scan)' => sub {
+subtest 'list_host_groups is cached per port; invalidated on create/delete' => sub {
     my $c = new_mock_client();
     MockRestClient::clear_request_log();
     MockRestClient::set_mock_responses(
-        # /host-wwns?portId=CL1-A -> every WWN on the port with its hostGroupNumber
-        { data => [
-            { portId => 'CL1-A', hostGroupNumber => 1, hostWwn => '10000000aaaa' },
-            { portId => 'CL1-A', hostGroupNumber => 2, hostWwn => '10000000bbbb' },
-            { portId => 'CL1-A', hostGroupNumber => 3, hostWwn => '10000000cccc' },
-        ] },
-        # /host-groups?portId=CL1-A -> the group objects (for the name/mode)
-        { data => [
-            { portId => 'CL1-A', hostGroupNumber => 1, hostGroupName => 'PVE_a' },
-            { portId => 'CL1-A', hostGroupNumber => 2, hostGroupName => 'PVE_b' },
-            { portId => 'CL1-A', hostGroupNumber => 3, hostGroupName => 'PVE_c' },
-        ] },
+        { data => [ { portId => 'CL1-A', hostGroupNumber => 2, hostGroupName => 'PVE_b' } ] },
+        { jobId => 'j' }, { state => 'Succeeded' },   # create_host_group job
+        { data => [ { portId => 'CL1-A', hostGroupNumber => 2, hostGroupName => 'PVE_b' },
+                    { portId => 'CL1-A', hostGroupNumber => 3, hostGroupName => 'PVE_c' } ] },
     );
-    my $hg = $c->find_host_group_by_wwn( 'CL1-A', '10000000BBBB' );
-    is( $hg->{hostGroupNumber}, 2, 'resolved the WWN to its host group' );
-    is( $hg->{hostGroupName}, 'PVE_b', 'returned the full host group object (name preserved)' );
+    $c->list_host_groups( port_id => 'CL1-A' );
+    $c->list_host_groups( port_id => 'CL1-A' );   # served from cache (no 2nd GET)
+    my @g1 = grep { $_->{method} eq 'GET' && $_->{url} =~ m{/host-groups} } MockRestClient::get_request_log();
+    is( scalar @g1, 1, 'second list_host_groups served from cache (one GET)' );
 
-    my @wwn_calls = grep { $_->{url} =~ m{/host-wwns} } MockRestClient::get_request_log();
-    is( scalar @wwn_calls, 1, 'exactly ONE /host-wwns query regardless of host-group count' );
+    $c->create_host_group( port_id => 'CL1-A', host_group_name => 'PVE_c' );   # invalidates CL1-A
+    my $g = $c->list_host_groups( port_id => 'CL1-A' );   # re-fetches (sees the new group)
+    is( scalar @$g, 2, 'cache invalidated on create_host_group -> fresh list' );
 };
 
 subtest 'create_ldev: auto-assign body + job resourceId extraction' => sub {
