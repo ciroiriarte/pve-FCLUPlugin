@@ -109,6 +109,9 @@ sub new {
             username   => $opts{username},
             password   => $opts{password},
             port       => $opts{port} // $prof->{default_port},
+            # Poll async CM REST jobs up to the profile's operation timeout (large TI
+            # v-vol clones can exceed the RestClient's shorter default).
+            job_timeout => $prof->{op_timeout_s},
             ( defined $opts{tls_verify}  ? ( tls_verify  => $opts{tls_verify} )  : () ),
             ( defined $opts{tls_ca_file} ? ( tls_ca_file => $opts{tls_ca_file} ) : () ),
             ( defined $opts{sessionless} ? ( sessionless => $opts{sessionless} ) : () ),

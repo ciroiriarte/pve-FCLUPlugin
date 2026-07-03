@@ -89,6 +89,12 @@ sub new {
         # immediately releases a transient session per basic-auth request, so
         # nothing accumulates. login()/logout()/keepalive() become no-ops.
         sessionless => $opts{sessionless} ? 1 : 0,
+        # Max seconds to poll an async CM REST job before giving up. Driven by the
+        # driver's profile op_timeout_s (default falls back to $JOB_POLL_TIMEOUT) —
+        # large Thin Image v-vol operations (e.g. cloning a 64G template disk) can run
+        # well past the old hard-coded 300s, so the poll budget must match the
+        # profile's declared operation timeout, not a shorter constant.
+        job_timeout => $opts{job_timeout} || $JOB_POLL_TIMEOUT,
         # Diagnostic logging verbosity (#33): 0=off, 2=+per-request method/path/
         # status/timing, 3=+bodies (redacted). Never logs auth headers/tokens.
         debug       => $opts{debug} // 0,
@@ -1118,7 +1124,8 @@ sub _wait_for_job {
     }
 
     my $elapsed = 0;
-    while ($elapsed < $JOB_POLL_TIMEOUT) {
+    my $budget  = $self->{job_timeout} || $JOB_POLL_TIMEOUT;
+    while ($elapsed < $budget) {
         sleep($JOB_POLL_INTERVAL);
         $elapsed += $JOB_POLL_INTERVAL;
 
@@ -1144,7 +1151,7 @@ sub _wait_for_job {
         }
     }
 
-    croak "Job $job_id timed out after ${JOB_POLL_TIMEOUT}s";
+    croak "Job $job_id timed out after ${budget}s";
 }
 
 1;

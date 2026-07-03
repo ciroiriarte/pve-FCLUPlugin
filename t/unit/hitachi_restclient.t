@@ -59,6 +59,15 @@ subtest 'constructor validates required fields and builds the CM base url' => su
 
     eval { PVE::Storage::FCLU::Driver::Hitachi::RestClient->new( storage_id => 'x', username => 'u', password => 'p' ) };
     like( $@, qr/mgmt_ip is required/, 'mgmt_ip required' );
+
+    # Async-job poll budget is configurable (driven by the driver's op_timeout_s) so a
+    # large Thin Image clone that runs past the default 300s does not time out.
+    my $c = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
+        mgmt_ip => '10.0.1.100', storage_id => 'x', username => 'u', password => 'p', job_timeout => 600 );
+    is( $c->{job_timeout}, 600, 'job_timeout honoured from opts' );
+    my $def = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
+        mgmt_ip => '10.0.1.100', storage_id => 'x', username => 'u', password => 'p' );
+    is( $def->{job_timeout}, 300, 'job_timeout falls back to the 300s default' );
 };
 
 subtest 'create_ldev: auto-assign body + job resourceId extraction' => sub {
