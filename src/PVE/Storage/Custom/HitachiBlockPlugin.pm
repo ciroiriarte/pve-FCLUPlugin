@@ -44,6 +44,7 @@ sub driver_config {
         host_mode           => $scfg->{host_mode},
         host_mode_options   => $scfg->{host_mode_options},
         skip_unmap_io_check => $scfg->{skip_unmap_io_check},
+        debug               => $scfg->{debug},
         # Host group name prefix: explicit config, else auto-derived from the PVE
         # cluster name so each cluster namespaces its host groups on a SHARED array
         # pool. See on_add_hook for the shared-array caveat.
