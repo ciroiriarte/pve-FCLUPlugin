@@ -1,10 +1,8 @@
-pve-fclu (0.1.0~alpha15) stable; urgency=medium
+pve-fclu (0.1.0~alpha16) stable; urgency=medium
 
-  * hitachi: correct the qm-clone host-mapping fix (alpha14's single /host-wwns query
-    is rejected by CM REST, which requires hostGroupNumber). publish_lu now resolves
-    each port's host group by the name ensure_host_access already found (cached
-    host-group list) instead of re-scanning WWNs per group — eliminates the ~90
-    REST queries/clone. list_host_groups cache gains a 30s TTL.
+  * hitachi: unpublish_lu resolves the node's host group by name (cached list) instead
+    of a per-group /host-wwns WWN scan — mirrors publish_lu. Eliminates the remaining
+    ~60 REST queries/clone (the #24 flow tears down the S-VOL mapping per disk).
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 07:00:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 08:00:00 -0300
 
