@@ -1,9 +1,7 @@
-pve-fclu (0.1.0~alpha21) stable; urgency=medium
+pve-fclu (0.1.0~alpha22) stable; urgency=medium
 
-  * hitachi: #2 truncation-tolerant, WWN-validated host-group resolution — eliminates the
-    O(host-groups) list_host_wwns scan on publish/unpublish (the array's 16-char list-view
-    truncation of PVE_<hostname> no longer forces a full WWN scan). Adopts an existing
-    truncated-name group only if it holds one of this node's WWNs; safe atop the #1 gate.
+  * hitachi: #2 review follow-ups — empty-WWN guard in the truncation pre-filter and a
+    mixed-ownership regression test (adopted-then-rejected by the #1 ownership gate).
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 01:15:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 01:30:00 -0300
 
