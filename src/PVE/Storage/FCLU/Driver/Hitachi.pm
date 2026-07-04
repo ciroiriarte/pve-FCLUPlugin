@@ -742,12 +742,10 @@ sub ensure_host_access {
         # WWNs); only create when truly absent, then re-look-up for the
         # array-assigned hostGroupNumber.
         my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } );
-        if ( !$hg ) {
-            for my $wwn (@$wwns) {
-                $hg = $self->_call( sub { $self->{rest}->find_host_group_by_wwn( $port, $wwn ) } );
-                last if $hg;
-            }
-        }
+        # Truncation-tolerant, WWN-validated fallback (#2): matches an existing group
+        # whose >16-char name the array truncated in the list view, without the
+        # O(host-groups) WWN scan on the common path.
+        $hg = $self->_find_node_hg( $port, $wwns, $hg_name ) if !$hg;
         if ( !$hg ) {
             $self->_call( sub {
                 $self->{rest}->create_host_group(
@@ -1054,7 +1052,37 @@ sub _check_host_ctx {
 
 # Find the node's host group on $port by any of its WWNs (translated _call).
 sub _find_node_hg {
-    my ($self, $port, $wwns) = @_;
+    my ($self, $port, $wwns, $hg_name) = @_;
+
+    # #2 truncation-tolerant fast path: the CM REST list view truncates hostGroupName
+    # to 16 chars, so a >16-char canonical name (PVE_<hostname>) never EXACT-matches —
+    # which is what forced the O(host-groups) list_host_wwns scan below on every
+    # publish/unpublish. Instead pre-filter (over the CACHED host-group list) to groups
+    # whose FULL or 16-char-truncated name equals ours, and ADOPT one only if a FRESH
+    # read shows it holds one of THIS node's WWNs. WWN membership is the authority; the
+    # name is only a pre-filter (safe because #1's _assert_hg_ownership re-proves it
+    # before any map). A same-truncation group that is really ANOTHER node's holds none
+    # of ours -> we skip it -> clean MISS (caller creates our group), never a false
+    # 'conflict'. Cost: O(same-truncation candidates ~= 1) reads instead of O(all HGs).
+    if ( defined $hg_name ) {
+        my %ours   = map { lc $_ => 1 } @$wwns;
+        my $trunc  = substr( $hg_name, 0, 16 );
+        my $groups = eval { $self->{rest}->list_host_groups( port_id => $port ) } || [];
+        for my $hg (@$groups) {
+            my $n = $hg->{hostGroupName};
+            next unless defined $n
+                && ( $n eq $hg_name || ( length($hg_name) > 16 && $n eq $trunc ) );
+            my $present = eval {
+                $self->{rest}->list_host_wwns(
+                    port_id => $port, host_group_number => $hg->{hostGroupNumber} );
+            };
+            next unless ref $present eq 'ARRAY';
+            return $hg if grep { $ours{ lc( $_->{hostWwn} // '' ) } } @$present;
+        }
+    }
+
+    # Legacy fallback: the full per-group WWN scan (now rare — reached only when the
+    # node's group name shares no prefix with ours, or the cached list read failed).
     for my $wwn (@$wwns) {
         my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_wwn( $port, $wwn ) } );
         return $hg if $hg;
@@ -1119,7 +1147,7 @@ sub _resolve_owned_hg {
     my ($self, $port, $hg_name, $wwns) = @_;
 
     my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
-        // $self->_find_node_hg( $port, $wwns );
+        // $self->_find_node_hg( $port, $wwns, $hg_name );
     return undef unless $hg;
 
     return $hg if eval { $self->_assert_hg_ownership( $port, $hg->{hostGroupNumber}, $wwns ); 1 };
@@ -1130,7 +1158,7 @@ sub _resolve_owned_hg {
     # it, re-resolve fresh once, and re-assert — dies if the group is genuinely foreign.
     $self->{rest}->_invalidate_hg_list_cache($port);
     $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
-        // $self->_find_node_hg( $port, $wwns );
+        // $self->_find_node_hg( $port, $wwns, $hg_name );
     die $e unless $hg;
     $self->_assert_hg_ownership( $port, $hg->{hostGroupNumber}, $wwns );
     return $hg;

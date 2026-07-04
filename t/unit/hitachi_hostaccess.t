@@ -31,6 +31,10 @@ sub find_host_group_by_name {
     }
     return undef;
 }
+sub list_host_groups {
+    my ( $s, %o ) = @_; $s->_c('list_host_groups');
+    return [ grep { !defined $o{port_id} || $_->{portId} eq $o{port_id} } values %{ $s->{hgs} } ];
+}
 sub find_host_group_by_wwn {
     my ( $s, $port, $wwn ) = @_; $s->_c('find_host_group_by_wwn');
     for my $hg ( values %{ $s->{hgs} } ) {
@@ -257,6 +261,38 @@ subtest 'unpublish_lu SAFETY GATE: never unmaps paths in a group we no longer ow
     $f->{hgs}{'CL2-A,0'}{wwns}{'2100000000ffff'} = 1;
     $d->unpublish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
     is( $f->{calls}{unmap_lun} // 0, $unmaps, 'no unmap on the now-foreign groups (skipped, not touched)' );
+};
+
+subtest '#2 adopts a group stored under the array-TRUNCATED name, no O(N) WWN scan' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    # The array's list view truncated PVE_dev-mp01-pve-03 (19) to PVE_dev-mp01-pve (16);
+    # the group holds THIS node's WWN.
+    for my $p ( 'CL1-A', 'CL2-A' ) {
+        $f->create_host_group( port_id => $p, host_group_name => 'PVE_dev-mp01-pve', host_mode_options => [] );
+        $f->{hgs}{"$p,0"}{wwns}{'10000000c9aa'} = 1;
+    }
+    my $before = $f->{calls}{find_host_group_by_wwn} // 0;
+    is( $d->ensure_host_access( ctx( 'dev-mp01-pve-03', '10000000c9aa' ) ),
+        'PVE_dev-mp01-pve', 'adopted the truncated-name group' );
+    is( $f->{calls}{create_host_group}, 2, 'no new group created — existing truncated group adopted' );
+    is( $f->{calls}{find_host_group_by_wwn} // 0, $before,
+        'resolved via the truncated-name pre-filter — the O(host-groups) WWN scan never ran' );
+};
+
+subtest '#2 does NOT adopt a same-truncation group owned by ANOTHER node (clean miss -> create)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    # node-04's group truncates to the SAME 16 chars but holds only node-04's WWN.
+    for my $p ( 'CL1-A', 'CL2-A' ) {
+        $f->create_host_group( port_id => $p, host_group_name => 'PVE_dev-mp01-pve', host_mode_options => [] );
+        $f->{hgs}{"$p,0"}{wwns}{'2100000000ff04'} = 1;   # node-04's WWN, foreign to us
+    }
+    my $ref = eval { $d->ensure_host_access( ctx( 'dev-mp01-pve-03', '10000000c9aa' ) ) };
+    ok( !$@, 'no FALSE conflict — the foreign same-truncation group was skipped, not adopted' )
+        or diag($@);
+    is( $f->{calls}{create_host_group}, 4, 'created THIS node\'s own group per port (2 new + 2 pre-existing foreign)' );
+    ok( $f->find_host_group_by_name( 'CL1-A', 'PVE_dev-mp01-pve-03' ), 'our own full-named group exists' );
 };
 
 subtest 'unpublish_lu removes only this node, idempotently' => sub {
