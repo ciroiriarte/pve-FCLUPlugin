@@ -1079,6 +1079,15 @@ sub _find_node_hg {
             next unless ref $present eq 'ARRAY';
             return $hg if grep { $ours{ lc( $_->{hostWwn} // '' ) } } @$present;
         }
+        # debug(3) diagnostic: the fast path missed — dump the list the cache gave us so
+        # we can see whether the node's group is present (and under which name) vs a
+        # stale/truncated/partial list response.
+        eval {
+            $self->{rest}->_debug( 3, "_find_node_hg prefilter MISS on $port"
+                . " want='$hg_name' trunc='$trunc' groups=["
+                . join( ',', map { ( $_->{hostGroupName} // '?' ) . '#' . ( $_->{hostGroupNumber} // '?' ) } @$groups )
+                . "]" );
+        };
     }
 
     # Legacy fallback: the full per-group WWN scan (now rare — reached only when the
