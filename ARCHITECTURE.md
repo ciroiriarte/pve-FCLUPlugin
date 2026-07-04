@@ -334,7 +334,10 @@ reference. So `clone_image` (CoW/linked) is the **only** array-offloaded clone P
 The `copy` capability and `create_full_clone` (§2) therefore describe **out-of-band /
 `fclu`-CLI** offload or a *future* upstream `copy_image` hook — they are **not** wired to
 `qm clone --full`, and a full-copy-only array simply falls back to PVE's host-side copy
-(it is not "mis-driven"). The core MUST NOT route `clone_image` to `copy`.
+(it is not "mis-driven"). The core MUST NOT route `clone_image` to `copy`. The upstream
+`copy_image` hook has been requested at **Proxmox Bugzilla
+[#7780](https://bugzilla.proxmox.com/show_bug.cgi?id=7780)** (pve/Storage); if accepted,
+the driver's `create_full_clone` can be wired to array-side XCOPY/ShadowImage offload.
 
 ---
 
