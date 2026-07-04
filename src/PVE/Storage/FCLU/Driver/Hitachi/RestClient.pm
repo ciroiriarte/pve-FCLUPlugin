@@ -516,6 +516,16 @@ sub find_host_group_by_name {
 sub find_host_group_by_wwn {
     my ($self, $port_id, $wwn) = @_;
 
+    # debug(3) diagnostic: this scan is O(host groups) and should be rare (a name-miss
+    # fallback). Log the caller chain past the _call/__ANON__ wrapper so a live trace
+    # can pin WHICH path still triggers it (ensure_host_access vs a publish/unpublish
+    # _find_node_hg fallback). Gated so the caller() walk only runs at debug>=3.
+    if ( ( $self->{debug} // 0 ) >= 3 ) {
+        my @chain;
+        for my $lvl ( 1 .. 6 ) { my @c = caller($lvl); last unless @c; push @chain, ( $c[3] // '?' ) . ':' . ( $c[2] // 0 ); }
+        $self->_debug( 3, "find_host_group_by_wwn scan on $port_id caller-chain: " . join( ' <- ', @chain ) );
+    }
+
     # NOTE: the CM REST /host-wwns collection REQUIRES both portId AND hostGroupNumber
     # (portId alone -> KART40044-E "Required parameters not specified"), so this must
     # scan per host group. It is therefore O(host groups) and slow on a busy port —
