@@ -295,6 +295,23 @@ subtest '#2 does NOT adopt a same-truncation group owned by ANOTHER node (clean 
     ok( $f->find_host_group_by_name( 'CL1-A', 'PVE_dev-mp01-pve-03' ), 'our own full-named group exists' );
 };
 
+subtest '#2 a MIXED-ownership truncated group (ours + foreign) is rejected by the WWN gate, no map' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    # A truncated-name group holds one of OUR WWNs (so the #2 pre-filter selects it) but
+    # ALSO a foreign one — the fresh-WWN ownership gate must fail closed, never map.
+    for my $p ( 'CL1-A', 'CL2-A' ) {
+        $f->create_host_group( port_id => $p, host_group_name => 'PVE_dev-mp01-pve', host_mode_options => [] );
+        $f->{hgs}{"$p,0"}{wwns}{'10000000c9aa'}   = 1;   # ours
+        $f->{hgs}{"$p,0"}{wwns}{'2100000000ff04'} = 1;   # foreign
+    }
+    my $err;
+    eval { $d->publish_lu( '42', ctx( 'dev-mp01-pve-03', '10000000c9aa' ) ); 1 } or $err = $@;
+    is( ref $err && $err->code, 'conflict',
+        'pre-filter selects the group, the fresh-WWN gate rejects the foreign initiator' );
+    is( $f->{calls}{map_lun} // 0, 0, 'nothing mapped into the mixed-ownership group' );
+};
+
 subtest 'unpublish_lu removes only this node, idempotently' => sub {
     my $f = FakeRest->new;
     my $d = drv($f);

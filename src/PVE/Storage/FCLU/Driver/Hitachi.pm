@@ -1065,7 +1065,7 @@ sub _find_node_hg {
     # of ours -> we skip it -> clean MISS (caller creates our group), never a false
     # 'conflict'. Cost: O(same-truncation candidates ~= 1) reads instead of O(all HGs).
     if ( defined $hg_name ) {
-        my %ours   = map { lc $_ => 1 } @$wwns;
+        my %ours   = map { lc $_ => 1 } grep { length } @$wwns;   # ignore malformed empty tokens
         my $trunc  = substr( $hg_name, 0, 16 );
         my $groups = eval { $self->{rest}->list_host_groups( port_id => $port ) } || [];
         for my $hg (@$groups) {
