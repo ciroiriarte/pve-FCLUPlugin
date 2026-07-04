@@ -1,8 +1,9 @@
-pve-fclu (0.1.0~alpha16) stable; urgency=medium
+pve-fclu (0.1.0~alpha17) stable; urgency=medium
 
-  * hitachi: unpublish_lu resolves the node's host group by name (cached list) instead
-    of a per-group /host-wwns WWN scan — mirrors publish_lu. Eliminates the remaining
-    ~60 REST queries/clone (the #24 flow tears down the S-VOL mapping per disk).
+  * hitachi: delete_lu is now idempotent when the array reports "LDEV is not installed"
+    (a NOT DEFINED slot) so free_image no longer fails and leaks the registry entry.
+  * hitachi: debug(3) caller-chain logging for find_host_group_by_wwn scans, to isolate
+    the residual qm-clone host-mapping scan (GH #17).
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 08:00:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 23:15:00 -0300
 
