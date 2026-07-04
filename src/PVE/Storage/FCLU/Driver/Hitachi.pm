@@ -781,11 +781,20 @@ sub ensure_host_access {
             warn "FCLU Hitachi: HMO reconcile warning ($port,$hg_num): $@" if $@;
         }
 
-        # Register any of our WWNs not already present (best-effort, idempotent).
+        # Read current membership FRESH (never cached). A read FAILURE here must NOT be
+        # treated as "empty" — that would bypass the foreign-WWN guard below and let us
+        # add this node's WWN INTO a possibly-foreign group (isolation pollution the
+        # pre-map gate cannot undo). Classify a transient read as array_busy (retryable),
+        # exactly like the pre-map gate _assert_hg_ownership.
         my $existing = eval {
             $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
-        } || [];
-        my %present = map { lc( $_->{hostWwn} ) => 1 } @$existing;
+        };
+        $self->_err( 'array_busy',
+            "host-wwn read for $port (#$hg_num) did not return; refusing to reconcile an "
+            . "unverified group" )
+            if $@ || ref $existing ne 'ARRAY';
+        my %present = map { lc( $_->{hostWwn} // '' ) => 1 } @$existing;
+        delete $present{''};   # ignore a malformed/empty hostWwn (no spurious "foreign" key)
 
         # SAFETY (multi-cluster shared pool): refuse to add THIS node's WWNs to a host
         # group that already holds FOREIGN initiators. On a shared array two clusters can
@@ -884,30 +893,24 @@ sub unpublish_lu {
     # other nodes' host groups are left intact (§12.2 live-migration rule).
     my ( $attempted, $failed, $last_err ) = ( 0, 0, undef );
     for my $port ( @{ $self->{array_ports} } ) {
-        # Resolve the node's group by NAME first (cheap, over the cached host-group
-        # list); fall back to the per-group WWN scan only for an adopted legacy name.
-        # Mirrors publish_lu — the raw _find_node_hg scan is O(host groups) /host-wwns
-        # and unpublish runs per S-VOL teardown in the clone flow, so on a busy port it
-        # was a large slice of the qm-clone REST cost.
-        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
-            // $self->_find_node_hg( $port, $wwns );
-        next unless $hg;
-        my $hg_num = $hg->{hostGroupNumber};
-
-        # #1 SAFETY GATE: never unmap paths in a group we don't own. A CONFIRMED foreign
-        # group (number reuse) is skipped — our mapping isn't there anyway. A transient
-        # read counts as a failed teardown attempt so an all-port failure surfaces
-        # (retryable) instead of a false idempotent success.
-        unless ( eval { $self->_assert_hg_ownership( $port, $hg_num, $wwns ); 1 } ) {
-            my $e = $@;
+        # #1 SAFETY GATE, symmetric with publish_lu: resolve the node's group AND prove
+        # ownership with a fresh read — INCLUDING the invalidate-and-re-resolve-once on a
+        # stale-cache number alias (so a recycled number doesn't leave the node's real
+        # path mapped). A CONFIRMED foreign group is SKIPPED (our paths aren't there). A
+        # transient read counts as a failed teardown attempt so an all-port failure
+        # surfaces (retryable) instead of a false idempotent success.
+        my $hg = eval { $self->_resolve_owned_hg( $port, $hg_name, $wwns ) };
+        if ( my $e = $@ ) {
             if ( ref $e && eval { $e->isa('PVE::Storage::FCLU::Error') } && $e->code eq 'conflict' ) {
-                warn "FCLU Hitachi: unpublish skipping unowned group $port (#$hg_num): $e";
+                warn "FCLU Hitachi: unpublish skipping unowned group on $port: $e";
                 next;
             }
             $attempted++; $failed++; $last_err = $e;
-            warn "FCLU Hitachi: unpublish ownership check unavailable $port (#$hg_num): $e";
+            warn "FCLU Hitachi: unpublish ownership check unavailable on $port: $e";
             next;
         }
+        next unless $hg;
+        my $hg_num = $hg->{hostGroupNumber};
 
         my $luns = $self->_call( sub {
             $self->{rest}->list_luns(
@@ -1067,7 +1070,10 @@ sub _find_node_hg {
 # CONFIRMED foreign WWN fails CLOSED ('conflict', non-retryable); a read that is
 # absent/errored — the very shared-array load that also 503s — is 'array_busy'
 # (retryable), NOT fail-closed, so a transient glitch never takes a prod volume
-# offline. Dies on violation; returns 1 when ownership holds.
+# offline. Like the ensure-time guard, this relies on %host_ctx enumerating ALL of
+# this node's PRESENT initiator WWNs — a stale WWN from a replaced/removed HBA on this
+# node reads as "foreign" (still safe: fail-loud, remedy = delete the stale WWN).
+# Dies on violation; returns 1 when ownership holds.
 sub _assert_hg_ownership {
     my ($self, $port, $hg_num, $wwns) = @_;
 

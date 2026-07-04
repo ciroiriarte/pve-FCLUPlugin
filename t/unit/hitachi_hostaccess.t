@@ -62,6 +62,7 @@ sub list_host_wwns {
     my $hg = $s->{hgs}{"$o{port_id},$o{host_group_number}"} or return [];
     return [ map { { hostWwn => $_ } } sort keys %{ $hg->{wwns} } ];
 }
+sub _invalidate_hg_list_cache { $_[0]->_c('_invalidate_hg_list_cache') }   # fake has no list cache
 sub add_wwn_to_host_group {
     my ( $s, %o ) = @_; $s->_c('add_wwn_to_host_group');
     $s->{hgs}{"$o{port_id},$o{host_group_number}"}{wwns}{ lc $o{wwn} } = 1;
