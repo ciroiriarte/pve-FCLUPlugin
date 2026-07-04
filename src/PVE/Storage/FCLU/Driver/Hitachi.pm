@@ -246,7 +246,10 @@ sub _translate_rest_error {
     if ( !defined $code ) {
         if    ( $msg =~ /insufficient|capacity|pool .*full|out of space/i ) { $code = 'out_of_space' }
         elsif ( $msg =~ /alread(y)? (exists|defined)|duplicate/i )          { $code = 'already_exists' }
-        elsif ( $msg =~ /not (found|defined)|does not exist|no such/i )     { $code = 'not_found' }
+        # "LDEV is not installed" is the array's phrasing for an absent/NOT DEFINED
+        # ldev slot — treat it as not_found so idempotent teardown (delete_lu) succeeds
+        # instead of failing [internal] and leaking the registry entry.
+        elsif ( $msg =~ /not (found|defined|installed)|does not exist|no such/i ) { $code = 'not_found' }
         elsif ( $msg =~ /limit|maximum number|too many/i )                  { $code = 'limit' }
     }
 

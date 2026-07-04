@@ -106,6 +106,15 @@ subtest 'delete_lu: success normally, idempotent on not_found' => sub {
 
     my ( $d2 ) = mk( { delete_ldev => $not_found } );
     is( $d2->delete_lu('99'), 1, 'deleting an absent ldev is success (not_found swallowed)' );
+
+    # The array phrases an absent/NOT DEFINED slot as "LDEV is not installed" (a job
+    # failure, not a 404) — delete_lu must still be idempotent, else free_image fails
+    # [internal] and leaks the registry entry (seen live cleaning up a partial clone).
+    my $not_installed = sub {
+        die "Job 3024 failed: An error occurred in the storage system. (message = LDEV is not installed.)\n";
+    };
+    my ( $d3 ) = mk( { delete_ldev => $not_installed } );
+    is( $d3->delete_lu('272'), 1, 'delete_lu idempotent on "LDEV is not installed"' );
 };
 
 subtest 'get_lu normalizes to the §12.1 descriptor' => sub {
