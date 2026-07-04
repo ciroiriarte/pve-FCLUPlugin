@@ -232,6 +232,16 @@ subtest 'unpublish_lu removes only this node, idempotently' => sub {
     is( $f->{calls}{unmap_lun}, $before, 'no further unmap calls' );
 };
 
+subtest 'unpublish_lu resolves the node group by NAME (no per-group WWN scan)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );   # creates PVE_node-a
+    $f->{calls}{find_host_group_by_wwn} = 0;                    # reset the scan counter
+    $d->unpublish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
+    is( $f->{calls}{find_host_group_by_wwn} // 0, 0,
+        'unpublish resolves by canonical name — no O(host-groups) WWN scan' );
+};
+
 subtest 'unpublish_lu_all reaps EVERY node mapping (crashed-migration cleanup)' => sub {
     my $f = FakeRest->new;
     my $d = drv($f);

@@ -874,12 +874,19 @@ sub unpublish_lu {
     my ($self, $backend_id, %ctx) = @_;
     my $hostname = $self->_check_host_ctx(%ctx);
     my $wwns = $ctx{initiators};
+    my $hg_name = $self->_hg_name($hostname);
 
     # Remove ONLY this node's mapping (the host group matched by the node's WWNs);
     # other nodes' host groups are left intact (§12.2 live-migration rule).
     my ( $attempted, $failed, $last_err ) = ( 0, 0, undef );
     for my $port ( @{ $self->{array_ports} } ) {
-        my $hg = $self->_find_node_hg( $port, $wwns );
+        # Resolve the node's group by NAME first (cheap, over the cached host-group
+        # list); fall back to the per-group WWN scan only for an adopted legacy name.
+        # Mirrors publish_lu — the raw _find_node_hg scan is O(host groups) /host-wwns
+        # and unpublish runs per S-VOL teardown in the clone flow, so on a busy port it
+        # was a large slice of the qm-clone REST cost.
+        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
+            // $self->_find_node_hg( $port, $wwns );
         next unless $hg;
         my $luns = $self->_call( sub {
             $self->{rest}->list_luns(
