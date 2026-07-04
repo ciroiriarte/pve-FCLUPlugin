@@ -215,6 +215,49 @@ subtest 'publish_lu maps the ldev per port, idempotently' => sub {
     is( $f->{calls}{map_lun}, 2, 'idempotent — no remap' );
 };
 
+subtest 'publish_lu SAFETY GATE: refuses to map into a group holding a foreign WWN' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) );   # PVE_node-a, our WWN
+    # A foreign initiator lands in our group's number (cross-cluster collision / number reuse).
+    $f->{hgs}{'CL1-A,0'}{wwns}{'2100000000ffff'} = 1;
+    my $err;
+    eval { $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) ); 1 } or $err = $@;
+    is( ref $err && $err->code, 'conflict', 'foreign WWN => conflict (fail closed)' );
+    ok( !$err->is_retryable, 'conflict is NOT retryable' );
+    is( $f->{calls}{map_lun} // 0, 0, 'nothing mapped' );
+};
+
+subtest 'publish_lu SAFETY GATE: transient host-wwn read => array_busy (retryable, not fail-closed)' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) );
+    my $err;
+    {
+        no warnings 'redefine';
+        # The FRESH ownership read glitches (the same shared-array load that 503s).
+        local *FakeRest::list_host_wwns =
+            sub { die "API request failed: GET /host-wwns -> 503 Service Unavailable\n" };
+        eval { $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) ); 1 } or $err = $@;
+    }
+    is( ref $err && $err->code, 'array_busy', 'transient read => array_busy, NOT conflict' );
+    ok( $err->is_retryable, 'array_busy is retryable (core retries; no prod outage on a glitch)' );
+    is( $f->{calls}{map_lun} // 0, 0, 'nothing mapped on an unverified group' );
+};
+
+subtest 'unpublish_lu SAFETY GATE: never unmaps paths in a group we no longer own' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) );
+    $d->publish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
+    my $unmaps = $f->{calls}{unmap_lun} // 0;
+    # Both ports' groups get a foreign WWN (number reuse) before teardown.
+    $f->{hgs}{'CL1-A,0'}{wwns}{'2100000000ffff'} = 1;
+    $f->{hgs}{'CL2-A,0'}{wwns}{'2100000000ffff'} = 1;
+    $d->unpublish_lu( '42', ctx( 'node-a', '10000000c9aa' ) );
+    is( $f->{calls}{unmap_lun} // 0, $unmaps, 'no unmap on the now-foreign groups (skipped, not touched)' );
+};
+
 subtest 'unpublish_lu removes only this node, idempotently' => sub {
     my $f = FakeRest->new;
     my $d = drv($f);

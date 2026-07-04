@@ -847,8 +847,9 @@ sub publish_lu {
 
     my ( $lun, $access_ref );
     for my $port ( @{ $self->{array_ports} } ) {
-        my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
-            // $self->_find_node_hg( $port, $wwns );
+        # #1 SAFETY GATE: resolve the node's group AND prove ownership (fresh WWN read)
+        # before mapping — never map into a foreign/number-reused group.
+        my $hg = $self->_resolve_owned_hg( $port, $hg_name, $wwns );
         next unless $hg;
         $access_ref //= $hg->{hostGroupName};   # the real group name (may be an adopted legacy name)
         my $hg_num = $hg->{hostGroupNumber};
@@ -891,9 +892,26 @@ sub unpublish_lu {
         my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
             // $self->_find_node_hg( $port, $wwns );
         next unless $hg;
+        my $hg_num = $hg->{hostGroupNumber};
+
+        # #1 SAFETY GATE: never unmap paths in a group we don't own. A CONFIRMED foreign
+        # group (number reuse) is skipped — our mapping isn't there anyway. A transient
+        # read counts as a failed teardown attempt so an all-port failure surfaces
+        # (retryable) instead of a false idempotent success.
+        unless ( eval { $self->_assert_hg_ownership( $port, $hg_num, $wwns ); 1 } ) {
+            my $e = $@;
+            if ( ref $e && eval { $e->isa('PVE::Storage::FCLU::Error') } && $e->code eq 'conflict' ) {
+                warn "FCLU Hitachi: unpublish skipping unowned group $port (#$hg_num): $e";
+                next;
+            }
+            $attempted++; $failed++; $last_err = $e;
+            warn "FCLU Hitachi: unpublish ownership check unavailable $port (#$hg_num): $e";
+            next;
+        }
+
         my $luns = $self->_call( sub {
             $self->{rest}->list_luns(
-                port_id => $port, host_group_number => $hg->{hostGroupNumber},
+                port_id => $port, host_group_number => $hg_num,
                 ldev_id => $backend_id );
         } );
         for my $l (@$luns) {
@@ -1039,6 +1057,77 @@ sub _find_node_hg {
         return $hg if $hg;
     }
     return undef;
+}
+
+# SAFETY GATE (§ multi-cluster): PROVE this node owns ($port,$hg_num) with a FRESH,
+# never-cached list_host_wwns read before any map/unmap. A cached or array-reused
+# hostGroupNumber can point at a FOREIGN cluster's group (numbers are recycled on
+# out-of-band delete), so identity by number/name is only a hint — WWN membership is
+# the authorization. Classification is deliberately split (the sharp edge): a
+# CONFIRMED foreign WWN fails CLOSED ('conflict', non-retryable); a read that is
+# absent/errored — the very shared-array load that also 503s — is 'array_busy'
+# (retryable), NOT fail-closed, so a transient glitch never takes a prod volume
+# offline. Dies on violation; returns 1 when ownership holds.
+sub _assert_hg_ownership {
+    my ($self, $port, $hg_num, $wwns) = @_;
+
+    my $present = eval {
+        $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
+    };
+    $self->_err( 'array_busy',
+        "host-wwn read for $port (#$hg_num) did not return; refusing to map on an "
+        . "unverified group" )
+        if $@ || ref $present ne 'ARRAY';
+
+    my %have = map { lc( $_->{hostWwn} // '' ) => 1 } @$present;
+    my %ours = map { lc($_) => 1 } @$wwns;
+    my @foreign = sort grep { length && !$ours{$_} } keys %have;
+
+    # CONFIRMED foreign initiator in the group -> fail closed. Same remedy text as the
+    # ensure-time guard: distinct host_group_prefix + disjoint ldev_range per cluster,
+    # or delete a stale WWN left by a replaced HBA on this node.
+    $self->_err( 'conflict',
+        "host group on $port (#$hg_num) holds initiators not owned by this node "
+        . "(foreign WWN(s): @foreign); refusing to map/unmap. Likely a host-group-number "
+        . "reuse or a cross-cluster collision on a shared pool — give each cluster a "
+        . "distinct host_group_prefix + a disjoint ldev_range, or delete the stale WWN." )
+        if @foreign;
+
+    # Non-empty group holding NONE of ours -> the number was reused for a different
+    # (empty-of-ours) group; treat as a conflict, not our target.
+    my @missing = grep { !$have{$_} } keys %ours;
+    $self->_err( 'conflict',
+        "host group on $port (#$hg_num) contains no initiator owned by this node "
+        . "(missing: @missing); the host-group number was likely reused — refusing to map/unmap." )
+        if @$present && @missing == keys %ours;
+
+    return 1;
+}
+
+# Resolve THIS node's host group on $port AND prove ownership (fresh) before it is
+# used to map. Returns the validated hg hashref, undef if the node has no group on
+# the port, or dies (conflict / array_busy). A CONFIRMED conflict re-resolves once
+# against a freshly-fetched host-group list (benign stale-cache number drift) before
+# failing closed; a transient array_busy propagates immediately for the core to retry.
+sub _resolve_owned_hg {
+    my ($self, $port, $hg_name, $wwns) = @_;
+
+    my $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
+        // $self->_find_node_hg( $port, $wwns );
+    return undef unless $hg;
+
+    return $hg if eval { $self->_assert_hg_ownership( $port, $hg->{hostGroupNumber}, $wwns ); 1 };
+    my $e = $@;
+    die $e unless ref $e && eval { $e->isa('PVE::Storage::FCLU::Error') } && $e->code eq 'conflict';
+
+    # Confirmed conflict: the cached topology list may name-alias a stale number. Drop
+    # it, re-resolve fresh once, and re-assert — dies if the group is genuinely foreign.
+    $self->{rest}->_invalidate_hg_list_cache($port);
+    $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
+        // $self->_find_node_hg( $port, $wwns );
+    die $e unless $hg;
+    $self->_assert_hg_ownership( $port, $hg->{hostGroupNumber}, $wwns );
+    return $hg;
 }
 
 sub _err {
