@@ -27,8 +27,19 @@ use parent -norequire, 'PVE::Storage::FCLU::Host::Connector';
 # lower-level helpers still operate on a bare/3-prefixed wwid so their tested,
 # taint-safe behaviour carries over verbatim.
 
-my $DEVICE_TIMEOUT = 60;
+# Device-appear budget. Measured baseline on a VSP E590H is ~38s for a freshly
+# mapped LUN to present on the FC ports + be discovered + assembled by multipathd —
+# on a QUIET system. Under concurrent clone load the array presents the LUN later,
+# so 60s (the old value) had too little headroom and full-clone target activation
+# timed out. Default generously and let storage.cfg override via `device_timeout`.
+my $DEVICE_TIMEOUT = 120;
 my $POLL_INTERVAL  = 2;
+# How often, inside the wait loop, to re-rescan the SCSI hosts. map_lun completes
+# before attach, but the LUN's presentation on the FC target ports can lag the REST
+# job under load, so the initial one-shot rescan may run before the paths exist —
+# re-trigger discovery periodically (kept coarse: a full rescan is heavy, per the
+# host-churn caveat).
+my $RESCAN_INTERVAL = 30;
 
 sub new {
     my ($class, %opts) = @_;
@@ -255,6 +266,10 @@ sub wait_for_device {
         $elapsed += $POLL_INTERVAL;
 
         eval { _run_cmd( 'multipath', '-r' ) } if $elapsed % 6 == 0;
+        # Re-trigger SCSI discovery for a LUN the array presented AFTER the initial
+        # one-shot rescan (late FC-port presentation under load). rescan_scsi_hosts
+        # settles udev, so it doubles as productive wait; kept coarse to limit churn.
+        eval { $self->rescan_scsi_hosts } if $elapsed % $RESCAN_INTERVAL == 0;
     }
 
     croak "Device $path did not appear within ${timeout}s";

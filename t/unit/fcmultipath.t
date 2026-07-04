@@ -36,7 +36,8 @@ subtest 'is a Connector implementing the §3 surface' => sub {
         my $impl = $P->can($m);
         isnt( $impl, $base, "$m is implemented (not the base stub)" );
     }
-    is( $P->new( timeout => 120 )->{timeout}, 120, 'custom timeout' );
+    is( $P->new->{timeout}, 120, 'default device timeout (raised from 60 for slow-under-load presentation)' );
+    is( $P->new( timeout => 200 )->{timeout}, 200, 'custom timeout' );
 };
 
 subtest '_wwid_from_identity: naa preferred, prefixes stripped, lowercased' => sub {
@@ -210,7 +211,7 @@ subtest 'attach/detach/resize/flush translate identity -> bare wwid' => sub {
     # attach MUST rescan the SCSI hosts before waiting, else a just-published LUN
     # never appears (live-found on the E590H).
     local *PVE::Storage::FCLU::Host::FCMultipath::rescan_scsi_hosts = sub { push @order, 'rescan'; $got{rescan}++ };
-    local *PVE::Storage::FCLU::Host::FCMultipath::wait_for_device = sub { push @order, 'wait'; $got{attach} = $_[1]; '/dev/mapper/3x' };
+    local *PVE::Storage::FCLU::Host::FCMultipath::wait_for_device = sub { push @order, 'wait'; $got{attach} = $_[1]; $got{timeout} = $_[2]; '/dev/mapper/3x' };
     local *PVE::Storage::FCLU::Host::FCMultipath::remove_device   = sub { $got{detach} = $_[1]; 1 };
     local *PVE::Storage::FCLU::Host::FCMultipath::resize_device   = sub { $got{resize} = $_[1]; 1 };
     local *PVE::Storage::FCLU::Host::FCMultipath::flush_device    = sub { $got{flush}  = $_[1]; 1 };
@@ -226,6 +227,10 @@ subtest 'attach/detach/resize/flush translate identity -> bare wwid' => sub {
     is( $got{flush},  '60060e80ff', 'flush translated identity' );
     is( $got{rescan}, 1, 'attach rescanned the SCSI hosts' );
     is_deeply( \@order, [ 'rescan', 'wait' ], 'rescan happens BEFORE waiting for the device' );
+
+    # A storage.cfg device_timeout threads through attach() to the wait budget.
+    $mp->attach( $id, 200 );
+    is( $got{timeout}, 200, 'attach threads a custom device_timeout to wait_for_device' );
 
     # A volume allocated but never activated has no usable device id — detach must
     # be a no-op success (so free_image can still tear it down).

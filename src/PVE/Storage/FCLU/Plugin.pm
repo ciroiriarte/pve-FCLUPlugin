@@ -130,6 +130,12 @@ sub properties {
                 . " never logged at any level.",
             type        => 'integer', minimum => 0, maximum => 3, default => 0, optional => 1,
         },
+        device_timeout => {
+            description => "Seconds to wait for a freshly mapped LUN's multipath device to"
+                . " appear on this host during activation. Raise it for arrays whose LUN"
+                . " presentation is slow under load (default 120).",
+            type        => 'integer', minimum => 10, default => 120, optional => 1,
+        },
     };
 }
 
@@ -146,6 +152,7 @@ sub options {
         tls_verify   => { optional => 1 },
         tls_ca_file  => { optional => 1 },
         lock_timeout => { optional => 1 },
+        device_timeout => { optional => 1 },
         debug        => { optional => 1 },
         # Inherited PVE properties — referenced, never redeclared in properties().
         nodes    => { optional => 1 },
@@ -499,7 +506,9 @@ sub activate_volume {
         if $identity && !$snapname;   # snapshot-S-VOL identity lands with the snapshot slice
 
     # Attach the multipath device by the array-reported canonical identity (§3).
-    $conn->attach($identity);
+    # device_timeout (storage.cfg) overrides the connector default for arrays whose
+    # LUN presentation is slow under load; undef keeps the connector's own default.
+    $conn->attach( $identity, $scfg->{device_timeout} );
 
     # Opt-in SCSI-3 PR readiness — validate-and-warn, NEVER blocks (§7 #2). When the
     # storage enables persistent_reservations, check this node's host-side PR plumbing
