@@ -1,9 +1,9 @@
-pve-fclu (0.1.0~alpha19) stable; urgency=medium
+pve-fclu (0.1.0~alpha20) stable; urgency=medium
 
-  * hitachi: #1 code-review follow-ups — unpublish_lu gains publish's re-resolve-once
-    symmetry (recycled host-group number no longer leaves a path mapped); ensure_host_access's
-    guard raises array_busy on a transient WWN read instead of treating it as empty (no
-    WWN-add into a foreign group).
+  * host: raise the device-appear timeout 60->120s (measured ~38s baseline on VSP E590H),
+    re-rescan SCSI hosts every 30s inside the wait loop for a LUN presented late under
+    load, and add a storage.cfg device_timeout override. Fixes full-clone target
+    activation timing out with "Device did not appear within 60s".
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 00:20:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 00:45:00 -0300
 
