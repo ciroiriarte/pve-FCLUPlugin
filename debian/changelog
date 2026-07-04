@@ -1,9 +1,9 @@
-pve-fclu (0.1.0~alpha18) stable; urgency=medium
+pve-fclu (0.1.0~alpha19) stable; urgency=medium
 
-  * hitachi: #1 validate-first, publish-second host-group ownership gate — a fresh
-    never-cached WWN-membership check before every map/unmap; confirmed foreign WWN
-    fails closed (conflict), a transient read is array_busy (retryable, no prod outage).
-    First of the #1->#2->#4->#3 host-access hardening (GH #17).
+  * hitachi: #1 code-review follow-ups — unpublish_lu gains publish's re-resolve-once
+    symmetry (recycled host-group number no longer leaves a path mapped); ensure_host_access's
+    guard raises array_busy on a transient WWN read instead of treating it as empty (no
+    WWN-add into a foreign group).
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 03 Jul 2026 23:55:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 00:20:00 -0300
 
