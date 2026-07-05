@@ -62,7 +62,7 @@ subtest 'driver_config maps storage.cfg to the Driver::Hitachi constructor opts'
     my $def = $HB->driver_config( {} );
     is( $def->{platform}, 'vsp_one', 'default platform vsp_one' );
     is( $def->{sessionless}, 1, 'default sessionless=1 (session-less)' );
-    is( $def->{host_group_prefix}, 'PVE', 'host_group_prefix derives to PVE when cluster name unavailable' );
+    is( $def->{host_group_prefix}, 'PVE', 'host_group_prefix defaults to a stable, short "PVE" (context-independent)' );
     ok( !exists $def->{port}, 'no port when mgmt_port unset (driver uses profile default)' );
     ok( !exists $def->{tls_verify}, 'no tls_verify key when unset' );
 };

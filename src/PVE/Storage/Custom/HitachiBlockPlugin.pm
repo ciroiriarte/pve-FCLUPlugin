@@ -56,16 +56,21 @@ sub driver_config {
 # name (so two clusters sharing an array pool namespace their host groups apart),
 # falling back to 'PVE' for a single node / when the cluster name is unavailable.
 # Sanitised to the host-group-name charset. Best-effort — never dies (config path).
+# The DEFAULT host-group name prefix when storage.cfg does not set host_group_prefix.
+# It MUST be short and STABLE. An earlier version auto-derived "PVE-<clustername>" from
+# corosync, which was actively harmful: (a) it read the cluster name only in a daemon
+# context and returned plain "PVE" from a CLI, so the SAME node computed DIFFERENT names
+# and never matched its own array group (forcing an O(host-groups) WWN scan on every
+# map); (b) "PVE-<clustername>_<hostname>" easily exceeds the array's 16-char host-group
+# name and truncates to a single "PVE-<clustername>_" that COLLAPSES all nodes — the
+# opposite of the per-cluster separation it was meant to provide. A physical WWPN is
+# globally unique and the §-multi-cluster WWN-ownership guard fail-closes any residual
+# collision, so the prefix is only a human label. Default to plain "PVE" (matches groups
+# created as PVE_<hostname>); multi-cluster shared-pool deployments set a distinct SHORT
+# host_group_prefix per cluster explicitly.
 sub _derive_cluster_prefix {
     my ($class) = @_;
-    my $name = eval {
-        require PVE::Cluster;
-        my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
-        $conf->{main}{totem}{cluster_name};
-    };
-    return 'PVE' unless defined $name && length $name;
-    $name =~ s/[^A-Za-z0-9]//g;
-    return length $name ? "PVE-$name" : 'PVE';
+    return 'PVE';
 }
 
 # ── Configuration schema (vendor deltas merged over the generic base) ──
@@ -235,9 +240,9 @@ sub on_update_hook {
 sub _warn_if_hg_prefix_unset {
     my ($class, $scfg) = @_;
     return if defined $scfg->{host_group_prefix} && length $scfg->{host_group_prefix};
-    warn "host_group_prefix is not set; host groups will be named '"
-        . $class->_derive_cluster_prefix() . "_<hostname>' (from the PVE cluster name)."
-        . " If this array pool is SHARED with another PVE cluster, set a distinct"
+    warn "host_group_prefix is not set; host groups default to '"
+        . $class->_derive_cluster_prefix() . "_<hostname>'."
+        . " If this array pool is SHARED with another PVE cluster, set a distinct SHORT"
         . " host_group_prefix per cluster to prevent host-group collisions.\n";
 }
 
