@@ -1,7 +1,9 @@
-pve-fclu (0.1.0~alpha23) stable; urgency=medium
+pve-fclu (0.1.0~alpha24) stable; urgency=medium
 
-  * hitachi: debug(3) diagnostic dump when the #2 truncation pre-filter misses (to
-    diagnose the non-deterministic list_host_groups truncation under load).
+  * hitachi: default host_group_prefix to a stable short "PVE" instead of the harmful
+    auto-derived "PVE-<clustername>" (context-dependent + >16 chars -> truncation
+    collapse). This was the true cause of the per-clone host-group WWN scan; with the
+    prefix matching the array groups, #2's truncation-tolerant resolver eliminates it.
 
- -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 01:45:00 -0300
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 04 Jul 2026 02:15:00 -0300
 

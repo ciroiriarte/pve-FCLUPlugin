@@ -1,2 +1,2 @@
-VERSION=0.1.0~alpha23
+VERSION=0.1.0~alpha24
 PACKAGE=pve-fclu
