@@ -459,11 +459,20 @@ sub alloc_image {
 
         $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $name, $d ) );
 
-        # QoS is best-effort: a limit-set failure must not fail provisioning.
+        # QoS is best-effort AND capability-gated: only attempt it where the control
+        # plane actually supports per-volume QoS (Hitachi: VSP F/G350-900 / VSP 5000 —
+        # NOT the E series or VSP One, whose embedded REST has no QoS surface). Calling
+        # it elsewhere only draws an [invalid] from the array. A limit-set failure must
+        # never fail provisioning.
         my $qos = $class->_qos_from_scfg($scfg);
         if (%$qos) {
-            eval { $d->set_lu_qos( $backend_id, $qos ) };
-            warn "FCLU: QoS application warning: $@" if $@;
+            if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'qos', 'per_lu' ) ) {
+                eval { $d->set_lu_qos( $backend_id, $qos ) };
+                warn "FCLU: QoS application warning: $@" if $@;
+            } else {
+                warn "FCLU: qos_* is configured but this array/platform does not support"
+                    . " per-volume QoS; ignoring the QoS settings for '$name'.\n";
+            }
         }
 
         # Read the real (possibly min-clamped) size + canonical identity once, then
@@ -574,24 +583,31 @@ sub filesystem_path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     my ( $backend_id, $entry ) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'die' );
 
-    my $identity = $entry->{identity};
-    die "volume '$volname' has no recorded device identity\n" unless $identity;
-
     my $conn = $class->_connector;
-    my $path = eval { $conn->device_path($identity) };
+
+    # Resolve the recorded identity to a /dev/mapper path. On arrays that only expose
+    # the device NAA once the LU is MAPPED (e.g. Hitachi), alloc records a null-NAA
+    # identity and activate_volume fills it in on first activation.
+    my $identity = $entry->{identity};
+    my $path = $identity ? eval { $conn->device_path($identity) } : undef;
+
     if ( !defined $path ) {
-        # The recorded identity carries no usable device id: on arrays that only expose
-        # the device NAA once the LU is mapped (e.g. Hitachi), alloc records a null
-        # identity and activate_volume fills it in — so a path-only caller (e.g.
-        # `pvesm free`) on a volume that was never activated would otherwise die here.
-        # Resolve it live and persist it; only fail if it is genuinely unresolvable
-        # (never mapped, so there is no host device to name).
+        # Try to resolve+persist the identity live (covers a volume mapped out-of-band).
         my $d    = $class->_driver( $storeid, $scfg );
         my $live = eval { $d->get_lu_identity($backend_id) };
-        $path = eval { $conn->device_path($live) } if $live;
-        die "volume '$volname' has no resolvable device identity (never activated?)\n"
-            unless defined $path;
-        $class->_registry($storeid)->update_meta( $volname, identity => $live );
+        my $p    = $live ? eval { $conn->device_path($live) } : undef;
+        if ( defined $p ) {
+            $path = $p;
+            $class->_registry($storeid)->update_meta( $volname, identity => $live );
+        }
+        # else: the LU was never mapped, so there is no host device to name YET. Do NOT
+        # die: PVE resolves the volume vtype via path() during `pvesm free` (the API
+        # DELETE handler reads it for the permission check, before vdisk_free) and
+        # during content listing — on volumes that were allocated but never activated.
+        # Real device consumers (attach, qemu_blockdev_options, volume_export) only call
+        # path() post-activation, when the identity is recorded. Return an undef device
+        # path with the correct vtype/ownervm so those metadata-only callers succeed
+        # instead of wedging `pvesm free` and orphaning the LU.
     }
 
     return wantarray ? ( $path, vmid_from_volname($volname), 'images' ) : $path;

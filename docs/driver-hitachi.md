@@ -109,7 +109,13 @@ prefix per cluster on a shared pool.
 ## Advanced services
 
 - **QoS** — upper/lower IOPS + MB/s and I/O priority, set per volume from the store's
-  `qos_*` defaults (core properties).
+  `qos_*` defaults (core properties). **Model-gated:** per Hitachi's support matrix,
+  QoS is available only on **VSP F/G350–900** and **VSP 5000** (firmware 88-06-01+ /
+  Configuration Manager REST 10.2.0+) — i.e. the `vsp_g` (Ops Center CM) platform. The
+  **VSP E series** (`vsp_e`: E590/E790/E990/E1090) and **VSP One Block** (`vsp_one`)
+  do **not** expose a QoS REST surface, so the driver does not advertise QoS on them
+  and silently ignores any `qos_*` settings there (with a warning). QoS on `vsp_g`
+  rides the §10 Ops Center CM connector and is not yet validated end-to-end.
 - **SCSI-3 PR readiness** — `persistent_reservations` validates the `qemu-pr-helper`
   socket + multipath reservation key on activation and **warns** only (never edits
   `multipath.conf`, never blocks). Ship the `qemu-pr-helper` units (disabled by

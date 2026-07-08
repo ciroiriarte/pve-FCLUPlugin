@@ -34,6 +34,14 @@ use constant MIB => 1024 * 1024;
 # the dedicated CM server fronting a VSP G) vs the embedded/direct GUM REST (443,
 # VSP One and the E/G midrange) — the maintainer's chosen Ops-Center-first
 # validation axis lives here, as a profile concern, not a separate driver class.
+#
+# QoS (`qos`) is model-gated per Hitachi's documented support matrix (see the OpenStack
+# HBSD "System requirements for a QoS"): only VSP F/G350-900 and VSP 5000 support QoS
+# (firmware 88-06-01+ / CM REST API 10.2.0+). The VSP E series (E590/E790/E990/E1090,
+# `vsp_e`) and VSP One Block (`vsp_one`) do NOT — their embedded GUM REST exposes no
+# QoS surface at all (LIVE-CONFIRMED on an E590H: the LDEV object carries no QoS fields
+# and every io-control endpoint 404s). So qos=1 only for `vsp_g` (Ops Center CM),
+# UNVALIDATED end-to-end until §10 lands the CM connector against a real G/F array.
 my %PLATFORM = (
     vsp_g => {
         family       => 'vsp_g',
@@ -41,6 +49,8 @@ my %PLATFORM = (
         min_lu_mb    => 48,              # POST /ldevs <= 46 MiB fails the async job
         max_label_len => 32,
         op_timeout_s => 600,
+        # qos: VSP F/G350-900 support it (fw 88-06-01+, CM REST 10.2.0+). Advertised
+        # here but UNVALIDATED — needs the §10 Ops Center CM connector + a real G/F array.
         capabilities => { snapshot => 1, clone => 1, qos => 1, cg_snapshot => 1 },
         quirks       => {},
     },
@@ -50,7 +60,8 @@ my %PLATFORM = (
         min_lu_mb    => 48,
         max_label_len => 32,
         op_timeout_s => 600,
-        capabilities => { snapshot => 1, clone => 1, qos => 1, cg_snapshot => 1 },
+        # qos=0: the VSP E series does not support QoS (no REST surface — live-confirmed on E590H).
+        capabilities => { snapshot => 1, clone => 1, qos => 0, cg_snapshot => 1 },
         quirks       => {
             list_luns_ignores_lu_filter => 1,
             used_pool_capacity_missing  => 1,
@@ -65,7 +76,8 @@ my %PLATFORM = (
         min_lu_mb    => 48,
         max_label_len => 32,
         op_timeout_s => 600,
-        capabilities => { snapshot => 1, clone => 1, qos => 1, cg_snapshot => 1 },
+        # qos=0: VSP One Block is not in Hitachi's QoS support matrix (embedded GUM REST).
+        capabilities => { snapshot => 1, clone => 1, qos => 0, cg_snapshot => 1 },
         quirks       => {},
     },
 );

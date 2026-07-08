@@ -66,9 +66,17 @@ subtest 'capabilities is a conformant §6 object reflecting the profile' => sub 
     is_deeply( [ sort keys %$cap ], [ sort $C->branches ], 'all seven branches present' );
     is( $C->has_feature( $cap, 'snapshot', 'single' ),  1, 'snapshot advertised' );
     is( $C->has_feature( $cap, 'clone', 'linked' ),     1, 'linked clone advertised' );
-    is( $C->has_feature( $cap, 'qos', 'per_lu' ),       1, 'qos advertised' );
+    is( $C->has_feature( $cap, 'qos', 'per_lu' ),       0,
+        'qos NOT advertised on vsp_e (E series has no QoS per Hitachi support matrix)' );
     is( $C->has_feature( $cap, 'resize', 'grow_online'),1, 'grow advertised' );
     is_deeply( $cap->{replication}, {}, 'replication off by default (gated, §8)' );
+
+    # QoS is model-gated: VSP One Block also lacks it; only vsp_g (VSP F/G350-900 via
+    # Ops Center CM) advertises it. See %PLATFORM + the OpenStack HBSD QoS matrix.
+    is( $C->has_feature( drv( platform => 'vsp_one' )->capabilities, 'qos', 'per_lu' ), 0,
+        'qos NOT advertised on vsp_one' );
+    is( $C->has_feature( drv( platform => 'vsp_g' )->capabilities, 'qos', 'per_lu' ), 1,
+        'qos advertised on vsp_g (Ops Center CM; F/G350-900)' );
 };
 
 subtest 'connect/disconnect/ping wrap the transport; logout never propagates' => sub {

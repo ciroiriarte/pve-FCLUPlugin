@@ -323,6 +323,46 @@ subtest 'filesystem_path resolves + persists a null identity live (never-activat
     ok( defined $meta->{identity}{ids}{naa}, 'the resolved identity is persisted back to the registry' );
 };
 
+subtest 'alloc: QoS is capability-gated (not attempted on a platform without QoS)' => sub {
+    # Regression (live E590H G-phase finding): the VSP E series / VSP One advertise no
+    # QoS; attempting set_lu_qos there just draws an [invalid] from the array. The alloc
+    # path must skip it (and say so) when the driver does not advertise qos/per_lu.
+    local $T::Plugin::FAKE = T::FakeDriver->new;   # capabilities() advertises no qos (per_lu absent)
+    $P->deactivate_storage( 'store1', {} );
+    my @warns;
+    local $SIG{__WARN__} = sub { push @warns, $_[0] };
+    $P->alloc_image( 'store1', { pool_id => '63', qos_upper_iops => 2000 }, 610, 'raw', undef, 1 << 30 );
+    ok( !$T::Plugin::FAKE->{calls}{set_lu_qos}, 'set_lu_qos NOT attempted when the platform lacks QoS' );
+    ok( ( grep { /does not support per-volume QoS/ } @warns ), 'a clear "unsupported QoS" warning is emitted' );
+};
+
+subtest 'never-mapped volume: filesystem_path returns metadata (no die) so pvesm free works' => sub {
+    # Regression (live E590H G-phase finding): PVE's API DELETE handler resolves the
+    # volume vtype via path() BEFORE vdisk_free. A volume allocated but NEVER activated
+    # has no device NAA yet (Hitachi exposes it only post-map) and the live
+    # get_lu_identity cannot produce one either — filesystem_path must NOT die (it used
+    # to), or `pvesm free` wedges before the delete and orphans the LU on the array.
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 951, 'raw', undef, 1 << 30 );
+    my ($bid) = reg()->lookup($name);
+
+    # Simulate a never-mapped LU: the array carries no NAA and the recorded identity is null.
+    $T::Plugin::FAKE->{lus}{$bid}{identity} = { protocol => 'scsi-fc', ids => { naa => undef } };
+    reg()->update_meta( $name, identity => { protocol => 'scsi-fc', ids => { naa => undef } } );
+
+    my ( $path, $vmid, $vtype ) = $P->filesystem_path( {}, $name, 'store1' );
+    is( $path,  undef,    'no device path for a never-mapped volume (returns instead of dying)' );
+    is( $vmid,  951,      'vmid still derived from the volname for the metadata caller' );
+    is( $vtype, 'images', 'vtype still returned for the metadata caller' );
+
+    # The pvesm-free path must then succeed and actually delete the LU (no orphan).
+    is( $P->free_image( 'store1', {}, $name ), undef, 'free_image on a never-mapped volume succeeds' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'the LU was deleted (no orphan)' );
+    is( reg()->lookup($name), undef, 'unregistered' );
+};
+
 subtest 'vendor hooks: _alloc_backend_id requested_id, safe_delete_precheck default' => sub {
     package T::RangedPlugin;
     use parent -norequire, 'T::Plugin';
