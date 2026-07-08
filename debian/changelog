@@ -1,3 +1,23 @@
+pve-fclu (0.1.0~alpha25) stable; urgency=medium
+
+  * hitachi: model-gate the QoS capability. Per Hitachi's support matrix (OpenStack
+    HBSD "System requirements for a QoS"), QoS exists only on VSP F/G350-900 and VSP
+    5000 (fw 88-06-01+ / CM REST 10.2.0+). The VSP E series (vsp_e) and VSP One Block
+    (vsp_one) have no QoS REST surface at all -- live-confirmed on an E590H: the LDEV
+    object carries no QoS fields and every io-control endpoint 404s. So qos=0 for
+    vsp_e/vsp_one, qos=1 only for vsp_g (Ops Center CM; unvalidated pending the CM
+    connector). alloc now capability-gates set_lu_qos so it is never attempted (and no
+    longer draws an [invalid]) on a platform without QoS.
+  * plugin: fix `pvesm free` of a volume that was allocated but never activated. PVE's
+    content DELETE handler resolves the volume vtype via path() before vdisk_free, and
+    filesystem_path used to die ("no resolvable device identity") for a never-mapped
+    volume -- wedging the free and orphaning the LU. It now returns metadata with an
+    undef device path; real device consumers only call path() post-activation.
+  * Both surfaced by the live E590H F/G validation battery (F1-F4 + F6 all passed,
+    including no data corruption under load). 187 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 08 Jul 2026 09:00:00 -0300
+
 pve-fclu (0.1.0~alpha24) stable; urgency=medium
 
   * hitachi: default host_group_prefix to a stable short "PVE" instead of the harmful
