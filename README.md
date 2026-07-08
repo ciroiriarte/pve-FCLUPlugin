@@ -9,9 +9,11 @@ policies — natively into the Proxmox VE ecosystem.*
 >
 > The framework is **implemented and packaged** — the generic core, the Hitachi
 > reference driver, the `type: hitachiblock` plugin (`FCLU::Plugin` cutover), and the
-> multi-binary Debian packaging are in place with a green unit suite. It has **not**
-> yet been validated against a live array or cluster; treat it as lab/test only until
-> verified on real hardware.
+> multi-binary Debian packaging are in place with a green unit suite. The core data
+> path has been **validated live on a Hitachi VSP E590H** cluster: package swap +
+> registry migration, alloc/map/IO/free, snapshots, Thin Image linked clones, and
+> multi-disk `qm clone`. It has **not** been validated against other arrays or at
+> production scale; treat it as lab/test only until verified on your own hardware.
 
 A vendor-neutral [Proxmox VE](https://www.proxmox.com/) storage framework that
 delivers **first-class per-virtual-disk volume** service over Fibre Channel: **one array LUN per virtual
@@ -58,6 +60,18 @@ systemctl restart pvedaemon
   and host-connector interfaces, per-model/generation specialization, PVE config-schema
   integration, capability negotiation, the registry, replication, the migration path,
   and the risk register.
+
+### Operator documentation
+
+- **[`docs/user-guide.md`](docs/user-guide.md)** — vendor-neutral install, `storage.cfg`
+  configuration, multipath requirements, multi-cluster shared-pool safety, operational
+  behavior, and troubleshooting.
+- **[`docs/driver-hitachi.md`](docs/driver-hitachi.md)** — Hitachi VSP driver: platform
+  profiles, the `ldev_range` fence, host-access, Thin Image snapshots/clones, QoS/PR,
+  and the CM REST transport.
+- **[`docs/migration-hitachi.md`](docs/migration-hitachi.md)** — zero-window swap from
+  `pve-storage-hitachiblock` and rollback.
+- **[`docs/packaging-obs.md`](docs/packaging-obs.md)** — the OBS build/release pipeline.
 
 ## Design provenance
 

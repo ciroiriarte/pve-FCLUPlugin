@@ -52,10 +52,6 @@ sub driver_config {
     };
 }
 
-# Default host group name prefix when `host_group_prefix` is unset: the PVE cluster
-# name (so two clusters sharing an array pool namespace their host groups apart),
-# falling back to 'PVE' for a single node / when the cluster name is unavailable.
-# Sanitised to the host-group-name charset. Best-effort — never dies (config path).
 # The DEFAULT host-group name prefix when storage.cfg does not set host_group_prefix.
 # It MUST be short and STABLE. An earlier version auto-derived "PVE-<clustername>" from
 # corosync, which was actively harmful: (a) it read the cluster name only in a daemon
@@ -150,9 +146,10 @@ sub properties {
         host_group_prefix => {
             description => "Prefix for this cluster's per-node host group names"
                 . " (<prefix>_<hostname>). Namespaces host groups on an array pool SHARED by"
-                . " multiple PVE clusters so they never collide. Defaults to the PVE cluster"
-                . " name (or 'PVE' for a single node). Set an explicit, distinct value per"
-                . " cluster when the clusters share a pool and could share a hostname.",
+                . " multiple PVE clusters so they never collide. Defaults to a stable, short"
+                . " 'PVE' (matching groups created as PVE_<hostname>). Set an explicit,"
+                . " distinct value per cluster when the clusters share a pool and could share"
+                . " a hostname.",
             type        => 'string',
             optional    => 1,
         },
@@ -234,8 +231,8 @@ sub on_update_hook {
     return $ret;
 }
 
-# Advisory: on a shared array pool the auto-derived prefix (PVE cluster name) only
-# namespaces clusters apart if their cluster NAMES differ — nudge the admin to set an
+# Advisory: on a shared array pool the default prefix ('PVE') is identical on every
+# cluster, so it does NOT namespace clusters apart — nudge the admin to set an
 # explicit, distinct host_group_prefix.
 sub _warn_if_hg_prefix_unset {
     my ($class, $scfg) = @_;
