@@ -51,8 +51,10 @@ subtest 'driver_config maps storage.cfg to the Driver::Hitachi constructor opts'
         storage_id => '900000012345', mgmt_port => 443, tls_verify => 1, tls_ca_file => '/ca',
         rest_keepalive => 1, target_ports => 'CL1-A,CL2-A', host_mode => 'LINUX/IRIX',
         host_mode_options => '2,22,25,68', skip_unmap_io_check => 1, host_group_prefix => 'clsX',
+        control_plane => 'cm',
     } );
     is( $cfg->{platform}, 'vsp_e', 'platform' );
+    is( $cfg->{control_plane}, 'cm', 'control_plane -> driver opt (Ops Center CM)' );
     is( $cfg->{array_ports}, 'CL1-A,CL2-A', 'target_ports -> array_ports' );
     is( $cfg->{port}, 443, 'mgmt_port -> port' );
     is( $cfg->{sessionless}, 0, 'rest_keepalive=1 -> sessionless=0' );
@@ -65,6 +67,7 @@ subtest 'driver_config maps storage.cfg to the Driver::Hitachi constructor opts'
     is( $def->{sessionless}, 1, 'default sessionless=1 (session-less)' );
     is( $def->{host_group_prefix}, 'PVE', 'host_group_prefix defaults to a stable, short "PVE" (context-independent)' );
     ok( !exists $def->{port}, 'no port when mgmt_port unset (driver uses profile default)' );
+    ok( !exists $def->{control_plane}, 'no control_plane key when unset (defaults to embedded)' );
     ok( !exists $def->{tls_verify}, 'no tls_verify key when unset' );
 };
 

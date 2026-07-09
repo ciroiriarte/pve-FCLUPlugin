@@ -58,7 +58,14 @@ sub new {
         grep { length } map { my $h = $_; $h =~ s/^\s+|\s+$//g; $h } split(/,/, $opts{mgmt_ip});
     croak "mgmt_ip is required" unless @endpoints;
 
-    my $port = $opts{port} || 443;
+    # Control plane (§10): 'cm' = a fronting Ops Center Configuration Manager server
+    # (default port 23451) vs 'embedded' = the array's own GUM REST (443). This ONLY
+    # picks the default port — the CM and the embedded GUM speak the SAME
+    # Configuration Manager REST API (session-less basic auth + storage-scoped jobs
+    # work identically on both), so there is no behavioural fork. `mgmt_port`
+    # overrides the default either way.
+    my $port = $opts{port}
+        || ( ( ($opts{control_plane} // 'embedded') eq 'cm' ) ? 23451 : 443 );
 
     # TLS verification is opt-in: Configuration Manager ships a self-signed cert by
     # default, so verification is disabled unless the caller explicitly enables it
@@ -1151,7 +1158,12 @@ sub _wait_for_job {
     # resource instead of a jobId in the body. Derive the job URL from either.
     my $url;
     if ($job_id) {
-        $url = $self->_objects_url("jobs/$job_id");
+        # Poll the job scoped UNDER the storage system (.../storages/<id>/jobs/<id>).
+        # This is the universal form: it works on both a fronting Ops Center CM server
+        # AND the array's embedded GUM REST (verified live on an E590 — both return the
+        # job). The flat /objects/jobs/<id> only works on the embedded GUM and 404s via
+        # a CM (which fronts many arrays, so job ids must be storage-scoped). §10.
+        $url = $self->_url("/jobs/$job_id");
     } elsif ($res->{location}) {
         my $loc = $res->{location};
         # Location may be absolute or relative to the API root.

@@ -8,25 +8,47 @@ multi-cluster safety, and migration are documented there and are not repeated he
 > (allocation fence). Storage type is `hitachiblock` (backward-compatible with the
 > legacy single-vendor plugin).
 
-## Platform profiles (§4)
+## Platform (model) & control plane (§4)
 
-One `Driver::Hitachi` handles the whole VSP family; the control-plane differences are
-a **profile** concern, selected by `platform`:
+Two **orthogonal** axes select the driver's behavior:
 
-| `platform`           | Control plane                                  | Default port |
-| -------------------- | ---------------------------------------------- | ------------ |
-| `vsp_one` (default)  | Embedded / direct GUM REST (VSP One, E·G midrange) | 443      |
-| `vsp_e`              | Embedded / direct GUM REST                     | 443          |
-| `vsp_g`              | Ops Center **Configuration Manager** server    | 23451        |
+**`platform`** — the array MODEL family, which governs *capabilities*:
 
-- **`mgmt_port`** — override the port to mix models (auto-detected from `platform`
-  when omitted).
+| `platform`          | Family                              | QoS |
+| ------------------- | ----------------------------------- | --- |
+| `vsp_one` (default) | VSP One Block                       | no  |
+| `vsp_e`             | VSP E series (E590/E790/E990/E1090) | no  |
+| `vsp_g`             | VSP F/G350–900                      | yes |
+
+**`control_plane`** — WHERE the Configuration Manager REST API lives (both speak the
+*same* API — this only picks the endpoint):
+
+| `control_plane`       | Endpoint                                        | Default port |
+| --------------------- | ----------------------------------------------- | ------------ |
+| `embedded` (default)  | The array's own built-in GUM REST               | 443          |
+| `cm`                  | A fronting Ops Center **Configuration Manager** server | 23451 |
+
+The axes combine freely: a VSP E fronted by an Ops Center CM is `platform=vsp_e` +
+`control_plane=cm` (QoS still correctly gated off — it's the *model* that lacks QoS,
+not the control plane). `mgmt_port` overrides the port either way.
+
 - **`storage_id`** (`fixed`) — the array's `storageDeviceId` (the 12-digit
   model+serial id from `GET /v1/objects/storages`), **not** the bare serial.
-- **`rest_keepalive`** — keep a persistent CM REST session per process instead of
-  authenticating each request. The default is **session-less** (auth per request),
-  which avoids exhausting the array's per-array session cap on large clusters. Enable
-  only if your array requires session auth.
+- **`rest_keepalive`** — keep a persistent REST session per process instead of
+  authenticating each request. The default is **session-less** (basic auth per
+  request), which avoids exhausting the array's per-array session cap on large
+  clusters. **A `control_plane=cm` store must stay session-less** (leave
+  `rest_keepalive` off) — the CM does not expose the per-storage session endpoint.
+
+### Using an Ops Center CM control plane (`control_plane=cm`)
+
+1. Set `mgmt_ip` to the **CM server** host and `control_plane=cm` (port defaults to
+   23451). Keep `platform` set to the array's real model.
+2. The array must be **registered on the CM** first (`POST
+   /ConfigurationManager/v1/objects/storages` with the array's `ctl1Ip`/`ctl2Ip`,
+   `serialNumber`, `model`) — authenticated with the **array** credentials, not the
+   CM's. Credentials for the store are the array's REST user (the CM proxies auth).
+3. Leave `rest_keepalive` off (session-less, the default).
 
 ## Provisioning & the fence (§7)
 

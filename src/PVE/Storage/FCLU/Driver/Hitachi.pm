@@ -115,12 +115,22 @@ sub new {
     # Build a real transport unless one was injected (tests inject a mock).
     unless ( $self->{rest} ) {
         my $prof = $self->profile;
+        # Control plane (§10): 'cm' = a fronting Ops Center Configuration Manager
+        # server (default port 23451) vs the array's own embedded GUM REST (443).
+        # Orthogonal to the array MODEL that `platform` selects (the model governs
+        # capabilities like QoS). The CM and the embedded GUM speak the SAME
+        # Configuration Manager REST API — session-less basic auth and storage-scoped
+        # jobs work identically on both — so control_plane ONLY picks the default
+        # port; there is no behavioural fork. A CM-fronted E-series is
+        # control_plane=cm + platform=vsp_e (correct QoS gating: none).
+        my $is_cm = ( ( $opts{control_plane} // 'embedded' ) eq 'cm' ) ? 1 : 0;
         $self->{rest} = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
             mgmt_ip    => $opts{mgmt_ip},
             storage_id => $opts{storage_id},
             username   => $opts{username},
             password   => $opts{password},
-            port       => $opts{port} // $prof->{default_port},
+            port       => $opts{port} // ( $is_cm ? 23451 : $prof->{default_port} ),
+            ( $opts{control_plane} ? ( control_plane => $opts{control_plane} ) : () ),
             # Poll async CM REST jobs up to the profile's operation timeout (large TI
             # v-vol clones can exceed the RestClient's shorter default).
             job_timeout => $prof->{op_timeout_s},

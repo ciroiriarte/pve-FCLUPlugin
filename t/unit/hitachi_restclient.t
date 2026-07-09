@@ -70,6 +70,18 @@ subtest 'constructor validates required fields and builds the CM base url' => su
     is( $def->{job_timeout}, 300, 'job_timeout falls back to the 300s default' );
 };
 
+subtest 'control_plane picks the default endpoint port (§10 Ops Center CM)' => sub {
+    my %base = ( mgmt_ip => 'h', storage_id => 'x', username => 'u', password => 'p' );
+    is( PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(%base)->{port}, 443,
+        'embedded (default) -> port 443' );
+    is( PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(%base, control_plane => 'embedded')->{port}, 443,
+        'control_plane=embedded -> 443' );
+    is( PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(%base, control_plane => 'cm')->{port}, 23451,
+        'control_plane=cm -> Ops Center CM port 23451' );
+    is( PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(%base, control_plane => 'cm', port => 8443)->{port}, 8443,
+        'explicit port overrides the control_plane default' );
+};
+
 subtest 'list_host_groups is cached per port; invalidated on create/delete' => sub {
     my $c = new_mock_client();
     MockRestClient::clear_request_log();

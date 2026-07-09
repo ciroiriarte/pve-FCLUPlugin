@@ -33,6 +33,11 @@ sub driver_config {
         snap_pool_id => $scfg->{snap_pool_id},
         mgmt_ip      => $scfg->{mgmt_ip},
         storage_id   => $scfg->{storage_id},
+        # Control plane (§10): 'cm' talks to a fronting Ops Center Configuration
+        # Manager server (default port 23451, session-less, storage-scoped jobs)
+        # instead of the array's own GUM REST. Orthogonal to `platform` (the array
+        # model, which governs capabilities like QoS).
+        ( defined $scfg->{control_plane} ? ( control_plane => $scfg->{control_plane} ) : () ),
         ( defined $scfg->{mgmt_port}   ? ( port        => $scfg->{mgmt_port} )   : () ),
         ( defined $scfg->{tls_verify}  ? ( tls_verify  => $scfg->{tls_verify} )  : () ),
         ( defined $scfg->{tls_ca_file} ? ( tls_ca_file => $scfg->{tls_ca_file} ) : () ),
@@ -120,12 +125,26 @@ sub properties {
             optional    => 1,
         },
         platform => {
-            description => "Storage platform type. Sets the default API port: 'vsp_one' and"
-                . " 'vsp_e' (embedded/direct REST) use 443; 'vsp_g' uses 23451 (Ops Center"
-                . " Configuration Manager server). Override with mgmt_port to mix models.",
+            description => "Array model family, which governs capabilities (e.g. QoS is"
+                . " available on 'vsp_g' = VSP F/G350-900, not on 'vsp_e'/'vsp_one'). The"
+                . " CONTROL PLANE (where the REST API lives) is separate — see"
+                . " control_plane / mgmt_port.",
             type        => 'string',
             enum        => ['vsp_g', 'vsp_e', 'vsp_one'],
             default     => 'vsp_one',
+            optional    => 1,
+        },
+        control_plane => {
+            description => "REST control plane: 'embedded' (default) talks to the array's own"
+                . " GUM REST (port 443); 'cm' talks to a fronting Ops Center Configuration"
+                . " Manager server (port 23451). Orthogonal to platform — a CM-fronted VSP E is"
+                . " control_plane=cm + platform=vsp_e. Set mgmt_ip to the CM host; the array"
+                . " must be registered on the CM. A CM store must stay session-less (leave"
+                . " rest_keepalive off, the default) — the CM does not expose the per-storage"
+                . " session endpoint.",
+            type        => 'string',
+            enum        => ['embedded', 'cm'],
+            default     => 'embedded',
             optional    => 1,
         },
         mgmt_port => {
@@ -202,6 +221,7 @@ sub options {
         skip_unmap_io_check => { optional => 1 },
         persistent_reservations => { optional => 1 },
         platform            => { optional => 1 },
+        control_plane       => { optional => 1 },
         mgmt_port           => { optional => 1 },
         ldev_range          => { optional => 1 },
         host_group_prefix   => { optional => 1 },
