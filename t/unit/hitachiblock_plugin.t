@@ -35,6 +35,7 @@ sub reg { PVE::Storage::FCLU::Registry->new( storeid => 's1', base_dir => $dir )
         for my $id ( $a{min} .. $a{max} ) { return "$id" unless $used{"$id"} }
         die "no free id\n";
     }
+    sub reclaim_zero_pages { my ( $s, $id ) = @_; $s->{calls}{reclaim} = $id; 1 }
 }
 
 subtest 'vendor identity + driver_class' => sub {
@@ -80,6 +81,15 @@ subtest 'properties/options merge over the base + avoid the SectionConfig landmi
     ok( $opts->{username} && $opts->{password}, 'inherited username/password references' );
     ok( $opts->{target_ports}{fixed} && $opts->{storage_id}{fixed}, 'vendor fixed keys' );
     ok( $opts->{ldev_range}{optional}, 'ldev_range optional' );
+};
+
+subtest '_after_deactivate: discard_zero_page drives reclaim_zero_pages (opt-in)' => sub {
+    my $d = T::HDriver->new;
+    my $P = 'PVE::Storage::Custom::HitachiBlockPlugin';
+    $P->_after_deactivate( 's1', {}, '300', $d );
+    ok( !exists $d->{calls}{reclaim}, 'no reclaim when discard_zero_page is unset (default off)' );
+    $P->_after_deactivate( 's1', { discard_zero_page => 1 }, '300', $d );
+    is( $d->{calls}{reclaim}, '300', 'discard_zero_page -> reclaim_zero_pages(backend_id)' );
 };
 
 subtest 'safe_delete_precheck: the §7 ldev_range fence' => sub {

@@ -574,6 +574,15 @@ sub get_lu_qos {
     return $self->_call( sub { $self->{rest}->get_ldev_qos($backend_id) } );
 }
 
+# Reclaim zero-filled pages of a DP volume (thin-pool space recovery). Off-contract
+# vendor hook (Hitachi discard-zero-page), driven by the plugin's discard_zero_page
+# option via _after_deactivate. Best-effort: the caller eval-wraps it.
+sub reclaim_zero_pages {
+    my ($self, $backend_id) = @_;
+    $self->_call( sub { $self->{rest}->reclaim_zero_pages($backend_id) } );
+    return 1;
+}
+
 # Allocate an S-VOL ldev sized to $parent (exact block count) and return its id.
 sub _alloc_svol {
     my ($self, $parent_ldev, %args) = @_;

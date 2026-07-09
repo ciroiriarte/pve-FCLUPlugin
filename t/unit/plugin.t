@@ -292,6 +292,25 @@ subtest 'activate_volume publishes + attaches; deactivate detaches + unpublishes
     is( $P->deactivate_volume( 'store1', {}, 'vm-12345-disk-0' ), 1, 'soft deactivate of a missing volume' );
 };
 
+subtest 'deactivate_volume invokes the _after_deactivate vendor hook (best-effort)' => sub {
+    package T::HookPlugin;
+    use parent -norequire, 'T::Plugin';
+    our @SEEN;
+    sub _after_deactivate { my ( $c, $sid, $scfg, $bid, $d ) = @_; push @SEEN, $bid; 1 }
+
+    package main;
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    T::HookPlugin->deactivate_storage( 'store1', {} );
+    my $name = T::HookPlugin->alloc_image( 'store1', { pool_id => '63' }, 611, 'raw', undef, 1 << 30 );
+    T::HookPlugin->activate_volume( 'store1', {}, $name );
+    my ($bid) = reg()->lookup($name);
+    @T::HookPlugin::SEEN = ();
+    T::HookPlugin->deactivate_volume( 'store1', {}, $name );
+    is_deeply( \@T::HookPlugin::SEEN, [$bid], 'hook invoked once with the backend_id after unmap' );
+    T::HookPlugin->free_image( 'store1', {}, $name );
+};
+
 subtest 'filesystem_path resolves from the recorded identity (no array session)' => sub {
     local $T::Plugin::FAKE = T::FakeDriver->new;
     $P->deactivate_storage( 'store1', {} );   # drop any cached driver so _driver picks up this FAKE

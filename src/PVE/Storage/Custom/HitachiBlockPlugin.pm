@@ -274,6 +274,17 @@ sub safe_delete_precheck {
     return $class->_ldev_in_range( $scfg, $backend_id );
 }
 
+# Post-deactivate reclaim: when discard_zero_page is enabled, reclaim the volume's
+# zero-filled pages for thin-pool space recovery once the LU is unmapped on this
+# node (ported from the reference plugin's deactivate_volume). Best-effort — the
+# base deactivate_volume eval-wraps this, so a reclaim failure never wedges teardown.
+sub _after_deactivate {
+    my ($class, $storeid, $scfg, $backend_id, $driver) = @_;
+    return 1 unless $scfg->{discard_zero_page};
+    $driver->reclaim_zero_pages($backend_id);
+    return 1;
+}
+
 # Parse an ldev_range ("1000-1999" or "0x3E8-0x7CF") into ($min,$max); dies on a
 # malformed range.
 sub _parse_ldev_range {

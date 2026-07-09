@@ -558,8 +558,18 @@ sub deactivate_volume {
     eval { $d->unpublish_lu( $backend_id, %hctx ) };
     warn "FCLU: unmap warning: $@" if $@;
 
+    # Vendor post-deactivate hook (best-effort, e.g. Hitachi discard-zero-page thin
+    # reclaim on the now-unmapped LU). Default no-op; must never fail the deactivate.
+    eval { $class->_after_deactivate( $storeid, $scfg, $backend_id, $d ) };
+    warn "FCLU: post-deactivate hook warning: $@" if $@;
+
     return 1;
 }
+
+# Vendor hook: run after a volume is torn down on this node (device detached + LU
+# unmapped). Best-effort, called eval-wrapped. Default no-op; a driver-specific
+# subclass may override it (e.g. Hitachi discard_zero_page thin-pool reclaim).
+sub _after_deactivate { return 1 }
 
 # Explicit map/unmap hooks (PVE 8+): the volume is a real block device, so map ==
 # activate + return the dm path; unmap == deactivate. Idempotent.
