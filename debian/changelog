@@ -1,3 +1,23 @@
+pve-fclu (0.1.0~alpha27) stable; urgency=medium
+
+  * hitachi: support an Ops Center Configuration Manager (CM) control plane (§10). The
+    CM server and the array's embedded GUM REST speak the SAME Configuration Manager
+    REST API, so this is config, not a new driver: a new `control_plane` option
+    ('embedded' default / 'cm') that only picks the default endpoint port (cm -> 23451),
+    orthogonal to `platform` (the array MODEL, which still governs capabilities like
+    QoS -- a CM-fronted VSP E is control_plane=cm + platform=vsp_e, QoS still off).
+  * hitachi: poll async jobs at the storage-scoped URL
+    .../objects/storages/<id>/jobs/<id> (was the flat /objects/jobs/<id>). This is the
+    documented, universal form -- it works on BOTH a fronting CM server (where the flat
+    form 404s, since one CM fronts many arrays) AND the array's embedded GUM REST
+    (verified live on both). A CM store must stay session-less (the default), as the CM
+    does not expose the per-storage session endpoint.
+  * Validated live: the E590H registered on an Ops Center CM, driven through the CM at
+    :23451 -- connect + 5/5 create->read->delete cycles, clean, correct QoS gating.
+    190 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 09 Jul 2026 15:00:00 -0300
+
 pve-fclu (0.1.0~alpha26) stable; urgency=medium
 
   * hitachi: wire up discard_zero_page (thin-pool zero-page reclaim). The property +
