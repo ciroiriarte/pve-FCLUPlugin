@@ -1,3 +1,19 @@
+pve-fclu (0.1.0~alpha26) stable; urgency=medium
+
+  * hitachi: wire up discard_zero_page (thin-pool zero-page reclaim). The property +
+    GUI field + RestClient reclaim_zero_pages existed but nothing called them -- the
+    §9 migration dropped the reference plugin's wiring. Restored via a vendor-neutral
+    best-effort _after_deactivate hook on FCLU::Plugin::deactivate_volume (default
+    no-op); the hitachiblock subclass overrides it to reclaim the LU's zero pages when
+    discard_zero_page is set, after the LU is unmapped on this node. Off by default;
+    matches the reference behaviour (reclaim on deactivate). Found by the live E590H
+    G-phase battery (G4).
+  * Also validated live in the same battery: G2 SCSI-3 PR readiness detection, G5
+    concurrent registry-lock (no lost updates across nodes), F5 manage/unmanage
+    adopt-release. 189 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 08 Jul 2026 12:00:00 -0300
+
 pve-fclu (0.1.0~alpha25) stable; urgency=medium
 
   * hitachi: model-gate the QoS capability. Per Hitachi's support matrix (OpenStack
