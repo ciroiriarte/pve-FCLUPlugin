@@ -1,3 +1,23 @@
+pve-fclu (0.1.0~alpha28) stable; urgency=medium
+
+  * hitachi: simplify linked clones to a single Thin Image pair creation (the OpenStack
+    HBSD recipe). create_linked_clone now creates a DP S-VOL and creates the autoSplit
+    pair WITH svolLdevId + canCascade + isDataReductionForceCopy in ONE step -- the
+    array binds the S-VOL at creation with NEITHER volume mapped. This replaces the old
+    4-step #24 workaround (poolId-1 v-vol -> data-only pair -> map S-VOL -> assign),
+    which existed only because a plain svolLdevId was rejected ("S-VOL does not have LU
+    paths"); the two extra flags remove that constraint. Effects: clones no longer need
+    the source (or clone) mapped, so a clone of an unmapped base now works;
+    create_linked_clone no longer needs host_ctx (accepted but ignored); simpler + no
+    mid-flow host mapping.
+  * Live-validated on the E590H (embedded + Ops Center CM control planes): clone of an
+    UNMAPPED base -> space-efficient CoW child (S-VOL usedBlocks 0, reads P-VOL data),
+    no orphans. Found by reviewing the OpenStack Cinder Hitachi driver
+    (hbsd_rest.py _create_snap_pair). Contract + fake-rest + snapshot tests updated. 190
+    unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 10 Jul 2026 18:00:00 -0300
+
 pve-fclu (0.1.0~alpha27) stable; urgency=medium
 
   * hitachi: support an Ops Center Configuration Manager (CM) control plane (§10). The
