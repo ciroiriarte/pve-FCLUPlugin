@@ -106,6 +106,9 @@ subtest '_translate_rest_error maps RestClient strings to §13 codes' => sub {
         'Job job-3 failed: pool capacity insufficient'                         => 'out_of_space',
         'Job job-4 failed: maximum number of LDEVs reached'                    => 'limit',
         'Job job-5 failed: some weird thing'                                   => 'internal',
+        # A mapping PRECONDITION, not an absent object — must NOT be not_found even
+        # though the array's phrasing ends with "...or the ... pair does not exist".
+        'Job 3602 failed: An error occurred in the storage system. (message = The specified snapshot P-VOL does not have LU paths, or the specified snapshot pair does not exist.)' => 'invalid',
     );
     for my $str ( sort keys %cases ) {
         my $e = $d->_translate_rest_error($str);

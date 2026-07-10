@@ -268,6 +268,13 @@ sub _translate_rest_error {
     if ( !defined $code ) {
         if    ( $msg =~ /insufficient|capacity|pool .*full|out of space/i ) { $code = 'out_of_space' }
         elsif ( $msg =~ /alread(y)? (exists|defined)|duplicate/i )          { $code = 'already_exists' }
+        # "does not have LU paths" is a PRECONDITION failure (the volume must be mapped
+        # for this operation), NOT an absent object. Must be matched BEFORE the generic
+        # "does not exist" rule below: the array phrases it as
+        # "The specified snapshot P-VOL does not have LU paths, or the specified snapshot
+        # pair does not exist" — the trailing "does not exist" would otherwise mis-classify
+        # a mapping precondition as not_found (which is misleading and hid the real cause).
+        elsif ( $msg =~ /does not have LU paths/i ) { $code = 'invalid' }
         # "LDEV is not installed" is the array's phrasing for an absent/NOT DEFINED
         # ldev slot — treat it as not_found so idempotent teardown (delete_lu) succeeds
         # instead of failing [internal] and leaking the registry entry.
