@@ -930,7 +930,7 @@ sub ensure_host_access {
         if ( $created && !$added && !%present ) {
             eval { $self->{rest}->delete_host_group("$port,$hg_num") };
             warn "FCLU Hitachi: host group '$hg_name' on $port registered none of node "
-                . "'$hostname's WWNs (@$wwns) — rolled back the empty group (node likely not "
+                . "'$hostname' WWNs (@$wwns) — rolled back the empty group (node likely not "
                 . "zoned to $port).\n";
             next;
         }

@@ -215,14 +215,19 @@ subtest '#4 atomic create: a freshly-created group with zero WWNs is rolled back
     my $f = FakeRest->new;
     my $d = drv( $f, array_ports => ['CL1-A'] );
     my $err;
+    my @warns;
     {
         no warnings 'redefine';
         local *FakeRest::add_wwn_to_host_group =
             sub { die "API request failed: POST /host-wwns -> 400 EXCEED_WWN_MAX\n" };
-        local $SIG{__WARN__} = sub { };
+        local $SIG{__WARN__} = sub { push @warns, $_[0] };
         eval { $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) ); 1 } or $err = $@;
     }
     ok( $err, 'ensure_host_access dies rather than leave an empty group' );
+    # The rollback warning must actually name the node — guards against a `$hostname's`
+    # apostrophe being parsed as the old `'` package separator (interpolates to empty).
+    ok( ( grep { /rolled back the empty group/ && /\bnode-a\b/ } @warns ),
+        'rollback warning names the node (no empty-interpolation regression)' );
     is( ref $err && $err->code, 'internal', 'zero-WWN create => internal error' );
     like( "$err", qr/registered none|rolled the empty group/i, 'message explains the rollback' );
     is( $f->{calls}{delete_host_group}, 1, 'the empty group was deleted (rolled back)' );
