@@ -60,7 +60,7 @@ subtest 'restore_snapshot restores then re-splits (PSUS)' => sub {
     is( $f->{snaps}{ $s->{snap_id} }{status}, 'PSUS', 'settled back to PSUS' );
 };
 
-subtest 'create_cg_snapshot snapshots every LU under one group' => sub {
+subtest 'create_cg_snapshot is crash-consistent: one group, single atomic split' => sub {
     my ( $d, $f ) = setup();
     my $a = $d->create_lu( size_bytes => GIB );
     my $b = $d->create_lu( size_bytes => GIB );
@@ -69,6 +69,49 @@ subtest 'create_cg_snapshot snapshots every LU under one group' => sub {
     is( scalar @$snaps, 2, 'one descriptor per LU' );
     is_deeply( [ sort map { $_->{parent_backend_id} } @$snaps ], [ sort $a, $b ], 'both parents' );
     is( $snaps->[0]{meta}{group}, 'cg1', 'shared CG group name' );
+
+    # Crash-consistency: pairs created UNSPLIT (auto_split off) then split as ONE group
+    # in a single action — NOT one autoSplit-per-pair (which froze each S-VOL at a
+    # different instant). So exactly one group-split call, and no per-pair splits.
+    is( $f->{calls}{split_snapshotgroup}, 1, 'the whole group is split in a single action' );
+    ok( !$f->{calls}{split_snapshot}, 'no per-pair splits (would break crash-consistency)' );
+    is( $f->{snaps}{ $snaps->[0]{snap_id} }{status}, 'PSUS', 'both S-VOLs suspended after the group split' );
+    is( $f->{snaps}{ $snaps->[1]{snap_id} }{status}, 'PSUS', 'both S-VOLs suspended after the group split' );
+
+    # A default (unnamed) CG derives a unique group name so concurrent CGs never collide.
+    my $c = $d->create_lu( size_bytes => GIB );
+    my $auto = $d->create_cg_snapshot( [$c] );
+    like( $auto->[0]{meta}{group}, qr/^pveC/, 'unnamed CG derives a unique pveC<...> group' );
+    isnt( $auto->[0]{meta}{group}, 'cg1', 'and it does not collide with a prior group' );
+};
+
+subtest 'create_cg_snapshot sweeps created pairs if the group split fails (no leak)' => sub {
+    my ( $d, $f ) = setup();
+    my $a = $d->create_lu( size_bytes => GIB );
+    my $b = $d->create_lu( size_bytes => GIB );
+    my $err;
+    {
+        no warnings 'redefine';
+        local *FCLU::FakeHitachiRest::split_snapshotgroup =
+            sub { die "API request failed: POST /snapshot-groups/cgX/actions/split -> 400 KART\n" };
+        local $SIG{__WARN__} = sub { };
+        eval { $d->create_cg_snapshot( [ $a, $b ], snapshot_group => 'cgX' ); 1 } or $err = $@;
+    }
+    ok( $err, 'CG snapshot fails when the group split fails' );
+    is( scalar @{ $d->list_snapshots($a) }, 0, 'pair on A swept (no orphan)' );
+    is( scalar @{ $d->list_snapshots($b) }, 0, 'pair on B swept (no orphan)' );
+};
+
+subtest 'wait_pair_released waits until the pair object is gone (#3 SMPP guard)' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+    my $s = $d->create_snapshot($bid);
+
+    # Pair still present → probe-once (interval 0) reports not-yet-released.
+    is( $d->wait_pair_released( $s->{snap_id} ), 0, 'still present → 0' );
+    # Once the pair delete lands, get_snapshot 404s → released.
+    $d->delete_snapshot( $s->{snap_id} );
+    is( $d->wait_pair_released( $s->{snap_id} ), 1, 'gone → 1' );
 };
 
 subtest 'QoS round-trip' => sub {

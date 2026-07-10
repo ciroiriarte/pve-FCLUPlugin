@@ -173,9 +173,12 @@ sub _new_snap {
     my ( $s, %o ) = @_;
     my $pvol = $o{pvol_ldev_id};
     my $sid  = "$pvol," . ( $s->{_mu}{$pvol}++ // 0 );
+    # autoSplit on (default) → the pair splits at creation (PSUS, host-accessible);
+    # auto_split=0 leaves it fully paired (PAIR) awaiting an explicit (group) split.
+    my $status = ( exists $o{auto_split} && !$o{auto_split} ) ? 'PAIR' : 'PSUS';
     $s->{snaps}{$sid} = {
         snapshotId => $sid, pvolLdevId => $pvol, svolLdevId => $o{svol_ldev_id},
-        snapshotGroupName => $o{snapshot_group}, status => 'PSUS',
+        snapshotGroupName => $o{snapshot_group}, status => $status,
     };
     return { resourceId => $sid };
 }
@@ -190,6 +193,13 @@ sub list_snapshots {
 sub get_snapshot { my ( $s, $id ) = @_; $s->_c('get_snapshot'); my $sn = $s->{snaps}{$id} or _404("GET /snapshots/$id"); return { %$sn } }
 sub delete_snapshot { my ( $s, $id ) = @_; $s->_c('delete_snapshot'); delete $s->{snaps}{$id}; return 1 }
 sub split_snapshot  { my ( $s, $id ) = @_; $s->_c('split_snapshot');  ( $s->{snaps}{$id} || _404("split") )->{status} = 'PSUS'; return 1 }
+sub split_snapshotgroup {
+    my ( $s, $group ) = @_; $s->_c('split_snapshotgroup');
+    my @m = grep { ( $s->{snaps}{$_}{snapshotGroupName} // '' ) eq $group } keys %{ $s->{snaps} };
+    _404("split-group $group") unless @m;
+    $s->{snaps}{$_}{status} = 'PSUS' for @m;   # atomic CG split: all pairs suspend together
+    return 1;
+}
 sub restore_snapshot { my ( $s, $id ) = @_; $s->_c('restore_snapshot'); ( $s->{snaps}{$id} || _404("restore") )->{status} = 'PAIR'; return 1 }
 sub assign_snapshot_volume {
     my ( $s, $id, $svol ) = @_; $s->_c('assign_snapshot_volume');

@@ -500,7 +500,8 @@ sub _create_pair {
             pvol_ldev_id   => $pvol,
             snap_pool_id   => $self->{snap_pool_id},
             snapshot_group => $opts{snapshot_group} // 'pve_snap',
-            ( $opts{is_consistency_group} ? ( is_consistency_group => 1 ) : () ),
+            ( defined $opts{auto_split}           ? ( auto_split => $opts{auto_split} )  : () ),
+            ( $opts{is_consistency_group}         ? ( is_consistency_group => 1 )        : () ),
         );
     } );
 
@@ -561,21 +562,58 @@ sub list_snapshots {
     return [ map { $self->_normalize_snap( $_, $backend_id ) } @$snaps ];
 }
 
+my $_cg_seq = 0;   # per-process disambiguator for derived CG group names
 sub create_cg_snapshot {
     my ($self, $backend_ids, %args) = @_;
     $self->_err( 'invalid', 'create_cg_snapshot needs an arrayref of backend_ids' )
         unless ref $backend_ids eq 'ARRAY' && @$backend_ids;
 
-    # A consistency-group snapshot = one pair per LU sharing a group name with
-    # isConsistencyGroup set (the reference's CG approach).
-    my $group = $args{snapshot_group} // 'pve_cg';
-    my @out;
-    for my $bid (@$backend_ids) {
-        push @out, $self->_normalize_snap(
-            $self->_create_pair( $bid, snapshot_group => $group, is_consistency_group => 1 ),
-            $bid );
+    # Crash-consistent CG snapshot (the OpenStack HBSD recipe): create EVERY pair under
+    # ONE snapshot group with isConsistencyGroup set and autoSplit OFF, let them all
+    # reach PAIR, then split the WHOLE group in a single action so every S-VOL freezes at
+    # the SAME instant. The old code looped one autoSplit pair per LU — each split fired
+    # at a different moment, so cg_snapshot was advertised but the S-VOLs were NOT mutually
+    # crash-consistent. A caller-supplied name is honoured (tests); otherwise derive a
+    # UNIQUE one (the static 'pve_cg' collided across concurrent CGs). ≤29 chars.
+    # Unique group name (unless the caller pins one): first P-VOL hex + a `_` separator +
+    # time and a per-process counter, so two CGs over the same P-VOL within one wall-clock
+    # second still get distinct names. ≤29 chars.
+    my $group = $args{snapshot_group};
+    if ( !defined $group ) {
+        $_cg_seq = ( $_cg_seq + 1 ) & 0xffff;
+        $group = substr( sprintf( 'pveC%x_%x%x', $backend_ids->[0], time(), $_cg_seq ), 0, 29 );
     }
-    return \@out;
+
+    my @pairs;
+    my $ok = eval {
+        # 1. Create all pairs unsplit under the shared consistency group.
+        for my $bid (@$backend_ids) {
+            push @pairs, [ $bid, $self->_create_pair( $bid,
+                snapshot_group => $group, is_consistency_group => 1, auto_split => 0 ) ];
+        }
+        # 2. Every pair must reach PAIR (fully paired) before the group split.
+        for my $p (@pairs) {
+            $self->_wait_snap_status( $p->[1]{snapshotId}, 'PAIR' )
+                or $self->_err( 'timeout',
+                    "CG snapshot pair '$p->[1]{snapshotId}' did not reach PAIR before the group split" );
+        }
+        # 3. One atomic split of the whole group → all S-VOLs suspend together (PSUS).
+        $self->_call( sub { $self->{rest}->split_snapshotgroup($group) } );
+        1;
+    };
+    if ( !$ok ) {
+        my $err = $@;
+        # Best-effort teardown so a partial CG (pairs created but not consistently split)
+        # does not leak S-VOLs / pool space on the shared array.
+        for my $p (@pairs) {
+            eval { $self->{rest}->delete_snapshot( $p->[1]{snapshotId} ) };
+            warn "FCLU Hitachi: CG snapshot rollback: releasing pair '$p->[1]{snapshotId}' failed: $@"
+                if $@;
+        }
+        die ref $err ? $err : "create_cg_snapshot failed: $err";
+    }
+
+    return [ map { $self->_normalize_snap( $_->[1], $_->[0] ) } @pairs ];
 }
 
 sub set_lu_qos {
@@ -685,8 +723,14 @@ sub create_linked_clone {
         # storage is the hardest to detect.
         $pair_id //= eval { $self->_find_pair_id( $backend_id, $group ) };
         if ( defined $pair_id ) {
-            eval { $self->{rest}->delete_snapshot($pair_id) };
-            warn "FCLU Hitachi: linked-clone rollback: releasing pair '$pair_id' failed: $@" if $@;
+            my $released = eval { $self->{rest}->delete_snapshot($pair_id); 1 };
+            warn "FCLU Hitachi: linked-clone rollback: releasing pair '$pair_id' failed: $@"
+                if !$released;
+            # Wait for the pair to fully dissolve before deleting the S-VOL, else the
+            # delete races the SMPP state and leaks the S-VOL on the shared pool (#3).
+            # Only when the delete SUCCEEDED — else the pair never 404s and the poll would
+            # burn its full budget inside this rollback path.
+            eval { $self->wait_pair_released($pair_id) } if $released;
         }
         eval { $self->{rest}->delete_ldev( int($svol_id) ) };
         warn "FCLU Hitachi: linked-clone rollback: deleting S-VOL '$svol_id' failed"
@@ -743,6 +787,26 @@ sub _wait_snap_status {
     return 0;
 }
 
+# #3 SMPP guard: a snapshot-pair DELETE job can return while the array still holds the
+# pair in a transient deleting state (SMPP). Deleting the S-VOL LDEV then races that and
+# is rejected, leaking the S-VOL on a shared pool. Poll until the pair object is gone
+# (get_snapshot 404s) before deleting the S-VOL. Bounded; returns 1 when gone, 0 on
+# timeout (caller proceeds best-effort). interval<=0 probes once (test fast-path).
+sub wait_pair_released {
+    my ($self, $snap_id) = @_;
+    my $budget   = $self->profile->{op_timeout_s} || 600;
+    my $interval = defined $self->{_snap_poll_interval} ? $self->{_snap_poll_interval} : 2;
+    my $elapsed  = 0;
+    while (1) {
+        my $present = eval { $self->_call( sub { $self->{rest}->get_snapshot($snap_id) } ); 1 };
+        return 1 if !$present && $self->_is_not_found($@);
+        last if $interval <= 0 || $elapsed >= $budget;
+        sleep($interval);
+        $elapsed += $interval;
+    }
+    return 0;
+}
+
 # ── Host access (§2) ──
 #
 # Migrated from the reference plugin's _ensure_host_groups / _map_lun_to_local /
@@ -759,6 +823,7 @@ sub ensure_host_access {
     my $wwns     = $ctx{initiators};
     my $hg_name  = $self->_hg_name($hostname);
     my $access_ref;   # the REAL resolved name (canonical, or an adopted legacy group)
+    my $any_access = 0;   # #4: did THIS node resolve a usable group on ANY port?
 
     my @hmo = @{ $self->{host_mode_options} };
     push @hmo, 91 if $self->{skip_unmap_io_check} && !grep { $_ == 91 } @hmo;
@@ -772,6 +837,7 @@ sub ensure_host_access {
         # whose >16-char name the array truncated in the list view, without the
         # O(host-groups) WWN scan on the common path.
         $hg = $self->_find_node_hg( $port, $wwns, $hg_name ) if !$hg;
+        my $created = 0;   # #4: did WE just create this group (→ atomic-with-WWNs)?
         if ( !$hg ) {
             $self->_call( sub {
                 $self->{rest}->create_host_group(
@@ -781,11 +847,9 @@ sub ensure_host_access {
             $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } );
             $self->_err( 'internal', "host group '$hg_name' not found on $port after creation" )
                 unless $hg;
+            $created = 1;
         }
         my $hg_num = $hg->{hostGroupNumber};
-        # The REAL name of the group we resolved — may be the canonical <prefix>_<host>
-        # we just created, OR a legacy PVE_<host> group adopted by WWN (never renamed).
-        $access_ref //= $hg->{hostGroupName};
 
         # Reconcile host-mode options additively (best-effort) — only ADD missing
         # options, never remove out-of-band ones; needed for groups predating an
@@ -841,15 +905,49 @@ sub ensure_host_access {
             if @foreign;
 
         # Register any of our WWNs not already present (best-effort, idempotent).
+        my $added = 0;
         for my $wwn (@$wwns) {
             next if $present{ lc $wwn };
-            eval {
+            if ( eval {
                 $self->{rest}->add_wwn_to_host_group(
                     port_id => $port, host_group_number => $hg_num, wwn => $wwn );
-            };
-            warn "FCLU Hitachi: WWN add warning ($port $wwn): $@" if $@;
+                1;
+            } ) {
+                $added++;
+            } else {
+                warn "FCLU Hitachi: WWN add warning ($port $wwn): $@";
+            }
         }
+
+        # #4 Atomic create: a group we JUST created that registered NONE of this node's
+        # initiators would still be a valid map target — publish_lu would map LUNs into a
+        # group the host cannot see, and it dangles empty on the shared array. That means
+        # the node is not zoned to THIS port (or every add failed): roll the empty group
+        # back (HBSD's NO_HBA_WWN_ADDED) and treat this port as no-access — but do NOT
+        # abort, since other ports may be validly zoned (asymmetric fabric). We fail loud
+        # only if NO port yields a path (after the loop). EXISTING groups stay additive/
+        # best-effort (a partial add on re-bring-up only warns — %present holds our WWNs).
+        if ( $created && !$added && !%present ) {
+            eval { $self->{rest}->delete_host_group("$port,$hg_num") };
+            warn "FCLU Hitachi: host group '$hg_name' on $port registered none of node "
+                . "'$hostname's WWNs (@$wwns) — rolled back the empty group (node likely not "
+                . "zoned to $port).\n";
+            next;
+        }
+
+        # This port resolved a usable group — the canonical <prefix>_<host> we just
+        # populated, a pre-existing group, or a legacy PVE_<host> adopted by WWN.
+        $access_ref //= $hg->{hostGroupName};
+        $any_access = 1;
     }
+
+    # Fail loud only when the node registered NO path on ANY configured port — a real
+    # zoning / HBA-login misconfig (every freshly-created group came up empty + was rolled
+    # back). A subset of working ports (asymmetric zoning) is fine and proceeds.
+    $self->_err( 'internal',
+        "node '$hostname' registered none of its WWNs (@$wwns) on ANY configured array port "
+        . "(@{ $self->{array_ports} }) — check FC zoning and HBA fabric login." )
+        unless $any_access;
 
     return $access_ref // $hg_name;
 }

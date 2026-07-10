@@ -416,6 +416,36 @@ subtest 'free_image: guards, snapshot cleanup, teardown, delete, unregister' => 
     like( $@, qr/not found in registry/, 'free of a missing volume dies' );
 };
 
+subtest 'free_image #2 id-recycle guard: a foreign LU label => unregister only, no delete' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 950, 'raw', undef, 1 << 30 );
+    my ($bid) = reg()->lookup($name);
+
+    # Simulate an LDEV id freed and re-allocated to a DIFFERENT volume: the backing LU
+    # now carries a foreign array label. free_image must refuse to unmap/delete the
+    # foreign LU and only drop the stale registry entry.
+    $T::Plugin::FAKE->{lus}{$bid}{label} = 'pve:store1:vm-777-disk-0';
+    local $SIG{__WARN__} = sub { };
+    is( $P->free_image( 'store1', {}, $name ), undef, 'free returns undef' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, undef, 'the recycled/foreign LU was NOT deleted' );
+    is( $T::Plugin::FAKE->{calls}{unpublish_lu_all}, undef, 'and it was NOT unmapped either' );
+    is( reg()->lookup($name), undef, 'the stale registry entry was dropped' );
+    ok( $T::Plugin::FAKE->{lus}{$bid}, 'the foreign LU is left intact on the array' );
+};
+
+subtest 'free_image #2 guard: a MATCHING label deletes normally' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $name = $P->alloc_image( 'store1', { pool_id => '63' }, 951, 'raw', undef, 1 << 30 );
+    # Label matches the one alloc_image set → the normal delete path runs.
+    is( $P->free_image( 'store1', {}, $name ), undef, 'free returns undef' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'matching label => LU deleted' );
+    is( reg()->lookup($name), undef, 'unregistered' );
+};
+
 subtest 'free_image refuses protected + dependents + fence' => sub {
     local $T::Plugin::FAKE = T::FakeDriver->new;
     $P->deactivate_storage( 'store1', {} );

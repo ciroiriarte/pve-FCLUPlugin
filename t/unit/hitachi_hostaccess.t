@@ -56,6 +56,11 @@ sub get_host_group {
     my ( $s, $id ) = @_; $s->_c('get_host_group');
     return $s->{hgs}{$id};
 }
+sub delete_host_group {
+    my ( $s, $id ) = @_; $s->_c('delete_host_group');
+    delete $s->{hgs}{$id};
+    return {};
+}
 sub set_host_group_mode {
     my ( $s, %o ) = @_; $s->_c('set_host_group_mode');
     $s->{hgs}{ $o{host_group_id} }{hostModeOptions} = [ @{ $o{host_mode_options} || [] } ];
@@ -204,6 +209,59 @@ subtest 'adopts a legacy PVE_<host> group by WWN under a new prefix (no rename, 
     is( $ref, 'PVE_node-a', 'adopted the legacy group name, not renamed to clsX_node-a' );
     ok( !$f->find_host_group_by_name( 'CL1-A', 'clsX_node-a' ), 'no duplicate prefixed group created' );
     is( $f->{calls}{create_host_group}, 2, 'no additional host groups created (only the 2 pre-existing)' );
+};
+
+subtest '#4 atomic create: a freshly-created group with zero WWNs is rolled back + fails loud' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => ['CL1-A'] );
+    my $err;
+    {
+        no warnings 'redefine';
+        local *FakeRest::add_wwn_to_host_group =
+            sub { die "API request failed: POST /host-wwns -> 400 EXCEED_WWN_MAX\n" };
+        local $SIG{__WARN__} = sub { };
+        eval { $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) ); 1 } or $err = $@;
+    }
+    ok( $err, 'ensure_host_access dies rather than leave an empty group' );
+    is( ref $err && $err->code, 'internal', 'zero-WWN create => internal error' );
+    like( "$err", qr/registered none|rolled the empty group/i, 'message explains the rollback' );
+    is( $f->{calls}{delete_host_group}, 1, 'the empty group was deleted (rolled back)' );
+    ok( !$f->find_host_group_by_name( 'CL1-A', 'PVE_node-a' ), 'no empty group left on the array' );
+};
+
+subtest '#4 an EXISTING group whose WWN add glitches is kept (additive/best-effort)' => sub {
+    my $f = FakeRest->new;
+    # Pre-existing group already holding this node's WWN (re-bring-up).
+    $f->create_host_group( port_id => 'CL1-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->{hgs}{'CL1-A,0'}{wwns}{'10000000c9aa'} = 1;
+    my $d = drv( $f, array_ports => ['CL1-A'] );
+    my $ok = eval { $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) ); 1 };
+    ok( $ok, 'existing group with our WWN present is not rolled back' );
+    is( $f->{calls}{delete_host_group} // 0, 0, 'no rollback of a pre-existing group' );
+};
+
+subtest '#4 asymmetric zoning: a dead port is rolled back but activation SUCCEEDS' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ] );
+    my $ref;
+    {
+        no warnings 'redefine';
+        my $orig = \&FakeRest::add_wwn_to_host_group;
+        # Node is zoned to CL1-A only; the WWN add on CL2-A fails (not logged in there).
+        local *FakeRest::add_wwn_to_host_group = sub {
+            my ( $s, %o ) = @_;
+            die "API request failed: POST /host-wwns -> 400 not logged in\n" if $o{port_id} eq 'CL2-A';
+            return $orig->( $s, %o );
+        };
+        local $SIG{__WARN__} = sub { };
+        $ref = eval { $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) ) };
+    }
+    ok( defined $ref && !ref $ref, 'activation succeeds on the working port (no abort)' );
+    is( $ref, 'PVE_node-a', 'access handle from the zoned port' );
+    is( $f->{calls}{delete_host_group}, 1, 'only the dead (CL2-A) group was rolled back' );
+    ok( $f->find_host_group_by_name( 'CL1-A', 'PVE_node-a' ), 'the working port keeps its group' );
+    ok( $f->{hgs}{'CL1-A,0'}{wwns}{'10000000c9aa'}, 'and it holds this node WWN' );
+    ok( !$f->find_host_group_by_name( 'CL2-A', 'PVE_node-a' ), 'the empty CL2-A group is gone' );
 };
 
 subtest 'publish_lu maps the ldev per port, idempotently' => sub {

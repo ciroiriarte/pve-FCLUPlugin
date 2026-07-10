@@ -652,6 +652,36 @@ sub free_image {
 
     my $d = $class->_driver( $storeid, $scfg );
 
+    # Shared-pool id-recycle guard (from the OpenStack HBSD `is_invalid_ldev` pattern):
+    # the registry maps volname -> backend_id, but on a shared array an LDEV id can be
+    # freed and re-allocated to a DIFFERENT volume. Before ANY destructive op, re-read
+    # the LU's array label; if it names a DIFFERENT volume, the id was recycled — drop
+    # the stale registry entry only and refuse to unmap/delete a foreign LU. This backs
+    # up the §7 ldev_range fence (safe_delete_precheck, above): the fence blocks a
+    # cross-store recycle when ranges are disjoint; this catches a same-range recycle.
+    #
+    # Match on the parsed VOLNAME, not raw-string equality: the label's storeid PREFIX
+    # can legitimately change form across plugin versions (readable `pve:<store>:` vs the
+    # bounded `pve:<hash>:` fallback when max_label_len shrinks), and a raw compare would
+    # then misread an owned LU as recycled and strand it. A missing/empty label or an
+    # unreadable LU falls through to the normal path (delete_lu is idempotent).
+    my $cur = eval { $d->get_lu($backend_id) };
+    if ( $cur && defined $cur->{label} && length $cur->{label} ) {
+        my $parsed   = PVE::Storage::FCLU::Label->parse_label( $cur->{label} );
+        # A parseable pve: label → compare its volname; an UNparseable/foreign label →
+        # fall back to exact-match vs our expected label (which fails → treated foreign,
+        # the safe direction: never delete an LU we cannot positively identify as ours).
+        my $mismatch = $parsed ? ( $parsed->{volname} ne $volname )
+            : ( $cur->{label} ne $class->_make_label( $storeid, $volname, $d ) );
+        if ( $mismatch ) {
+            warn "FCLU: refusing to free '$volname': backend LU '$backend_id' now carries a"
+                . " label for a different volume — the LDEV id was recycled. Dropping the"
+                . " stale registry entry only (the LU is left intact).\n";
+            $reg->unregister($volname);
+            return undef;
+        }
+    }
+
     # Delete this volume's own snapshot pairs first (capability-gated).
     if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'snapshot', 'single' ) ) {
         eval {
@@ -678,8 +708,14 @@ sub free_image {
         warn "FCLU: linked-clone pair rediscovery warning: $@" if $@;
     }
     if ( defined $backing_snap ) {
-        eval { $d->delete_snapshot($backing_snap) };
-        warn "FCLU: linked-clone pair release warning: $@" if $@;
+        my $released = eval { $d->delete_snapshot($backing_snap); 1 };
+        warn "FCLU: linked-clone pair release warning: $@" if !$released;
+        # Wait for the pair to fully dissolve before this S-VOL's LU is deleted below,
+        # so the array does not reject the delete and leak the S-VOL (#3). Only when the
+        # delete SUCCEEDED — else the pair never 404s and the poll would burn its full
+        # budget. Optional driver capability — the generic core stays vendor-neutral.
+        eval { $d->wait_pair_released($backing_snap) }
+            if $released && $d->can('wait_pair_released');
     }
 
     # Tear the host side down (detach the device + unmap THIS node) before deleting

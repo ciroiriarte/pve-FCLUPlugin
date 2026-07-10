@@ -1,4 +1,32 @@
-pve-fclu (0.1.0~alpha28) stable; urgency=medium
+pve-fclu (0.1.0~alpha29) stable; urgency=medium
+
+  * Tier-1 correctness/safety batch from the OpenStack HBSD review (hbsd-review-backlog):
+  * hitachi: crash-consistent CG snapshots. create_cg_snapshot now creates every pair
+    UNSPLIT under one snapshot group (isConsistencyGroup, autoSplit off), waits all pairs
+    to PAIR, then issues a SINGLE split_snapshotgroup so all S-VOLs suspend at the same
+    instant -- the old code split one autoSplit pair per LU, so cg_snapshot was advertised
+    but the S-VOLs were NOT mutually crash-consistent. Unique derived group name (the
+    static 'pve_cg' collided); best-effort pair sweep if the split fails (no shared-pool
+    leak). New RestClient split_snapshotgroup.
+  * core: id-recycle delete guard. free_image re-reads the LU's array label before any
+    destructive op and, if it names a different volume, drops the stale registry entry
+    WITHOUT unmapping/deleting -- backstops the ldev_range fence against a same-range LDEV
+    recycle on a shared array. Matches on the parsed volname (tolerant of a storeid-prefix
+    scheme change).
+  * hitachi: wait for a deleted snapshot pair to fully dissolve (SMPP -> gone) before
+    deleting the S-VOL, in the linked-clone rollback and free_image backing-pair release
+    -- closes a #23-class S-VOL leak on the shared pool. Skipped when the pair delete
+    itself failed (no full-budget hang).
+  * hitachi: atomic host-group create. A group we freshly create that registers NONE of
+    the node's WWNs is rolled back (HBSD NO_HBA_WWN_ADDED) and the port treated as
+    no-access; activation fails loud only if NO configured port yields a path (a partial/
+    asymmetric fabric still activates). Existing groups stay additive/best-effort.
+  * hitachi: also carries the committed fix classifying "P-VOL does not have LU paths" as
+    invalid (not not_found).
+  * Independent code review (APPROVE, no CRITICAL/HIGH): addressed the per-port-abort and
+    label-scheme MEDIUMs + the wait-budget / CG-uniqueness / CG-sweep LOWs. 197 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 10 Jul 2026 11:40:00 -0300
 
   * hitachi: simplify linked clones to a single Thin Image pair creation (the OpenStack
     HBSD recipe). create_linked_clone now creates a DP S-VOL and creates the autoSplit

@@ -689,6 +689,23 @@ sub split_snapshot {
     return $self->_wait_for_job($res);
 }
 
+sub split_snapshotgroup {
+    my ($self, $group_name) = @_;
+
+    croak "group_name is required" unless defined $group_name;
+
+    # Atomically split every pair in a snapshot group — the crash-consistent CG
+    # snapshot action: all S-VOLs suspend (PAIR->PSUS) at the same instant. The object
+    # id is the snapshot group NAME. Send {"parameters":{}} — the same empty-params form
+    # the single-pair split/restore actions require on this microcode (an operationType
+    # attribute is rejected with KART40038-E; see split_snapshot).
+    my $body = { parameters => {} };
+
+    my $res = $self->_request('POST',
+        $self->_url("/snapshot-groups/$group_name/actions/split/invoke"), $body);
+    return $self->_wait_for_job($res);
+}
+
 sub restore_snapshot {
     my ($self, $snapshot_id) = @_;
 
