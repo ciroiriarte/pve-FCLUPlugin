@@ -566,7 +566,7 @@ subtest 'clone_image: linked clone from a base + backing-pair release on free (#
     my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $base, 921, undef, 0 );
     like( $clone, qr/^vm-921-disk-\d+$/, 'clone returns a fresh volname' );
     is( $T::Plugin::FAKE->{calls}{create_linked_clone}, 1, 'driver create_linked_clone called' );
-    ok( defined $T::Plugin::FAKE->{last_clone_hctx}, 'host_ctx handed to the driver (#24)' );
+    ok( !defined $T::Plugin::FAKE->{last_clone_hctx}, 'no host_ctx passed (single-step pair recipe)' );
 
     my ( $cbid, $cmeta ) = reg()->lookup($clone);
     ok( defined $cbid, 'clone committed to the registry' );

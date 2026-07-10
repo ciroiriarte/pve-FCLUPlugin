@@ -609,14 +609,16 @@ sub _alloc_svol {
     return defined $args{requested_id} ? "$args{requested_id}" : "$res->{resourceId}";
 }
 
-# Persistent CoW child — the PVE clone_image primitive (§6). Allocate an S-VOL and
-# bind it to the parent via an autoSplit Thin Image pair.
+# Persistent CoW child — the PVE clone_image primitive (§6). Allocate a DP S-VOL and
+# bind it to the parent via a single autoSplit Thin Image pair creation.
 #
-# REAL-ARRAY FLOW (#24, verified live on the E590H): the array rejects svolLdevId at
-# pair creation ("the snapshot S-VOL does not have LU paths"), so the S-VOL must be
-# MAPPED before it can be bound to the pair. The §2 signature carries host_ctx for
-# exactly this — the driver creates the pair without an S-VOL, maps the S-VOL itself
-# (ensure_host_access + publish_lu), then assign_snapshot_volume. host_ctx is required.
+# REAL-ARRAY FLOW (verified live on the E590H, 0 used blocks on the S-VOL + CoW reads):
+# create the S-VOL as a DP volume, then create the pair WITH svolLdevId + canCascade +
+# isDataReductionForceCopy — the array binds the S-VOL at creation with NEITHER volume
+# mapped. This is the OpenStack HBSD recipe. It SUPERSEDES the old 4-step #24 workaround
+# (poolId-1 v-vol → data-only pair → map → assign_snapshot_volume): a plain svolLdevId
+# WAS rejected ("S-VOL does not have LU paths"), but the two extra flags remove that
+# constraint. host_ctx is accepted for §2 back-compat but NO LONGER used.
 sub create_linked_clone {
     my ($self, $backend_id, %args) = @_;
 
@@ -626,73 +628,59 @@ sub create_linked_clone {
     my $blocks = $src->{blockCapacity} // $src->{numOfBlocks};
     $self->_err( 'internal', 'source ldev has no block capacity' ) unless defined $blocks;
 
-    # #24 (verified live on the E590H): the array REJECTS a Thin Image pair created
-    # WITH svolLdevId — "the snapshot S-VOL does not have LU paths". The real flow is:
-    #   1. create the S-VOL as a Thin Image VIRTUAL volume (poolId -1),
-    #   2. create a DATA-ONLY autoSplit pair on the source (no svolLdevId) — snapshot
-    #      data captured, pair in PSUS,
-    #   3. MAP the S-VOL so it has LU paths (needs host context — the §2 signature now
-    #      carries host_ctx precisely for this),
-    #   4. assign the S-VOL to the pair → a persistent host-R/W copy-on-write child.
-    # (`isClone` is never set — that would full-copy then auto-delete the pair.)
-    my %hctx = %{ $args{host_ctx} || {} };
-    $self->_err( 'invalid',
-        'create_linked_clone requires host_ctx — the #24 S-VOL must be mapped before assign' )
-        unless %hctx;
+    # Space-efficient copy-on-write clone via a SINGLE Thin Image pair creation (the
+    # OpenStack HBSD recipe, verified live on the E590H: 0 used blocks on the S-VOL,
+    # CoW reads of the P-VOL, both volumes unmapped). Create the S-VOL as a DP volume
+    # (poolId = the DP pool), then create the autoSplit pair WITH svolLdevId +
+    # canCascade + isDataReductionForceCopy — the array binds the S-VOL at creation
+    # with NEITHER volume needing LU paths. This SUPERSEDES the old 4-step #24
+    # workaround (poolId-1 v-vol → data-only pair → map S-VOL → assign_snapshot_volume),
+    # which existed only because a plain svolLdevId was rejected ("S-VOL does not have
+    # LU paths"); the two extra flags remove that constraint. No host context needed —
+    # host_ctx is accepted for §2 back-compat but ignored. (`isClone` is never set;
+    # that would full-copy then auto-delete the pair.)
 
-    # 1. S-VOL as a Thin Image virtual volume (poolId -1), explicit id when requested.
+    # 1. S-VOL as a DP volume sized to the P-VOL (explicit id when requested).
     my $svol_id;
     if ( defined $args{requested_id} ) {
         $svol_id = "$args{requested_id}";
         $self->_call( sub {
-            $self->{rest}->create_ldev( pool_id => -1, block_capacity => $blocks, ldev_id => int($svol_id) );
+            $self->{rest}->create_ldev( pool_id => $self->{pool_id}, block_capacity => $blocks, ldev_id => int($svol_id) );
         } );
     } else {
-        my $res = $self->_call( sub { $self->{rest}->create_ldev( pool_id => -1, block_capacity => $blocks ) } );
+        my $res = $self->_call( sub { $self->{rest}->create_ldev( pool_id => $self->{pool_id}, block_capacity => $blocks ) } );
         $svol_id = "$res->{resourceId}";
     }
 
     my $group   = "pve_lc_$svol_id";   # unique per clone → find this exact pair
     my $pair_id = undef;
     eval {
-        # 2. Data-only split pair on the source (NO svolLdevId).
+        # 2. Create the autoSplit Thin Image pair binding pvol -> svol in ONE step.
         $self->_call( sub {
             $self->{rest}->create_snapshot(
-                pvol_ldev_id   => $backend_id,
-                snap_pool_id   => $self->{snap_pool_id},
-                snapshot_group => $group,
-                auto_split     => 1,
+                pvol_ldev_id                 => $backend_id,
+                svol_ldev_id                 => $svol_id,
+                snap_pool_id                 => $self->{snap_pool_id},
+                snapshot_group               => $group,
+                auto_split                   => 1,
+                can_cascade                  => 1,
+                is_data_reduction_force_copy => 1,
             );
         } );
         $pair_id = $self->_find_pair_id( $backend_id, $group );
         $self->_err( 'internal', "linked-clone pair '$group' not found after creation" )
             unless defined $pair_id;
-
-        # 3. Map the S-VOL locally so it has LU paths (required before assign).
-        $self->ensure_host_access(%hctx);
-        $self->publish_lu( $svol_id, %hctx );
-
-        # 4. Attach the S-VOL to the pair's snapshot data → host-R/W CoW view (PSUS).
-        $self->_call( sub { $self->{rest}->assign_snapshot_volume( $pair_id, int($svol_id) ) } );
     };
     if ( my $err = $@ ) {
-        # Reverse-order best-effort cleanup so no S-VOL/pair is orphaned on the shared
-        # pool: release the pair (frees snapshot data + unassigns the S-VOL) before
-        # deleting the LDEV (#23). Each step WARNS on failure — a silent failure would
-        # leak on shared production storage with no trail, the hardest leak to detect.
-        # Residual window: if create_snapshot took on the array but the pair is not yet
-        # visible to list_snapshots on both lookups (eventual consistency), the
-        # data-only pair can still orphan; the warn below is the operator's signal.
+        # Best-effort rollback so no S-VOL/pair is orphaned on the shared pool: release
+        # the pair (frees snapshot data + unbinds the S-VOL) before deleting the S-VOL
+        # LDEV (#23). Each step WARNS on failure — a silent leak on shared production
+        # storage is the hardest to detect.
         $pair_id //= eval { $self->_find_pair_id( $backend_id, $group ) };
         if ( defined $pair_id ) {
             eval { $self->{rest}->delete_snapshot($pair_id) };
             warn "FCLU Hitachi: linked-clone rollback: releasing pair '$pair_id' failed: $@" if $@;
-        } else {
-            warn "FCLU Hitachi: linked-clone rollback: no pair found for group '$group' —"
-                . " a data-only Thin Image pair on pvol '$backend_id' may be orphaned\n";
         }
-        eval { $self->unpublish_lu( $svol_id, %hctx ) };
-        warn "FCLU Hitachi: linked-clone rollback: unmapping S-VOL '$svol_id' failed: $@" if $@;
         eval { $self->{rest}->delete_ldev( int($svol_id) ) };
         warn "FCLU Hitachi: linked-clone rollback: deleting S-VOL '$svol_id' failed"
             . " — LEAKED on the shared pool: $@" if $@;

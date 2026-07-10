@@ -127,10 +127,10 @@ sub create_lu { my ($self) = @_; $self->_nyi('create_lu') }
 # delete_lu($backend_id). Idempotent + retry-safe: "not found" MUST be converted
 # to success internally, never raised (§12.2, §13.3).
 #
-# Teardown symmetry (§6/#24): create_linked_clone(host_ctx) MAPS the clone S-VOL to a
-# host, but the contract has no paired driver-side unmap. The CORE owns the unmap —
-# free_image runs the host teardown (this-node detach/unmap via deactivate_volume, then
-# a cluster-wide reap via the optional unpublish_lu_all) BEFORE calling delete_lu — so
+# Teardown symmetry (§6): a clone S-VOL, like any volume, is mapped on activate and the
+# contract has no paired driver-side unmap. The CORE owns the unmap — free_image runs
+# the host teardown (this-node detach/unmap via deactivate_volume, then a cluster-wide
+# reap via the optional unpublish_lu_all) BEFORE calling delete_lu — so
 # delete_lu is always invoked on an already-unmapped LU. A driver whose array refuses
 # to delete an LDEV that still has LU paths may rely on that guarantee; a driver whose
 # delete implicitly clears mappings is equally conformant.
@@ -215,11 +215,11 @@ sub list_snapshots { my ($self) = @_; $self->_nyi('list_snapshots') }
 
 # create_linked_clone($backend_id, %args) -> $backend_id. OPTIONAL (clone.linked).
 # Persistent CoW child — the PVE clone_image primitive (§6). Only advertise `clone`
-# where the backend gives a real CoW child. %args carries host_ctx (#24): on arrays
-# that require the clone S-VOL to have LU paths before it can be bound to the pair, the
-# driver maps the S-VOL itself (ensure_host_access + publish_lu) then assigns it. That
-# host mapping is undone by the core delete path, NOT a paired driver method — see
-# delete_lu (teardown symmetry).
+# where the backend gives a real space-efficient CoW child. %args may carry
+# requested_id. host_ctx is accepted for back-compat but a driver SHOULD NOT need to
+# map the clone to create it (the reference Hitachi driver binds the S-VOL at pair
+# creation, both volumes unmapped). §12.2: the pair MUST be observable to
+# list_snapshots on return so the core can release it (#23).
 sub create_linked_clone { my ($self) = @_; $self->_nyi('create_linked_clone') }
 
 # create_full_clone($backend_id, %args) -> $backend_id. OPTIONAL (copy.full).

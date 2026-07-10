@@ -926,8 +926,8 @@ sub volume_snapshot_rollback {
 # PVE copies host-side via alloc_image + the device path (§6). The array driver owns
 # the pair mechanics behind create_linked_clone; the core resolves the CoW source,
 # drives the driver, and records parentage + the backing-pair id so free_image can
-# release it (#23). %host_ctx is handed to the driver for arrays that must map the
-# S-VOL mid-flow before binding it to the pair (the E590H #24 sequence).
+# release it (#23). The driver creates the CoW child without any host context (the
+# Hitachi driver binds the S-VOL at pair creation, both volumes unmapped).
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snap, $running, $target) = @_;
 
@@ -952,7 +952,6 @@ sub clone_image {
 
     my $d        = $class->_driver( $storeid, $scfg );
     my $new_name = $reg->reserve_volname($vmid);
-    my %hctx     = %{ $class->_connector->host_context( hostname => $class->_nodename ) };
 
     # $pair is resolved inside the eval but MUST be visible to the rollback: a linked
     # clone is a split CoW pair, so undoing a partial build has to release that pair
@@ -963,7 +962,6 @@ sub clone_image {
         my $rid = $class->_alloc_backend_id( $storeid, $scfg, $d );
         $svol = $d->create_linked_clone( $clone_source,
             ( defined $rid ? ( requested_id => $rid ) : () ),
-            host_ctx => \%hctx,
         );
         die "driver create_linked_clone returned no backend_id\n" unless defined $svol;
 

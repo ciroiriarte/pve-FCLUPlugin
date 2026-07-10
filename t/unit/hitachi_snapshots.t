@@ -83,27 +83,28 @@ subtest 'QoS round-trip' => sub {
     like( $@->message, qr/non-empty hashref/, 'empty qos rejected' );
 };
 
-subtest 'create_linked_clone: #24 flow (TI vvol S-VOL, data-only pair, map, assign)' => sub {
+subtest 'create_linked_clone: single-step pair with svolLdevId (DP S-VOL, no map/assign)' => sub {
     my ( $d, $f ) = setup();
     my $bid = $d->create_lu( size_bytes => GIB );
 
-    # host_ctx is REQUIRED (#24): the S-VOL must be mapped before assign_snapshot_volume.
-    my %hctx = ( hostname => 'node-a', protocol => 'scsi-fc', initiators => ['10000000c0a80001'] );
-    my $clone = $d->create_linked_clone( $bid, host_ctx => \%hctx );
+    # No host_ctx needed: the pair is created with svolLdevId + canCascade +
+    # isDataReductionForceCopy, binding the S-VOL at creation with neither vol mapped.
+    my $clone = $d->create_linked_clone($bid);
     isnt( $clone, $bid, 'clone is a distinct LU' );
     ok( $d->get_lu($clone), 'clone ldev is gettable' );
     is( $d->get_lu($clone)->{size_bytes}, GIB, 'clone sized to parent' );
 
-    # The S-VOL was created as a Thin Image virtual volume (poolId -1), NOT from a pool.
-    is( $f->{ldevs}{$clone}{poolId}, -1, 'S-VOL is a TI virtual volume (poolId -1)' );
-    # The pair was created data-only then the S-VOL assigned to it.
-    is( $f->{calls}{assign_snapshot_volume}, 1, 'S-VOL assigned to the pair (#24)' );
+    # The S-VOL is a DP volume from the pool (NOT a poolId -1 v-vol).
+    is( $f->{ldevs}{$clone}{poolId}, '63', 'S-VOL is a DP volume from the pool' );
+    # One-step pair creation — no separate assign_snapshot_volume, no host mapping.
+    ok( !$f->{calls}{assign_snapshot_volume}, 'no assign_snapshot_volume (single-step pair)' );
+    ok( !$f->{calls}{ensure_host_access},     'no host mapping during clone' );
     my ($pair) = @{ $d->list_snapshots($bid) };
-    is( $pair->{meta}{svol}, $clone, 'pair S-VOL is the clone after assign' );
+    is( $pair->{meta}{svol}, $clone, 'pair S-VOL is the clone (bound at creation)' );
 
-    # #24 requires host_ctx — refuse without it.
-    eval { $d->create_linked_clone($bid) };
-    like( $@, qr/host_ctx/, 'create_linked_clone without host_ctx is refused' );
+    # host_ctx is accepted for back-compat but ignored (not required).
+    my $c2 = $d->create_linked_clone( $bid, host_ctx => { hostname => 'x' } );
+    ok( $d->get_lu($c2), 'host_ctx is tolerated (ignored), clone still created' );
 };
 
 subtest 'create_full_clone uses the clone (full-copy) path' => sub {

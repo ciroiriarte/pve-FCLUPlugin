@@ -631,6 +631,14 @@ sub create_snapshot {
     $body->{svolLdevId} = int($opts{svol_ldev_id}) if defined $opts{svol_ldev_id};
     $body->{copySpeed}  = int($opts{copy_speed})   if defined $opts{copy_speed};
 
+    # canCascade lets the S-VOL itself be a P-VOL of a further pair (clone chains).
+    # isDataReductionForceCopy permits the pair when the P-VOL is a data-reduction
+    # (dedup/compression) volume. Together with svolLdevId they let the array bind the
+    # S-VOL at pair creation with NEITHER volume mapped — the space-efficient linked
+    # clone recipe (per the OpenStack HBSD driver), avoiding the map-then-assign dance.
+    $body->{canCascade}               = JSON::true if $opts{can_cascade};
+    $body->{isDataReductionForceCopy} = JSON::true if $opts{is_data_reduction_force_copy};
+
     my $res = $self->_request('POST', $self->_url('/snapshots'), $body);
     return $self->_wait_for_job($res);
 }

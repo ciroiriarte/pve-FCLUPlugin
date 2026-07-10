@@ -270,9 +270,9 @@ sub run_contract_tests {
                 unless $CAP->has_feature( $cap, 'clone', 'linked' );
 
             my $bid   = $d->create_lu( size_bytes => 1 << 30 );
-            # host_ctx is part of the §2 create_linked_clone contract: a driver whose
-            # array requires the S-VOL to be mapped before binding it to the pair (#24)
-            # needs it. Drivers that do not still accept it.
+            # create_linked_clone needs no host context — a conformant driver produces
+            # the CoW child without mapping either volume. host_ctx is still accepted
+            # for back-compat, so pass it to prove it is tolerated (and ignored).
             my $clone = $d->create_linked_clone( $bid, host_ctx => { _host_ctx('node-a') } );
             like( $clone, qr/^[\w.:-]{1,255}$/, 'clone backend_id obeys charset' );
             isnt( $clone, $bid, 'clone is a distinct LU' );
