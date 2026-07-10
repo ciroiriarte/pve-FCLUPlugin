@@ -28,6 +28,8 @@ pve-fclu (0.1.0~alpha29) stable; urgency=medium
 
  -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Fri, 10 Jul 2026 11:40:00 -0300
 
+pve-fclu (0.1.0~alpha28) stable; urgency=medium
+
   * hitachi: simplify linked clones to a single Thin Image pair creation (the OpenStack
     HBSD recipe). create_linked_clone now creates a DP S-VOL and creates the autoSplit
     pair WITH svolLdevId + canCascade + isDataReductionForceCopy in ONE step -- the
