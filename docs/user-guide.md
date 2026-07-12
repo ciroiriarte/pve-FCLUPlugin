@@ -166,6 +166,48 @@ and rollback: [`migration-hitachi.md`](migration-hitachi.md).
 - **Teardown is host-first.** `deactivate`/`free` flush and remove the host device
   *before* unmapping array-side, so an unmap cannot race in-flight I/O.
 
+## Consistency groups (crash-consistent multi-volume snapshots)
+
+A **consistency group (CG)** is a named set of volumes on one store that can be
+snapshotted **atomically** — every member volume is frozen at the *same instant* on
+the array (a crash-consistent point-in-time). Use it when several disks must be
+mutually consistent: a database's data + log LUNs, an LVM volume group spread across
+disks, or an application tier spanning volumes.
+
+CG support is advertised per driver (`snapshot.consistency_group`; the Hitachi driver
+maps it to a Thin Image snapshot group split in one action).
+
+**Membership is a per-volume attribute** (`cg`), managed out-of-band with `pve-fclu-cg`.
+Because Proxmox's storage API is per-volume (no multi-volume snapshot call), a group
+snapshot is an **explicit** operation — per-volume `qm`/`pvesm` snapshots are unaffected
+and keep working. A volume belongs to **at most one** group; a group may span several
+VMs, and one VM's disks may be split across several groups.
+
+```
+# tag volumes into groups (volid or bare volname both accepted)
+pve-fclu-cg tag  <store> db   vm-100-disk-0 vm-100-disk-1
+pve-fclu-cg tag  <store> logs vm-100-disk-2
+pve-fclu-cg members <store>              # list all groups + members
+
+# take / list / delete a crash-consistent group snapshot
+pve-fclu-cg snapshot        <store> db before-upgrade
+pve-fclu-cg snapshots       <store> db
+pve-fclu-cg snapshot-delete <store> db before-upgrade
+
+pve-fclu-cg untag <store> vm-100-disk-2  # remove from its group
+```
+
+CG snapshots are recorded **separately** from PVE's per-volume snapshot view, so they
+never appear in `qm`'s snapshot list. Rollback/restore of a whole group is manual
+today (delete + reprovision, or per-member array restore); **transparent
+`qm snapshot` integration** (making a whole-VM snapshot automatically crash-consistent)
+needs an upstream Proxmox hook — Bugzilla #7812, tracked in
+`docs/rfc/consistency-group-snapshot.md`.
+
+⚠️ Application consistency (vs. crash consistency) still needs a guest quiesce
+(`qm guest exec … fsfreeze` / DB flush) **before** the group snapshot — the array only
+guarantees all LUNs freeze together, not that the guest flushed its caches first.
+
 ## Troubleshooting
 
 | Symptom | Cause & fix |

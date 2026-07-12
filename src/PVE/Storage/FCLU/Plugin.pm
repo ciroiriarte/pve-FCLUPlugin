@@ -1364,6 +1364,89 @@ sub get_volume_attribute {
     return;
 }
 
+# ── Consistency-group snapshots (§6 snapshot.consistency_group) ──
+#
+# CG membership is the per-volume `cg` attribute. Because PVE's storage API is per-volume
+# with NO multi-volume snapshot hook, a group snapshot is an EXPLICIT out-of-band operation
+# (the `pve-fclu-cg` CLI calls these) — per-volume volume_snapshot is untouched and still
+# works. It resolves every member sharing the tag and asks the driver for ONE crash-
+# consistent array snapshot (all S-VOLs frozen at the same instant). Records live under the
+# registry `cg_snapshots` subtree, SEPARATE from PVE's per-volume `snapshots` view, so they
+# never leak into volume_snapshot_info. (Transparent `qm snapshot` integration needs an
+# upstream storage hook — see docs/rfc/consistency-group-snapshot.md.)
+
+sub _cg_driver {
+    my ($class, $storeid, $scfg) = @_;
+    my $d = $class->_driver( $storeid, $scfg );
+    die "storage '$storeid' does not support consistency-group snapshots\n"
+        unless PVE::Storage::FCLU::Capabilities->has_feature(
+                   $d->capabilities, 'snapshot', 'consistency_group' )
+            && $d->can('create_cg_snapshot');
+    return $d;
+}
+
+sub cg_snapshot_create {
+    my ($class, $scfg, $storeid, $cgname, $label) = @_;
+    die "consistency-group name is required\n" unless defined $cgname && length $cgname;
+    die "snapshot label is required\n"         unless defined $label  && length $label;
+
+    my $reg     = $class->_registry($storeid);
+    my $members = $reg->find_cg_members($cgname);
+    die "consistency group '$cgname' has no members on '$storeid'\n" unless @$members;
+    die "CG snapshot '$label' already exists for group '$cgname'\n"
+        if @{ $reg->find_cg_snapshot( $cgname, $label ) };
+
+    my $d   = $class->_cg_driver( $storeid, $scfg );
+    my @ids = map { my ($bid) = $reg->lookup($_); $bid } @$members;
+
+    # One crash-consistent array snapshot across every member. On failure the driver
+    # sweeps its own partial pairs (no shared-pool leak); nothing is recorded here.
+    my $snaps  = $d->create_cg_snapshot( \@ids );
+    my %by_bid = map {; "$_->{parent_backend_id}" => $_ } @$snaps;   # leading ; forces a block
+
+    for my $i ( 0 .. $#$members ) {
+        my $descr = $by_bid{ "$ids[$i]" }
+            or die "internal: CG snapshot missing a descriptor for member '$members->[$i]'\n";
+        $reg->add_cg_snapshot( $members->[$i], $label,
+            snap_id => $descr->{snap_id},
+            group   => $descr->{meta}{group},
+            cg      => $cgname,
+        );
+    }
+    return { cg => $cgname, label => $label, members => $members };
+}
+
+sub cg_snapshot_delete {
+    my ($class, $scfg, $storeid, $cgname, $label) = @_;
+    die "consistency-group name is required\n" unless defined $cgname && length $cgname;
+    die "snapshot label is required\n"         unless defined $label  && length $label;
+
+    my $reg  = $class->_registry($storeid);
+    my $recs = $reg->find_cg_snapshot( $cgname, $label );
+    die "no CG snapshot '$label' found for group '$cgname'\n" unless @$recs;
+
+    my $d = $class->_cg_driver( $storeid, $scfg );
+    # Release every member's array pair (delete_snapshot is idempotent), then drop its
+    # record — so a re-run after a partial failure still converges.
+    for my $r (@$recs) {
+        $d->delete_snapshot( $r->{snap_id} );
+        $reg->remove_cg_snapshot( $r->{volname}, $label );
+    }
+    return 1;
+}
+
+# { cgname => { label => [ { volname, snap_id, group, cg, timestamp } ] } }, or a single
+# group's map when $cgname is given.
+sub cg_snapshot_list {
+    my ($class, $storeid, $cgname) = @_;
+    my $all = $class->_registry($storeid)->list_all_cg_snapshots();
+    return defined $cgname ? ( $all->{$cgname} // {} ) : $all;
+}
+
+# Read helpers for the CLI (keep the registry encapsulated).
+sub cg_list    { return $_[0]->_registry( $_[1] )->list_cgs }
+sub cg_members { return $_[0]->_registry( $_[1] )->find_cg_members( $_[2] ) }
+
 sub update_volume_attribute {
     my ($class, $scfg, $storeid, $volname, $attribute, $value) = @_;
 
@@ -1377,6 +1460,16 @@ sub update_volume_attribute {
     }
     if ( $attribute eq 'notes' ) {
         return $class->update_volume_notes( $scfg, $storeid, $volname, $value );
+    }
+    if ( $attribute eq 'cg' ) {
+        my $reg = $class->_registry($storeid);
+        die "Volume '$volname' not found in registry\n"
+            unless defined $reg->lookup($volname);
+        # Consistency-group membership (§6 snapshot.consistency_group). A volume belongs
+        # to at most one CG; an empty/undef value clears membership. Names are per-store.
+        $reg->update_meta( $volname,
+            cg => ( defined($value) && $value ne '' ? "$value" : undef ) );
+        return;
     }
     die "attribute '$attribute' is not supported for storage type '$scfg->{type}'\n";
 }

@@ -65,7 +65,21 @@ use PVE::Storage::FCLU::Plugin;
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
     sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
         $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
-    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1 }, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1 }, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    # One crash-consistent group snapshot across all given LDEVs: one pair per id under
+    # a shared group, returning the §12.1 descriptors the plugin records.
+    sub create_cg_snapshot {
+        my ( $s, $ids, %o ) = @_; $s->{calls}{create_cg_snapshot}++;
+        my $group = $o{snapshot_group} // ( 'cg' . ++$SEQ );
+        my @out;
+        for my $bid ( @$ids ) {
+            my $p = { snap_id => "$bid,cg" . scalar( @{ $s->{snaps}{$bid} // [] } ),
+                group => $group, svol => '' . ++$SEQ, status => 'PSUS' };
+            push @{ $s->{snaps}{$bid} }, $p;
+            push @out, $s->_snap_descr( $bid, $p );
+        }
+        return \@out;
+    }
     # Stateful snapshots: $s->{snaps}{$pvol} = [ { snap_id, group, svol, status } ].
     sub _snap_descr { my ( $s, $bid, $p ) = @_;
         { snap_id => $p->{snap_id}, parent_backend_id => "$bid", created => undef,
@@ -892,6 +906,60 @@ subtest 'base _connector loads its connector_class (regression: missing require)
     # require the module before calling ->new.
     my $conn = PVE::Storage::FCLU::Plugin->_connector;
     isa_ok( $conn, 'PVE::Storage::FCLU::Host::FCMultipath', 'base _connector returns a loaded connector instance' );
+};
+
+subtest 'consistency groups: cg attribute + explicit crash-consistent group snapshot' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    # One VM (700), three disks: two tagged into CG 'db', one into CG 'logs' — the
+    # multi-CG-per-VM case. CG membership is a per-volume attribute.
+    my @v = map { $P->alloc_image( 'store1', { pool_id => '63' }, 700, 'raw', undef, 1 << 30 ) } 1 .. 3;
+    $P->update_volume_attribute( {}, 'store1', $v[0], 'cg', 'db' );
+    $P->update_volume_attribute( {}, 'store1', $v[1], 'cg', 'db' );
+    $P->update_volume_attribute( {}, 'store1', $v[2], 'cg', 'logs' );
+
+    my $reg = reg();
+    is_deeply( $reg->find_cg_members('db'), [ sort $v[0], $v[1] ], 'db has its two members' );
+    is_deeply( $reg->find_cg_members('logs'), [ $v[2] ], 'logs has one member' );
+    is_deeply( [ sort keys %{ $reg->list_cgs() } ], [ 'db', 'logs' ],
+        'one VM spans several CGs' );
+
+    # Explicit crash-consistent snapshot of 'db' → ONE array call across both members.
+    my $r = $P->cg_snapshot_create( {}, 'store1', 'db', 'snap1' );
+    is_deeply( $r->{members}, [ sort $v[0], $v[1] ], 'snapshot covered both db members' );
+    is( $T::Plugin::FAKE->{calls}{create_cg_snapshot}, 1, 'exactly one crash-consistent array snapshot' );
+
+    # CG snapshots must NOT leak into PVE's per-volume snapshot view.
+    my $info = $P->volume_snapshot_info( {}, 'store1', $v[0] );
+    is_deeply( [ grep { $_ ne 'current' } keys %$info ], [],
+        'CG snapshot does not appear in volume_snapshot_info' );
+
+    my $list = $P->cg_snapshot_list( 'store1', 'db' );
+    ok( $list->{snap1}, 'CG snapshot is listed' );
+    is( scalar @{ $list->{snap1} }, 2, 'with both member records' );
+
+    # Per-volume snapshot STILL works on a CG member (nothing taken away).
+    $P->volume_snapshot( {}, 'store1', $v[0], 'plainsnap' );
+    ok( $P->volume_snapshot_info( {}, 'store1', $v[0] )->{plainsnap},
+        'per-volume snapshot still available on a CG member' );
+
+    # Guards.
+    eval { $P->cg_snapshot_create( {}, 'store1', 'db', 'snap1' ) };
+    like( $@, qr/already exists/, 'duplicate CG snapshot label refused' );
+    eval { $P->cg_snapshot_create( {}, 'store1', 'nope', 'x' ) };
+    like( $@, qr/no members/, 'snapshot of an empty/unknown group refused' );
+
+    # Delete the CG snapshot → array pairs released, records gone.
+    my $before = $T::Plugin::FAKE->{calls}{delete_snapshot} // 0;
+    is( $P->cg_snapshot_delete( {}, 'store1', 'db', 'snap1' ), 1, 'CG snapshot deleted' );
+    is( ( $T::Plugin::FAKE->{calls}{delete_snapshot} // 0 ) - $before, 2, 'both member pairs released' );
+    is_deeply( $P->cg_snapshot_list( 'store1', 'db' ), {}, 'no CG snapshots remain' );
+
+    # Clearing the attribute removes membership.
+    $P->update_volume_attribute( {}, 'store1', $v[2], 'cg', '' );
+    is_deeply( $reg->find_cg_members('logs'), [], 'cleared CG membership' );
 };
 
 done_testing();

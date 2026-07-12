@@ -1,3 +1,24 @@
+pve-fclu (0.1.0~alpha31) stable; urgency=medium
+
+  * Consistency groups (explicit-reference model). CG membership is a per-volume `cg`
+    attribute (update_volume_attribute); a volume belongs to at most one group, a VM may
+    span several groups, a group may span VMs. Because PVE's storage API is per-volume with
+    no multi-volume snapshot hook, a group snapshot is an EXPLICIT out-of-band operation --
+    per-volume qm/pvesm snapshots are untouched. It resolves a group's members and issues
+    ONE crash-consistent array snapshot (create_cg_snapshot -> single split_snapshotgroup).
+  * New vendor-neutral CLI `pve-fclu-cg` (ships in pve-fclu-core): tag/untag/members/
+    snapshot/snapshots/snapshot-delete. Registry gains find_cg_members/list_cgs +
+    add/remove/find/list_all_cg_snapshots (records under a separate `cg_snapshots` subtree
+    so they never leak into volume_snapshot_info). Plugin gains cg_snapshot_create/delete/
+    list, capability-gated on snapshot.consistency_group. 199 unit tests.
+  * docs/user-guide.md CG section; docs/rfc/consistency-group-snapshot.md.
+  * Upstream RFC filed as Proxmox Bugzilla #7812: an optional volume_group_snapshot storage
+    hook so a plain `qm snapshot` of a multi-disk VM becomes crash-consistent (companion to
+    #7780). Also cross-posted the latest copy_image RFC feedback to #7780 (pve-devel
+    moderation delay).
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sun, 12 Jul 2026 09:35:00 -0300
+
 pve-fclu (0.1.0~alpha30) stable; urgency=medium
 
   * hitachi: fix a `$hostname's` in the alpha29 host-group rollback warning that Perl

@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+#
+# pve-fclu-cg — manage FCLU storage consistency groups and take crash-consistent
+# group snapshots.
+#
+# A consistency group (CG) is a named set of volumes on one FCLU store. CG membership
+# is a per-volume attribute (`cg`); a volume belongs to at most one group. Because PVE's
+# storage API is per-volume with no multi-volume snapshot hook, group snapshots are an
+# EXPLICIT out-of-band operation — this tool — while per-volume `qm`/`pvesm` snapshots
+# keep working normally. A group snapshot asks the array for ONE crash-consistent
+# snapshot across every member (all volumes frozen at the same instant). Records are
+# kept separate from PVE's per-volume snapshot view.
+#
+# Usage:
+#   pve-fclu-cg tag       <storeid> <cgname> <volume> [<volume> ...]
+#   pve-fclu-cg untag     <storeid> <volume> [<volume> ...]
+#   pve-fclu-cg members   <storeid> [<cgname>]
+#   pve-fclu-cg snapshot  <storeid> <cgname> <label>
+#   pve-fclu-cg snapshots <storeid> [<cgname>]
+#   pve-fclu-cg snapshot-delete <storeid> <cgname> <label>
+#   pve-fclu-cg --help
+#
+# <volume> may be a bare volname (vm-100-disk-0) or a full volid (mystore:vm-100-disk-0).
+#
+# A CG may span several VMs, and one VM may span several CGs (membership is per-volume,
+# not per-VM). Transparent `qm snapshot` integration needs an upstream Proxmox hook —
+# see docs/rfc/consistency-group-snapshot.md.
+
+use strict;
+use warnings;
+
+use PVE::Storage;
+
+sub usage {
+    my ($err) = @_;
+    print STDERR "$err\n\n" if $err;
+    print STDERR <<'USAGE';
+usage:
+  pve-fclu-cg tag       <storeid> <cgname> <volume> [<volume> ...]
+  pve-fclu-cg untag     <storeid> <volume> [<volume> ...]
+  pve-fclu-cg members   <storeid> [<cgname>]
+  pve-fclu-cg snapshot  <storeid> <cgname> <label>
+  pve-fclu-cg snapshots <storeid> [<cgname>]
+  pve-fclu-cg snapshot-delete <storeid> <cgname> <label>
+
+  <volume> is a volname (vm-100-disk-0) or a volid (store:vm-100-disk-0).
+USAGE
+    exit( $err ? 2 : 0 );
+}
+
+usage() if !@ARGV || $ARGV[0] eq '--help' || $ARGV[0] eq '-h';
+
+my $cmd     = shift @ARGV;
+my $storeid = shift @ARGV or usage("missing <storeid>");
+
+# Resolve the concrete FCLU plugin class for this store.
+my $cfg    = PVE::Storage::config();
+my $scfg   = PVE::Storage::storage_config( $cfg, $storeid );
+my $pclass = PVE::Storage::Plugin->lookup( $scfg->{type} );
+die "store '$storeid' (type '$scfg->{type}') is not an FCLU storage\n"
+    unless $pclass->isa('PVE::Storage::FCLU::Plugin');
+
+# Accept "store:volname" or bare "volname".
+sub volname_of {
+    my ($arg) = @_;
+    return $arg =~ /^\Q$storeid\E:(.+)$/ ? $1 : $arg;
+}
+
+if ( $cmd eq 'tag' ) {
+    my $cgname = shift @ARGV or usage("tag: missing <cgname>");
+    usage("tag: at least one <volume> required") unless @ARGV;
+    for my $arg (@ARGV) {
+        my $v = volname_of($arg);
+        $pclass->update_volume_attribute( $scfg, $storeid, $v, 'cg', $cgname );
+        print "tagged $v -> cg '$cgname'\n";
+    }
+}
+elsif ( $cmd eq 'untag' ) {
+    usage("untag: at least one <volume> required") unless @ARGV;
+    for my $arg (@ARGV) {
+        my $v = volname_of($arg);
+        $pclass->update_volume_attribute( $scfg, $storeid, $v, 'cg', '' );
+        print "untagged $v\n";
+    }
+}
+elsif ( $cmd eq 'members' ) {
+    my $cgname = shift @ARGV;
+    if ( defined $cgname ) {
+        my $m = $pclass->cg_members( $storeid, $cgname );
+        print "$cgname:\n";
+        print "  $_\n" for @$m;
+        print "  (no members)\n" unless @$m;
+    }
+    else {
+        my $cgs = $pclass->cg_list($storeid);
+        usage(undef), exit 0 unless %$cgs;   # nothing tagged
+        for my $g ( sort keys %$cgs ) {
+            print "$g:\n";
+            print "  $_\n" for @{ $cgs->{$g} };
+        }
+    }
+}
+elsif ( $cmd eq 'snapshot' ) {
+    my $cgname = shift @ARGV or usage("snapshot: missing <cgname>");
+    my $label  = shift @ARGV or usage("snapshot: missing <label>");
+    my $r = $pclass->cg_snapshot_create( $scfg, $storeid, $cgname, $label );
+    printf "created crash-consistent snapshot '%s' of cg '%s' across %d member(s):\n",
+        $label, $cgname, scalar @{ $r->{members} };
+    print "  $_\n" for @{ $r->{members} };
+}
+elsif ( $cmd eq 'snapshots' ) {
+    my $cgname = shift @ARGV;
+    my $by = $pclass->cg_snapshot_list( $storeid, $cgname );
+    if ( defined $cgname ) {
+        for my $label ( sort keys %$by ) {
+            print "$cgname/$label:\n";
+            print "  $_->{volname} ($_->{snap_id})\n" for @{ $by->{$label} };
+        }
+    }
+    else {
+        for my $g ( sort keys %$by ) {
+            for my $label ( sort keys %{ $by->{$g} } ) {
+                print "$g/$label:\n";
+                print "  $_->{volname} ($_->{snap_id})\n" for @{ $by->{$g}{$label} };
+            }
+        }
+    }
+}
+elsif ( $cmd eq 'snapshot-delete' ) {
+    my $cgname = shift @ARGV or usage("snapshot-delete: missing <cgname>");
+    my $label  = shift @ARGV or usage("snapshot-delete: missing <label>");
+    $pclass->cg_snapshot_delete( $scfg, $storeid, $cgname, $label );
+    print "deleted cg snapshot '$cgname/$label'\n";
+}
+else {
+    usage("unknown command '$cmd'");
+}
+
+exit 0;

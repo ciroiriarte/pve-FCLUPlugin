@@ -200,4 +200,44 @@ subtest 'data persists to disk across instances' => sub {
     is( $e->{size_mb}, 7, 'persisted meta survives' );
 };
 
+subtest 'consistency-group membership + cg_snapshot records' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'a', cg => 'db' );
+    $r->register( 'vm-1-disk-1', 'b', cg => 'db' );
+    $r->register( 'vm-1-disk-2', 'c', cg => 'logs' );
+    $r->register( 'vm-1-disk-3', 'd' );                       # untagged
+    $r->reserve_volname(9);                                   # a reservation must be ignored
+
+    is_deeply( $r->find_cg_members('db'), [ 'vm-1-disk-0', 'vm-1-disk-1' ], 'db members' );
+    is_deeply( $r->find_cg_members('logs'), [ 'vm-1-disk-2' ], 'logs member' );
+    is_deeply( $r->find_cg_members('nope'), [], 'unknown group => empty' );
+    is_deeply( [ sort keys %{ $r->list_cgs() } ], [ 'db', 'logs' ], 'list_cgs enumerates groups' );
+
+    # clearing the attribute drops membership
+    $r->update_meta( 'vm-1-disk-1', cg => undef );
+    is_deeply( $r->find_cg_members('db'), [ 'vm-1-disk-0' ], 'cleared member gone' );
+
+    # cg_snapshot records live in their own subtree
+    $r->add_cg_snapshot( 'vm-1-disk-0', 's1', snap_id => 'a,1', group => 'g', cg => 'db' );
+    $r->add_cg_snapshot( 'vm-1-disk-2', 's1', snap_id => 'c,1', group => 'g', cg => 'logs' );
+    my $found = $r->find_cg_snapshot( 'db', 's1' );
+    is( scalar @$found, 1, 'find_cg_snapshot filters by cg' );
+    is( $found->[0]{volname}, 'vm-1-disk-0', 'right holder' );
+    is( $found->[0]{snap_id}, 'a,1', 'record carries snap_id' );
+    ok( $r->list_all_cg_snapshots()->{db}{s1}, 'list_all groups by cg then label' );
+
+    # add is idempotency-guarded
+    eval { $r->add_cg_snapshot( 'vm-1-disk-0', 's1', snap_id => 'x' ) };
+    like( $@, qr/already exists/, 'duplicate label per volume refused' );
+
+    # cg_snapshots is reserved against update_meta clobbering
+    eval { $r->update_meta( 'vm-1-disk-0', cg_snapshots => {} ) };
+    like( $@, qr/reserved key/, 'update_meta refuses cg_snapshots' );
+
+    # remove prunes the subtree
+    $r->remove_cg_snapshot( 'vm-1-disk-0', 's1' );
+    is_deeply( $r->find_cg_snapshot( 'db', 's1' ), [], 'record removed' );
+    $r->remove_cg_snapshot( 'vm-1-disk-0', 's1' );   # idempotent
+};
+
 done_testing();

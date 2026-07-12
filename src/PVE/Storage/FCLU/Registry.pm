@@ -234,7 +234,7 @@ sub update_meta {
     # neither is a free-form attribute, so refuse to let a metadata merge silently
     # overwrite them (closes an identity-bypass latent in the reference source).
     croak "update_meta must not touch reserved key '$_'"
-        for grep { exists $meta{$_} } qw(backend_id snapshots);
+        for grep { exists $meta{$_} } qw(backend_id snapshots cg_snapshots);
 
     $self->_with_registry_lock( sub {
         my ($reg) = @_;
@@ -452,6 +452,110 @@ sub list_snapshots {
     my $entry = $reg->{$volname} or return {};
 
     return $entry->{snapshots} || {};
+}
+
+# ── Consistency groups (§6 snapshot.consistency_group) ──
+#
+# CG membership is a plain per-volume attribute (`cg` => "<name>", set via
+# update_meta). A group snapshot is out-of-band (PVE's storage API is per-volume);
+# its per-member records live under a SEPARATE `cg_snapshots` subtree so they never
+# leak into volume_snapshot_info (the PVE per-volume snapshot view reads `snapshots`).
+
+# Volnames currently tagged into consistency group $cg (excludes reservations).
+sub find_cg_members {
+    my ($self, $cg) = @_;
+    croak "cg is required" unless defined $cg && length $cg;
+    my $reg = $self->load();
+    return [ sort grep {
+        ref $reg->{$_} eq 'HASH' && !$reg->{$_}{reserved}
+            && defined $reg->{$_}{cg} && $reg->{$_}{cg} eq $cg
+    } keys %$reg ];
+}
+
+# All consistency groups on this store: { cgname => [volname, ...] }.
+sub list_cgs {
+    my ($self) = @_;
+    my $reg = $self->load();
+    my %cgs;
+    for my $name ( keys %$reg ) {
+        my $e = $reg->{$name};
+        next unless ref $e eq 'HASH' && !$e->{reserved}
+            && defined $e->{cg} && length $e->{cg};
+        push @{ $cgs{ $e->{cg} } }, $name;
+    }
+    $_ = [ sort @$_ ] for values %cgs;
+    return \%cgs;
+}
+
+# Record a member's array pair for a group snapshot labelled $label. Croaks if the
+# label already exists for the volume (a partial/duplicate CG snapshot is invalid).
+sub add_cg_snapshot {
+    my ($self, $volname, $label, %rec) = @_;
+    croak "volname is required" unless $volname;
+    croak "label is required"   unless defined $label && length $label;
+
+    $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        croak "Volume '$volname' not in registry" unless ref $reg->{$volname} eq 'HASH';
+        $reg->{$volname}{cg_snapshots} //= {};
+        croak "CG snapshot '$label' already exists for '$volname'"
+            if $reg->{$volname}{cg_snapshots}{$label};
+        $reg->{$volname}{cg_snapshots}{$label} = { timestamp => time(), %rec };
+        return;
+    } );
+    return 1;
+}
+
+# Drop a member's CG-snapshot record (idempotent); prunes the empty subtree.
+sub remove_cg_snapshot {
+    my ($self, $volname, $label) = @_;
+    croak "volname is required" unless $volname;
+    croak "label is required"   unless defined $label && length $label;
+
+    $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        if ( $reg->{$volname} && $reg->{$volname}{cg_snapshots} ) {
+            delete $reg->{$volname}{cg_snapshots}{$label};
+            delete $reg->{$volname}{cg_snapshots}
+                unless %{ $reg->{$volname}{cg_snapshots} };
+        }
+        return;
+    } );
+    return 1;
+}
+
+# Every member record for a labelled CG snapshot: [ { volname, snap_id, group, cg,
+# timestamp }, ... ]. Scans the whole registry (a member may have been untagged from
+# the group after the snapshot), optionally filtered to $cg. Sorted by volname.
+sub find_cg_snapshot {
+    my ($self, $cg, $label) = @_;
+    croak "label is required" unless defined $label && length $label;
+    my $reg = $self->load();
+    my @out;
+    for my $v ( sort keys %$reg ) {
+        my $e = $reg->{$v};
+        next unless ref $e eq 'HASH';
+        my $rec = $e->{cg_snapshots} && $e->{cg_snapshots}{$label} or next;
+        next if defined $cg && ( $rec->{cg} // '' ) ne $cg;
+        push @out, { volname => $v, %$rec };
+    }
+    return \@out;
+}
+
+# All recorded CG snapshots: { cgname => { label => [ { volname, snap_id, ... } ] } }.
+sub list_all_cg_snapshots {
+    my ($self) = @_;
+    my $reg = $self->load();
+    my %by;
+    for my $v ( sort keys %$reg ) {
+        my $e = $reg->{$v};
+        next unless ref $e eq 'HASH' && $e->{cg_snapshots};
+        for my $label ( keys %{ $e->{cg_snapshots} } ) {
+            my $rec = $e->{cg_snapshots}{$label};
+            push @{ $by{ $rec->{cg} // '?' }{$label} }, { volname => $v, %$rec };
+        }
+    }
+    return \%by;
 }
 
 # ── Internal ──
