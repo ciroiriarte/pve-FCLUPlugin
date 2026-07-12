@@ -87,10 +87,19 @@ sub list_luns {
 }
 sub map_lun {
     my ( $s, %o ) = @_; $s->_c('map_lun');
+    # A requested LUN already held by ANOTHER ldev in this group is rejected (B958,0947).
+    if ( defined $o{lun} ) {
+        # ANOTHER_LDEV_MAPPED (B958,0947 = conflict) — NOT LU-path-defined; the message must
+        # not say "already" or the regex would misread it as already_exists (idempotent).
+        die "API request failed: POST /luns -> 409 Conflict the specified LUN is used by a different LDEV\n"
+            if grep { $_->{portId} eq $o{port_id} && $_->{hostGroupNumber} == $o{host_group_number}
+                       && $_->{lun} == $o{lun} && $_->{ldevId} ne "$o{ldev_id}" } @{ $s->{luns} };
+    }
+    # Honor an explicitly requested LUN (T2-6 consistent-LUN); else auto-assign.
     push @{ $s->{luns} }, {
         lunId => 'L' . $s->{_lunid}++, portId => $o{port_id},
         hostGroupNumber => $o{host_group_number}, ldevId => "$o{ldev_id}",
-        lun => $s->{_lun}++,
+        lun => ( defined $o{lun} ? $o{lun} : $s->{_lun}++ ),
     };
     $s->{ldevs}{ "$o{ldev_id}" } = 1;
     return {};
@@ -158,6 +167,16 @@ subtest 'ensure_host_access reconciles missing host-mode options (union)' => sub
     $d->ensure_host_access( ctx('node-a') );
     is_deeply( $f->{hgs}{'CL1-A,0'}{hostModeOptions}, [ 2, 22, 25, 68 ],
         'missing options added as a sorted union; existing kept' );
+};
+
+subtest 'T2-5: HMO reconcile is cached per (port,hg) across activates' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => ['CL1-A'] );
+    $d->ensure_host_access( ctx('node-a') );
+    my $g1 = $f->{calls}{get_host_group} // 0;
+    ok( $g1 >= 1, 'first activate reads the host group for HMO reconcile' );
+    $d->ensure_host_access( ctx('node-a') );
+    is( $f->{calls}{get_host_group}, $g1, 'second activate skips the get_host_group (cached)' );
 };
 
 subtest 'skip_unmap_io_check appends HMO 91' => sub {
@@ -283,6 +302,32 @@ subtest 'publish_lu maps the ldev per port, idempotently' => sub {
     # Re-publish: no new map_lun (already mapped).
     $d->publish_lu( '42', ctx('node-a') );
     is( $f->{calls}{map_lun}, 2, 'idempotent — no remap' );
+};
+
+subtest 'T2-6: consistent LUN across ports + one fewer post-map read' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ] );
+    my $m = $d->publish_lu( '42', ctx('node-a') );
+    my @luns = map { $_->{lun} } grep { $_->{ldevId} eq '42' } @{ $f->{luns} };
+    is( scalar @luns, 2, 'mapped on both ports' );
+    is( $luns[0], $luns[1], 'SAME LUN across both ports (multipath-consistent)' );
+    is( $m->{lun}, $luns[0], 'reported LUN is the head-port LUN' );
+    # Head port reads its LUN back (pre-map idempotency + post-map read = 2); the non-head
+    # port only does the pre-map idempotency read (1) — the requested LUN is already known.
+    is( $f->{calls}{list_luns}, 3, 'one fewer list_luns than the old per-port post-map read' );
+};
+
+subtest 'T2-6: a requested LUN taken by another ldev falls back to auto-assign' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ] );
+    # Pre-occupy LUN 0 on CL2-A with a FOREIGN ldev (explicit LUN keeps the fake's
+    # auto-assign counter at 0, so the head port then also picks 0 and forces the clash).
+    $f->map_lun( port_id => 'CL2-A', host_group_number => 0, ldev_id => '77', lun => 0 );
+    my $m = $d->publish_lu( '42', ctx('node-a') );
+    my %by_port = map { $_->{portId} => $_->{lun} } grep { $_->{ldevId} eq '42' } @{ $f->{luns} };
+    is( scalar keys %by_port, 2, 'mapped on both ports despite the collision' );
+    isnt( $by_port{'CL1-A'}, $by_port{'CL2-A'}, 'CL2-A auto-assigned a different LUN (no mis-map)' );
+    ok( defined $m->{lun}, 'a LUN is still reported' );
 };
 
 subtest 'publish_lu SAFETY GATE: refuses to map into a group holding a foreign WWN' => sub {

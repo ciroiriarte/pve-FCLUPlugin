@@ -979,7 +979,12 @@ sub ensure_host_access {
         # Reconcile host-mode options additively (best-effort) — only ADD missing
         # options, never remove out-of-band ones; needed for groups predating an
         # HMO change so UNMAP/discard gets enabled.
-        if (@hmo) {
+        # T2-5: once a (port,hg) is confirmed to carry all required HMOs, cache that for the
+        # process so subsequent per-disk activates in a multi-disk clone skip this
+        # get_host_group read (a per-disk×per-port amplifier, GH#17). Process-lifetime,
+        # best-effort — same tradeoff as the host-group list cache; HMO is config-driven and
+        # rarely changes out-of-band, and this stays warn-only.
+        if ( @hmo && !$self->{_hmo_ok}{"$port,$hg_num"} ) {
             eval {
                 my $info    = $self->{rest}->get_host_group("$port,$hg_num");
                 my @current = @{ $info->{hostModeOptions} || [] };
@@ -990,6 +995,7 @@ sub ensure_host_access {
                         host_group_id => "$port,$hg_num",
                         host_mode => $self->{host_mode}, host_mode_options => \@union );
                 }
+                $self->{_hmo_ok}{"$port,$hg_num"} = 1;   # all required HMOs now present
             };
             warn "FCLU Hitachi: HMO reconcile warning ($port,$hg_num): $@" if $@;
         }
@@ -1054,6 +1060,7 @@ sub ensure_host_access {
         # best-effort (a partial add on re-bring-up only warns — %present holds our WWNs).
         if ( $created && !$added && !%present ) {
             eval { $self->{rest}->delete_host_group("$port,$hg_num") };
+            delete $self->{_hmo_ok}{"$port,$hg_num"};   # the (port,hgnum) is gone; drop its HMO cache
             warn "FCLU Hitachi: host group '$hg_name' on $port registered none of node "
                 . "'$hostname' WWNs (@$wwns) — rolled back the empty group (node likely not "
                 . "zoned to $port).\n";
@@ -1092,13 +1099,14 @@ sub _hg_name {
 # (array_busy) — bounded retry, mirroring the snapshot-pair poll discipline. Test knobs:
 # _lun_op_tries / _lun_op_delay.
 sub _map_lun_settled {
-    my ($self, $port, $hg_num, $backend_id) = @_;
+    my ($self, $port, $hg_num, $backend_id, %opts) = @_;
     my $tries = $self->{_lun_op_tries} // 12;
     my $delay = defined $self->{_lun_op_delay} ? $self->{_lun_op_delay} : 5;
     for my $i ( 1 .. $tries ) {
         return 1 if eval {
             $self->{rest}->map_lun(
-                port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+                port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id,
+                ( defined $opts{lun} ? ( lun => $opts{lun} ) : () ) );   # T2-6: request a specific LUN
             1;
         };
         my $err = $self->_translate_rest_error($@);
@@ -1149,12 +1157,37 @@ sub reclaim_empty_host_groups {
         my $luns = eval { $self->{rest}->list_luns( port_id => $port, host_group_number => $hg_num ) };
         next if $@ || ref $luns ne 'ARRAY' || @$luns;
         if ( eval { $self->{rest}->delete_host_group("$port,$hg_num"); 1 } ) {
+            delete $self->{_hmo_ok}{"$port,$hg_num"};   # reaped — drop its HMO cache
             push @reaped, "$port,$hg_num";
         } else {
             warn "FCLU Hitachi: reclaim of empty host group ($port,#$hg_num) failed: $@";
         }
     }
     return \@reaped;
+}
+
+# T2-6: map the ldev and RETURN its LUN. On the head port $want_lun is undef → the array
+# auto-assigns and we read the LUN back. On the other ports $want_lun is the head port's
+# LUN → we REQUEST it, so (a) multipath sees ONE consistent LUN across every path and (b)
+# we already KNOW the LUN, avoiding a post-map list_luns read per port (the GH#17 amplifier).
+# If the array rejects the requested LUN because it is taken by ANOTHER ldev on that port
+# (conflict / B958,0947), fall back to auto-assign there and read the assigned LUN. The
+# returned LUN is best-effort/informational: under a concurrent-publish race the port could
+# already be at a different LUN (LU-path-already-defined = success) — harmless, since the
+# host attaches by NAA identity (multipath coalesces by WWID), never by the reported LUN.
+sub _map_lun_consistent {
+    my ($self, $port, $hg_num, $backend_id, $want_lun) = @_;
+    if ( defined $want_lun ) {
+        return $want_lun
+            if eval { $self->_map_lun_settled( $port, $hg_num, $backend_id, lun => $want_lun ); 1 };
+        my $err = $self->_translate_rest_error($@);
+        die $err unless $err->code eq 'conflict';   # LUN taken by another ldev → auto-assign
+    }
+    $self->_map_lun_settled( $port, $hg_num, $backend_id );
+    my $luns = $self->_call( sub {
+        $self->{rest}->list_luns( port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+    } );
+    return ( @$luns && defined $luns->[0]{lun} ) ? $luns->[0]{lun} : undef;
 }
 
 sub publish_lu {
@@ -1173,7 +1206,7 @@ sub publish_lu {
     my $hg_name = $self->ensure_host_access(%ctx);
     my $wwns = $ctx{initiators};
 
-    my ( $lun, $access_ref );
+    my ( $head_lun, $access_ref );
     for my $port ( @{ $self->{array_ports} } ) {
         # #1 SAFETY GATE: resolve the node's group AND prove ownership (fresh WWN read)
         # before mapping — never map into a foreign/number-reused group.
@@ -1182,21 +1215,19 @@ sub publish_lu {
         $access_ref //= $hg->{hostGroupName};   # the real group name (may be an adopted legacy name)
         my $hg_num = $hg->{hostGroupNumber};
 
+        # Idempotency: is this ldev already mapped on this port? (kept — avoids a duplicate
+        # map and reuses an existing/legacy LUN.)
         my $luns = $self->_call( sub {
             $self->{rest}->list_luns(
                 port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
         } );
-        if ( !@$luns ) {
-            $self->_map_lun_settled( $port, $hg_num, $backend_id );   # N8: idempotent + retry
-            $luns = $self->_call( sub {
-                $self->{rest}->list_luns(
-                    port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
-            } );
-        }
-        $lun //= $luns->[0]{lun} if @$luns && defined $luns->[0]{lun};
+        my $lun = ( @$luns && defined $luns->[0]{lun} )
+            ? $luns->[0]{lun}                                        # already mapped — reuse
+            : $self->_map_lun_consistent( $port, $hg_num, $backend_id, $head_lun );   # T2-6
+        $head_lun //= $lun if defined $lun;
     }
 
-    return { hostname => $hostname, access_ref => $access_ref // $self->_hg_name($hostname), lun => $lun };
+    return { hostname => $hostname, access_ref => $access_ref // $self->_hg_name($hostname), lun => $head_lun };
 }
 
 sub unpublish_lu {

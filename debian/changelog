@@ -1,3 +1,21 @@
+pve-fclu (0.1.0~alpha34) stable; urgency=medium
+
+  * hitachi: cut clone host-mapping REST amplification (HBSD backlog T2, GH #17).
+  * T2-6 consistent LUN-id across a node's ports: publish_lu maps the ldev on the HEAD
+    port (array auto-assigns), captures the LUN, then REQUESTS that same LUN on the other
+    ports -- so multipath sees ONE consistent LUN across every path AND the LUN is known
+    without a post-map list_luns read per non-head port (the query amplifier). If the
+    requested LUN is held by another ldev on a port (conflict / SSB B958,0947) it falls
+    back to auto-assign there. map_lun gains an explicit-lun option.
+  * T2-5 HMO-reconcile cache: once a (port,host-group) is confirmed to carry the required
+    host-mode options, cache that for the process so subsequent per-disk activates in a
+    multi-disk clone skip the get_host_group read (a per-disk x per-port amplifier).
+  * Net: for an N-port node, ~N-1 fewer list_luns per disk mapped + the HMO get_host_group
+    dropped after the first disk. The WWN-ownership safety gate (fresh reads) is untouched.
+    213 unit tests; independent code review.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sun, 12 Jul 2026 12:30:00 -0300
+
 pve-fclu (0.1.0~alpha33) stable; urgency=medium
 
   * hitachi: structured messageId/SSB error classification (HBSD backlog T3-8). The
