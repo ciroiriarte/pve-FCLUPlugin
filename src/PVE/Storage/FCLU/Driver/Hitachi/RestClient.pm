@@ -9,6 +9,20 @@ use JSON qw(encode_json decode_json);
 use Carp qw(croak);
 use Time::HiRes ();
 
+# T3-8: a structured Hitachi REST error. Carries the array's messageId + SSB error code
+# (errorCode.SSB1/SSB2) so the driver can classify off the stable code — instead of the
+# fragile English message text — while STRINGIFYING to the same human string the code used
+# to croak, so every existing `warn "... $@"`, string-regex, and test keeps working.
+{
+    package PVE::Storage::FCLU::Driver::Hitachi::RestError;
+    use overload '""' => sub { $_[0]->{message} // '' }, fallback => 1;
+    sub new         { my ($c, %o) = @_; bless {%o}, $c }
+    sub message_id  { $_[0]->{message_id} }
+    sub ssb1        { $_[0]->{ssb1} }
+    sub ssb2        { $_[0]->{ssb2} }
+    sub http_status { $_[0]->{http_status} }
+}
+
 # Default timeouts and retry settings
 my $DEFAULT_TIMEOUT     = 30;
 my $JOB_POLL_INTERVAL   = 2;
@@ -171,6 +185,25 @@ sub _is_connect_phase_error {
                  | network\s+is\s+unreachable
                  | name\s+or\s+service\s+not\s+known
                  | temporary\s+failure\s+in\s+name\s+resolution/ix ? 1 : 0;
+}
+
+# T3-8: pull the array's structured error fields (messageId + errorCode.SSB1/SSB2) from a
+# decoded CM REST error object — the top-level body or a nested `error`/`errorObject`.
+# Returns a (possibly empty) key/value list for RestError->new.
+sub _extract_error_fields {
+    my ($self, $obj) = @_;
+    return () unless ref $obj eq 'HASH';
+    my $e = ( ref $obj->{error}       eq 'HASH' ) ? $obj->{error}
+          : ( ref $obj->{errorObject} eq 'HASH' ) ? $obj->{errorObject}
+          :                                          $obj;
+    my $ec = ( ref $e->{errorCode} eq 'HASH' ) ? $e->{errorCode} : {};
+    my %f;
+    $f{message_id} = $e->{messageId} if defined $e->{messageId} && length $e->{messageId};
+    my ( $s1, $s2 ) = ( $ec->{SSB1}, $ec->{SSB2} );
+    if ( defined $s1 && length $s1 && defined $s2 && length $s2 ) {
+        ( $f{ssb1}, $f{ssb2} ) = ( uc $s1, uc $s2 );
+    }
+    return %f;
 }
 
 # Rewrite the scheme+authority of an absolute URL to the current endpoint, so a
@@ -1223,7 +1256,15 @@ sub _request {
         last;
     }
 
-    croak "API request failed: $method $url -> " . $res->status_line . " " . ($res->content || '');
+    # T3-8: throw a structured RestError carrying the array's messageId + SSB code (from the
+    # error body) so the driver classifies off the stable code, not the English text. It
+    # stringifies to the same human string, so string-matching callers are unaffected.
+    my %ef = $self->_extract_error_fields( eval { decode_json( $res->content // '' ) } );
+    die PVE::Storage::FCLU::Driver::Hitachi::RestError->new(
+        message     => "API request failed: $method $url -> " . $res->status_line . " " . ($res->content || ''),
+        http_status => $res->code,
+        %ef,
+    );
 }
 
 sub _wait_for_job {
@@ -1284,7 +1325,11 @@ sub _wait_for_job {
 
         if ($state eq 'Failed' || $state eq 'Unknown') {
             my $error = $job->{error} || {};
-            croak "Job $job_id failed: " . ($error->{message} || $state);
+            # T3-8: preserve the job error's messageId + SSB code in the thrown RestError.
+            die PVE::Storage::FCLU::Driver::Hitachi::RestError->new(
+                message => "Job $job_id failed: " . ($error->{message} || $state),
+                $self->_extract_error_fields($error),
+            );
         }
     }
 

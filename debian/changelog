@@ -1,3 +1,21 @@
+pve-fclu (0.1.0~alpha33) stable; urgency=medium
+
+  * hitachi: structured messageId/SSB error classification (HBSD backlog T3-8). The
+    RestClient now throws a `RestError` carrying the array's `messageId` +
+    `errorCode.SSB1/SSB2` (extracted from the CM REST error body / job error) instead of a
+    bare string; it stringifies to the same human message so every existing warn/regex/
+    re-die keeps working. `_translate_rest_error` classifies off the STABLE code first
+    (SSB pairs + KART ids -> §13 codes: 2E22/0001 & B958/015A already_exists, B958/0947
+    conflict, B957/4184 & 2E11/2209 limit, 2E30/600E invalid, 2E11/2205-2207 &
+    KART00003-E & KART40050-52-E array_busy, KART30013-E not_found), falling back to the
+    HTTP-status + English-text regex only when the array gives no code we recognise. This
+    retires the fragile English-regex band-aids (e.g. the "does not have LU paths"
+    ordering hack): a stable code now wins over misleading message text, and the
+    messageId/SSB are preserved in the error's vendor blob for logs. 210 unit tests;
+    independent code review.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sun, 12 Jul 2026 11:55:00 -0300
+
 pve-fclu (0.1.0~alpha32) stable; urgency=medium
 
   * OpenStack HBSD re-review batch (net-new items N1-N16; replication-gated + a few larger

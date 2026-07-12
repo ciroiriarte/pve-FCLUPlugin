@@ -7,6 +7,7 @@ use Test::More;
 
 use lib 'src';
 use PVE::Storage::FCLU::Driver::Hitachi;
+use PVE::Storage::FCLU::Driver::Hitachi::RestClient;   # defines the RestError class
 use PVE::Storage::FCLU::Capabilities;
 
 # §9 Phase 1 step 3 (slice A): the Driver::Hitachi spine — profile/port selection
@@ -139,6 +140,48 @@ subtest '_call rethrows a translated error and passes success through' => sub {
 
     $m->{plan}{get_pool} = sub { { ok => 1 } };
     is_deeply( $d->_call( sub { $m->get_pool } ), { ok => 1 }, 'success passes through' );
+};
+
+subtest 'T3-8: _translate classifies off structured messageId/SSB code first' => sub {
+    my $d = drv();
+    my $RE = 'PVE::Storage::FCLU::Driver::Hitachi::RestError';
+
+    my %ssb = (
+        '2E22,0001' => 'already_exists',   # LDEV already defined
+        'B958,015A' => 'already_exists',   # LU path already defined
+        'B958,0947' => 'conflict',         # another LDEV mapped
+        'B957,4184' => 'limit',            # exceed max WWN
+        '2E11,2209' => 'limit',            # no available ldev id
+        '2E30,600E' => 'invalid',          # invalid snapshot pool
+        '2E11,2205' => 'array_busy',       # resource locked
+        '2E11,2206' => 'array_busy',       # resource locked (mid of the 2205-2207 range)
+    );
+    for my $k ( sort keys %ssb ) {
+        my ( $s1, $s2 ) = split /,/, $k;
+        my $e = $d->_translate_rest_error(
+            $RE->new( message => "Job 5 failed: whatever", ssb1 => $s1, ssb2 => $s2 ) );
+        is( $e->code, $ssb{$k}, "SSB $k -> $ssb{$k}" );
+        is( $e->vendor->{ssb}, $k, "SSB $k preserved in vendor blob" );
+    }
+
+    # messageId classification.
+    is( $d->_translate_rest_error( $RE->new( message => 'Job 1 failed: busy', message_id => 'KART00003-E' ) )->code,
+        'array_busy', 'KART00003-E (REST busy) -> array_busy' );
+    my $nf = $d->_translate_rest_error( $RE->new( message => 'Job 2 failed: gone', message_id => 'KART30013-E' ) );
+    is( $nf->code, 'not_found', 'KART30013-E -> not_found' );
+    is( $nf->vendor->{message_id}, 'KART30013-E', 'messageId preserved in vendor blob' );
+
+    # PRECEDENCE: a stable code wins over misleading English text. The array phrases
+    # LDEV-already-defined with "... does not exist" nearby, which the regex would call
+    # not_found; the SSB pins it to already_exists.
+    my $p = $d->_translate_rest_error( $RE->new(
+        message => 'Job 3 failed: the specified object does not exist', ssb1 => '2E22', ssb2 => '0001' ) );
+    is( $p->code, 'already_exists', 'structured SSB overrides the "does not exist" regex' );
+
+    # Fallback: a RestError with NO structured code still classifies off HTTP status.
+    my $fb = $d->_translate_rest_error(
+        $RE->new( message => 'API request failed: POST https://a/ldevs -> 409 Conflict locked', http_status => 409 ) );
+    is( $fb->code, 'conflict', 'no SSB -> falls back to the HTTP-status regex' );
 };
 
 done_testing();

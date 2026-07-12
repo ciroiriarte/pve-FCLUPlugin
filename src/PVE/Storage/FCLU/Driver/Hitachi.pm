@@ -237,17 +237,66 @@ my %CODE_MESSAGE = (
 # status first, then job/transport/keyword heuristics. The admin-facing `message`
 # is a normalized per-code string (no raw payload, §13.5); the raw text is carried
 # in `vendor` for the task log only.
+# T3-8: HBSD's SSB1,SSB2 error-code pairs (keyed "SSB1,SSB2", uppercased) → §13 codes.
+# Exact classification where the array's English message is fragile / locale-dependent.
+my %SSB_CODE = (
+    '2E22,0001' => 'already_exists',   # LDEV already defined
+    'B958,015A' => 'already_exists',   # LU path already defined
+    'B958,0947' => 'conflict',         # another LDEV already mapped at this LUN
+    'B957,4184' => 'limit',            # exceed max WWN per host group
+    '2E11,2209' => 'limit',            # no available LDEV id
+    '2E10,2302' => 'limit',            # max consistency-group count exceeded
+    '2E13,9900' => 'limit',            # max pairs in a consistency group exceeded
+    '2E30,600E' => 'invalid',          # invalid snapshot pool
+    '2E11,2205' => 'array_busy',       # resource locked (transient)
+    '2E11,2206' => 'array_busy',       # resource locked (transient)
+    '2E11,2207' => 'array_busy',       # resource locked (transient)
+);
+# messageId (KART id) → §13 code.
+my %MSGID_CODE = (
+    'KART00003-E' => 'array_busy',     # REST server busy
+    'KART40050-E' => 'array_busy',     # lock failure
+    'KART40051-E' => 'array_busy',
+    'KART40052-E' => 'array_busy',
+    'KART30013-E' => 'not_found',      # specified object does not exist
+);
+
+# Classify off the array's stable messageId / SSB code, or undef if unrecognized.
+sub _classify_structured_error {
+    my ($self, $mid, $ssb1, $ssb2) = @_;
+    if ( defined $ssb1 && defined $ssb2 ) {
+        my $c = $SSB_CODE{ uc("$ssb1,$ssb2") };
+        return $c if $c;
+    }
+    return $MSGID_CODE{$mid} if defined $mid && $MSGID_CODE{$mid};
+    return undef;
+}
+
 sub _translate_rest_error {
     my ($self, $err) = @_;
 
     # Already normalized (e.g. a nested _call) — pass through unchanged.
     return $err if ref $err && eval { $err->isa('PVE::Storage::FCLU::Error') };
 
+    # T3-8: RestClient throws a RestError carrying the array's messageId + SSB code for
+    # array/job failures; a plain string croak (transport, timeout, required-field) has none
+    # and drops straight to the HTTP-status / English-text path below.
+    my ($mid, $ssb1, $ssb2, $http);
+    if ( ref $err && eval { $err->isa('PVE::Storage::FCLU::Driver::Hitachi::RestError') } ) {
+        ($mid, $ssb1, $ssb2, $http) = ( $err->message_id, $err->ssb1, $err->ssb2, $err->http_status );
+    }
+
     my $msg = "$err";
     $msg =~ s/\s+\z//;
 
-    my $code;
-    if ( my ($status) = $msg =~ /->\s*(\d{3})\b/ ) {
+    # Stable code FIRST; HTTP status + English regex are the fallback when the array gave no
+    # code we recognize. Prefer the RestError's carried http_status over re-parsing the
+    # message (which the string form still supports for plain-string dies).
+    my $code = $self->_classify_structured_error( $mid, $ssb1, $ssb2 );
+
+    my $status = $http;
+    ($status) = $msg =~ /->\s*(\d{3})\b/ unless defined $status;
+    if ( !defined $code && defined $status ) {
         if    ( $status == 401 || $status == 403 ) { $code = 'auth' }
         elsif ( $status == 404 )                   { $code = 'not_found' }
         elsif ( $status == 409 ) { $code = $msg =~ /alread|exist|duplicate/i ? 'already_exists' : 'conflict' }
@@ -287,7 +336,11 @@ sub _translate_rest_error {
     return PVE::Storage::FCLU::Error->new(
         code    => $code,
         message => "Hitachi: $CODE_MESSAGE{$code}",
-        vendor  => { raw => $msg },
+        vendor  => {
+            raw => $msg,
+            ( defined $mid  ? ( message_id => $mid )       : () ),
+            ( defined $ssb1 ? ( ssb => uc("$ssb1,$ssb2") ) : () ),
+        },
     );
 }
 
