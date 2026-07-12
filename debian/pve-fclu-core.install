@@ -8,3 +8,4 @@ usr/share/perl5/PVE/Storage/FCLU/Driver.pm
 usr/share/perl5/PVE/Storage/FCLU/Host/Connector.pm
 usr/share/perl5/PVE/Storage/FCLU/Host/FCMultipath.pm
 usr/bin/pve-fclu-cg
+usr/bin/pve-fclu-host

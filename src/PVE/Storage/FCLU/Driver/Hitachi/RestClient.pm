@@ -77,9 +77,17 @@ sub new {
         $ssl_opts{SSL_ca_file}     = $opts{tls_ca_file} if $opts{tls_ca_file};
     }
 
+    # N5: enable HTTP keep-alive so one TCP+TLS connection is REUSED across a
+    # create-then-poll sequence and the per-port host-group/LUN calls in the clone hot
+    # path, instead of a fresh handshake per request (TLS handshakes dominate against a
+    # slow GUM — GH #17). N10: the socket timeout is configurable via `http_timeout`; LWP
+    # applies one timeout to both connect and read, so the default stays the validated 30s
+    # (connect-refused is instant regardless; raise it only for an unusually slow GUM whose
+    # single GETs — e.g. a large range scan — legitimately run long).
     my $ua = LWP::UserAgent->new(
-        timeout  => $opts{timeout} || $DEFAULT_TIMEOUT,
-        ssl_opts => \%ssl_opts,
+        timeout    => $opts{http_timeout} || $opts{timeout} || $DEFAULT_TIMEOUT,
+        keep_alive => 1,
+        ssl_opts   => \%ssl_opts,
     );
 
     my $self = bless {
@@ -146,6 +154,23 @@ sub _is_transport_error {
     my ($self, $res) = @_;
     return 0 unless $res;
     return ($res->header('Client-Warning') // '') eq 'Internal response' ? 1 : 0;
+}
+
+# N9: is this transport error CONNECT-phase — i.e. the request provably never left the
+# client, so a resend cannot double-apply a non-idempotent POST? Only a small allowlist of
+# LWP-synthesized connect messages qualify; a READ timeout (the array may already hold the
+# request) and anything ambiguous return false, so a POST is NOT resent for those.
+sub _is_connect_phase_error {
+    my ($self, $res) = @_;
+    return 0 unless $res;
+    my $m = ( $res->content // '' ) . ' ' . ( $res->message // '' );
+    return 0 if $m =~ /read timeout/i;   # response phase — may already be applied
+    return $m =~ /can'?t connect
+                 | connection\s+refused
+                 | no\s+route\s+to\s+host
+                 | network\s+is\s+unreachable
+                 | name\s+or\s+service\s+not\s+known
+                 | temporary\s+failure\s+in\s+name\s+resolution/ix ? 1 : 0;
 }
 
 # Rewrite the scheme+authority of an absolute URL to the current endpoint, so a
@@ -1104,7 +1129,18 @@ sub _request {
         if ($res->is_success) {
             my $content = $res->content;
             if ($content && length($content) > 0) {
-                return decode_json($content);
+                # N11: only decode when the body is actually JSON. An interposed auth
+                # portal / reverse proxy / GUM can return an HTML 200 — surface that as a
+                # classified error instead of an opaque decode_json die with no HTTP status
+                # for _translate_rest_error to key on.
+                my $ct = $res->content_type // '';
+                croak "API request failed: $method $url -> 200 non-JSON response"
+                    . " (content-type '$ct')"
+                    unless $ct =~ /json/i;
+                my $data = eval { decode_json($content) };
+                croak "API request failed: $method $url -> 200 with an unparseable JSON body: $@"
+                    if $@;
+                return $data;
             }
 
             # For async operations, extract job URL from Location or response headers
@@ -1137,6 +1173,24 @@ sub _request {
             # Re-apply auth for the survivor: basic auth is host-independent, the
             # session token is per-controller and was just refreshed by login().
             $self->_apply_auth($req);
+            next;
+        }
+
+        # N9: a GENUINE transport error (an LWP-synthesized response, not a server status)
+        # means no HTTP reply arrived. For an IDEMPOTENT method it is always safe to resend.
+        # For a non-idempotent POST it is safe ONLY when the failure is clearly CONNECT-phase
+        # (connection refused / host unreachable / DNS — the request never left the client);
+        # a READ timeout may mean the array already RECEIVED and applied the request (e.g. the
+        # RELATIVE expand_ldev), so resending would double-apply. LWP stamps the same
+        # Client-Warning on both, so we distinguish by the synthesized message. When there is
+        # nothing to fail over to (single endpoint / floating VIP), retry here rather than
+        # croaking; a server-returned 5xx is NOT a transport error and gates on idempotency
+        # below.
+        my $idempotent_n9 = $method =~ /^(?:GET|PUT|DELETE|HEAD)$/i;
+        if ($self->_is_transport_error($res) && !$skip_reauth && $retries < $MAX_RETRIES
+            && ($idempotent_n9 || $self->_is_connect_phase_error($res))) {
+            $retries++;
+            sleep($self->_retry_delay($retries, $res));
             next;
         }
 
@@ -1213,10 +1267,15 @@ sub _wait_for_job {
         if ($state eq 'Succeeded') {
             my $affected = $job->{affectedResources} || [];
             if (@$affected) {
-                # Extract resource ID from the last path segment
+                # Extract the resource id from the last path segment. N16: a pure-numeric
+                # tail (LDEV) becomes an int for back-compat; a COMPOSITE id — host group
+                # ".../host-groups/CL1-A,0", LUN ".../luns/CL1-A,0,1" — is kept as the full
+                # last segment (an opaque string), instead of being missed by a numeric-only
+                # regex and degrading to a bare resourceUrl.
                 my $resource_url = $affected->[0];
-                if ($resource_url =~ m{/(\d+)$}) {
-                    return { resourceId => int($1), jobId => $job_id };
+                if ( my ($last) = $resource_url =~ m{/([^/]+)$} ) {
+                    return { resourceId => ( $last =~ /^\d+$/ ? int($last) : $last ),
+                             jobId => $job_id };
                 }
                 return { resourceUrl => $resource_url, jobId => $job_id };
             }

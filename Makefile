@@ -53,6 +53,7 @@ install:
 	install -m0644 src/PVE/Storage/FCLU/Migrate/Hitachi.pm $(FCLU)/Migrate/
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m0755 bin/pve-fclu-cg $(DESTDIR)$(PREFIX)/bin/
+	install -m0755 bin/pve-fclu-host $(DESTDIR)$(PREFIX)/bin/
 	install -m0755 bin/pve-fclu-migrate-hitachi $(DESTDIR)$(PREFIX)/bin/
 	# --- pve-fclu-hitachi: web UI panel, opt-in SCSI-3 PR units, config examples ---
 	install -d $(PVE_MANAGER_JS)

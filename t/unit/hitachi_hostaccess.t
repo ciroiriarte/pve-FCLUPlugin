@@ -114,13 +114,15 @@ package main;
 
 sub drv {
     my ($fake, %o) = @_;
-    return PVE::Storage::FCLU::Driver::Hitachi->new(
+    my $d = PVE::Storage::FCLU::Driver::Hitachi->new(
         platform => 'vsp_e', rest => $fake,
         array_ports => $o{array_ports} // [ 'CL1-A', 'CL2-A' ],
         host_mode_options => $o{hmo} // [ 2, 22, 25, 68 ],
         ( $o{skip_unmap} ? ( skip_unmap_io_check => 1 ) : () ),
         ( defined $o{prefix} ? ( host_group_prefix => $o{prefix} ) : () ),
     );
+    $d->{_lun_op_delay} = 0;   # N8: no real sleeps in the map/unmap retry loops under test
+    return $d;
 }
 sub ctx { my ( $h, @w ) = @_; return ( hostname => $h, protocol => 'scsi-fc', initiators => [ @w ? @w : ('10000000c9aa') ] ); }
 
@@ -487,6 +489,52 @@ subtest 'unpublish_lu surfaces the cause when EVERY unmap fails (§12.4)' => sub
     eval { $d->unpublish_lu( '42', ctx('node-a') ); 1 } or $err = $@;
     isa_ok( $err, 'PVE::Storage::FCLU::Error', 'all-unmap-fail' );
     is( $err->code, 'array_busy', 'classified from the underlying cause (retryable)' );
+};
+
+subtest 'N8: map is idempotent (LU-path-defined) + retries a transient array_busy' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => ['CL1-A'] );
+    $d->{_lun_op_delay} = 0;   # no real sleeps in tests
+    {
+        no warnings 'redefine';
+        # A racing publisher already defined the path → 409 already-defined = success.
+        local *FakeRest::map_lun =
+            sub { die "API request failed: POST /luns -> 409 Conflict LU path has already been defined\n" };
+        is( $d->_map_lun_settled( 'CL1-A', 0, '42' ), 1, 'LU-path-defined treated as success' );
+    }
+    {
+        no warnings 'redefine';
+        my $n = 0;
+        local *FakeRest::map_lun = sub {
+            $n++;
+            die "API request failed: POST /luns -> 503 Service Unavailable\n" if $n == 1;
+            return {};
+        };
+        is( $d->_map_lun_settled( 'CL1-A', 0, '42' ), 1, 'transient array_busy retried then succeeded' );
+        is( $n, 2, 'exactly one retry' );
+    }
+};
+
+subtest 'N12: reclaim_empty_host_groups reaps only OUR EMPTY groups' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ] );
+    $d->ensure_host_access( ctx( 'node-a', '10000000c9aa' ) );   # PVE_node-a on both ports, our WWN
+    $f->map_lun( port_id => 'CL2-A', host_group_number => 0, ldev_id => '42' );   # CL2-A now in use
+    my $reaped = $d->reclaim_empty_host_groups( ctx( 'node-a', '10000000c9aa' ) );
+    is_deeply( $reaped, ['CL1-A,0'], 'only the empty owned group reaped' );
+    ok( !$f->find_host_group_by_name( 'CL1-A', 'PVE_node-a' ), 'empty group deleted' );
+    ok( $f->find_host_group_by_name( 'CL2-A', 'PVE_node-a' ), 'in-use group kept' );
+};
+
+subtest 'N12: never reaps a group holding FOREIGN initiators' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => ['CL1-A'] );
+    $f->create_host_group( port_id => 'CL1-A', host_group_name => 'PVE_node-a', host_mode_options => [] );
+    $f->add_wwn_to_host_group( port_id => 'CL1-A', host_group_number => 0, wwn => '10000000dead' );   # foreign
+    local $SIG{__WARN__} = sub { };
+    my $reaped = $d->reclaim_empty_host_groups( ctx( 'node-a', '10000000c9aa' ) );
+    is_deeply( $reaped, [], 'foreign-holding group NOT reaped' );
+    ok( $f->find_host_group_by_name( 'CL1-A', 'PVE_node-a' ), 'foreign group left intact' );
 };
 
 subtest 'target_ports surfaces configured ports (WWPN deferred to fabric §14)' => sub {

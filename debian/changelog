@@ -1,3 +1,28 @@
+pve-fclu (0.1.0~alpha32) stable; urgency=medium
+
+  * OpenStack HBSD re-review batch (net-new items N1-N16; replication-gated + a few larger
+    items deferred with notes in the backlog).
+  * T1 correctness: N1 plain + CG snapshots now set canCascade + isDataReductionForceCopy
+    (a snapshot of a dedup/compression P-VOL was array-rejected; without canCascade a
+    snapshot could not be a clone source). N2 restore_snapshot uses a dedicated 24h budget
+    and FAILS instead of splitting mid-restore (no torn P-VOL). N3 restore verifies the
+    pair's P-VOL matches the target volume.
+  * Transport (RestClient): N5 HTTP keep-alive (reuse the TCP+TLS connection across the
+    create-then-poll / per-port clone calls - GH#17). N9 retry a genuine transport error on
+    a single-endpoint non-idempotent POST (the request never reached the array). N10
+    configurable http_timeout. N11 validate Content-Type before decode_json (middlebox HTML
+    200 -> classified error, not an opaque die). N16 extract composite (port,hg,lun) job ids.
+  * Data/host path: N7 full clone waits for copy completion + surfaces a PSUE copy failure.
+    N8 publish_lu maps idempotently (LU-path-already-defined = success) with bounded
+    array_busy retry; matching unmap retry. N12 new `pve-fclu-host reclaim-groups` reaps THIS
+    node's empty host groups (WWN-ownership-gated) so a decommissioned node doesn't exhaust
+    per-port host-group slots.
+  * Config/parity: N14 colon-hex ldev_range (00:03:E8, the Storage Navigator display form).
+    N15 adaptive per-GiB QoS (upperIopsPerGB) scaling the IOPS ceiling by volume size.
+  * 209 unit tests; independent code review.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sun, 12 Jul 2026 10:20:00 -0300
+
 pve-fclu (0.1.0~alpha31) stable; urgency=medium
 
   * Consistency groups (explicit-reference model). CG membership is a per-volume `cg`

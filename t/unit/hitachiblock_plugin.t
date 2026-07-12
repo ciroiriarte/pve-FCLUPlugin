@@ -121,6 +121,8 @@ subtest '_alloc_backend_id: next free in-range id, excluding registry-reserved i
 subtest '_parse_ldev_range + CU-alignment hint' => sub {
     is_deeply( [ $HB->_parse_ldev_range('1000-1999') ], [ 1000, 1999 ], 'decimal range' );
     is_deeply( [ $HB->_parse_ldev_range('0x3E8-0x7CF') ], [ 1000, 1999 ], 'hex range' );
+    is_deeply( [ $HB->_parse_ldev_range('00:03:E8-00:07:CF') ], [ 1000, 1999 ], 'N14 colon-hex range' );
+    is_deeply( [ $HB->_parse_ldev_range('03:E8-07:CF') ], [ 1000, 1999 ], 'N14 colon-hex (2-part)' );
     eval { $HB->_parse_ldev_range('garbage') };
     like( $@, qr/invalid ldev_range/, 'malformed range dies' );
     eval { $HB->_parse_ldev_range('2000-1000') };

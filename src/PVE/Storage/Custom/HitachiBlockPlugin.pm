@@ -154,8 +154,9 @@ sub properties {
             optional    => 1,
         },
         ldev_range => {
-            description => "Restrict LDEV ID allocation to a range (e.g. '1000-1999' or"
-                . " '0x3E8-0x7CF'). Also fences destructive ops: the plugin refuses to unmap"
+            description => "Restrict LDEV ID allocation to a range (e.g. '1000-1999',"
+                . " '0x3E8-0x7CF', or Hitachi colon-hex '00:03:E8-00:07:CF' as shown in"
+                . " Storage Navigator / Ops Center). Also fences destructive ops: the plugin refuses to unmap"
                 . " or delete any LDEV outside the range, so it can never touch foreign"
                 . " volumes that merely share a target port. On a pool shared by multiple PVE"
                 . " clusters, give each cluster a DISJOINT range.",
@@ -313,10 +314,18 @@ sub _parse_ldev_range {
     my ($min, $max);
     if ( $range =~ /^(0x[0-9a-f]+)-(0x[0-9a-f]+)$/i ) {
         ($min, $max) = ( hex($1), hex($2) );
+    } elsif ( $range =~ /^([0-9a-f]{1,2}(?::[0-9a-f]{1,2})+)-([0-9a-f]{1,2}(?::[0-9a-f]{1,2})+)$/i ) {
+        # Hitachi colon-separated hex — the form Storage Navigator / Ops Center DISPLAY an
+        # LDEV id in (e.g. 00:03:E8 = 1000). Strip the colons and read as hex (N14), so an
+        # operator can paste a CU:LDEV range straight from the GUI.
+        my ( $lo, $hi ) = ( $1, $2 );
+        s/://g for ( $lo, $hi );
+        ($min, $max) = ( hex($lo), hex($hi) );
     } elsif ( $range =~ /^(\d+)-(\d+)$/ ) {
         ($min, $max) = ( int($1), int($2) );
     } else {
-        die "invalid ldev_range format '$range' (expected 'min-max')\n";
+        die "invalid ldev_range format '$range' (expected 'min-max' as decimal, 0x-hex, "
+            . "or colon-hex e.g. 00:00:00-00:03:E8)\n";
     }
 
     die "invalid ldev_range: min ($min) > max ($max)\n" if $min > $max;

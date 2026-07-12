@@ -167,6 +167,84 @@ subtest '_retry_delay honours a numeric Retry-After (pure function)' => sub {
     is( $c->_retry_delay( 1, $res ), 7, 'server Retry-After takes precedence' );
 };
 
+subtest 'N16: _wait_for_job extracts composite (port,hg) resource ids' => sub {
+    my $c = new_mock_client();
+    # The job poll returns Succeeded with a composite host-group affectedResource.
+    MockRestClient::set_mock_responses(
+        { state => 'Succeeded', affectedResources => ['/host-groups/CL1-A,0'] } );
+    my $r = $c->_wait_for_job( { jobId => 'j1' } );
+    is( $r->{resourceId}, 'CL1-A,0', 'composite host-group id kept whole (not missed)' );
+};
+
+subtest 'N9/N11: real _request transport-retry + non-JSON guard' => sub {
+    require HTTP::Response;
+    my $real = PVE::Storage::FCLU::Driver::Hitachi::RestClient->new(
+        mgmt_ip => '10.0.0.9', storage_id => '836000123456',
+        username => 'u', password => 'p', port => 443, sessionless => 1 );
+
+    # N11: a 200 with a NON-JSON (HTML) body must not decode_json — surface a clear error.
+    {
+        package StubUA_HTML;
+        sub new { bless {}, shift }
+        sub request {
+            return HTTP::Response->new( 200, 'OK',
+                [ 'Content-Type' => 'text/html' ], '<html>login portal</html>' );
+        }
+    }
+    $real->{ua} = StubUA_HTML->new;
+    eval { $real->_request( 'GET', 'https://x/y' ); 1 };
+    like( $@, qr/non-JSON/, 'HTML 200 => clear non-JSON error, not an opaque decode die' );
+
+    # N9: a CONNECT-phase transport error on a POST (request provably never sent) is retried
+    # and then succeeds. Keep the retry instant.
+    {
+        package StubUA_Flap;
+        sub new { bless { n => 0 }, shift }
+        sub request {
+            my ($s) = @_; $s->{n}++;
+            if ( $s->{n} == 1 ) {
+                my $r = HTTP::Response->new( 500, "Can't connect to x:443 (connection refused)" );
+                $r->header( 'Client-Warning' => 'Internal response' );
+                return $r;
+            }
+            return HTTP::Response->new( 200, 'OK',
+                [ 'Content-Type' => 'application/json' ], '{"ok":1}' );
+        }
+    }
+    my $flap = StubUA_Flap->new;
+    $real->{ua} = $flap;
+    my $res;
+    {
+        no warnings 'redefine';
+        local *PVE::Storage::FCLU::Driver::Hitachi::RestClient::_retry_delay = sub { 0 };
+        $res = $real->_request( 'POST', 'https://x/z', { a => 1 } );
+    }
+    is_deeply( $res, { ok => 1 }, 'connect-phase transport error on a POST retried, then succeeded' );
+    is( $flap->{n}, 2, 'exactly one retry (request never left the client => safe to resend)' );
+
+    # N9 SAFETY: a READ-timeout transport error on a POST must NOT be resent (the array may
+    # already have applied it — e.g. a relative expand). It croaks instead of double-applying.
+    {
+        package StubUA_ReadTimeout;
+        sub new { bless { n => 0 }, shift }
+        sub request {
+            my ($s) = @_; $s->{n}++;
+            my $r = HTTP::Response->new( 500, 'read timeout' );
+            $r->header( 'Client-Warning' => 'Internal response' );
+            return $r;
+        }
+    }
+    my $rt = StubUA_ReadTimeout->new;
+    $real->{ua} = $rt;
+    {
+        no warnings 'redefine';
+        local *PVE::Storage::FCLU::Driver::Hitachi::RestClient::_retry_delay = sub { 0 };
+        eval { $real->_request( 'POST', 'https://x/z', { a => 1 } ); 1 };
+    }
+    ok( $@, 'read-timeout POST croaks (not resent)' );
+    is( $rt->{n}, 1, 'the POST was sent exactly once (no double-apply)' );
+};
+
 done_testing();
 
 BEGIN { require HTTP::Response; }

@@ -1,0 +1,52 @@
+#!/usr/bin/perl
+#
+# pve-fclu-host — node-local FCLU host-access maintenance.
+#
+#   pve-fclu-host reclaim-groups <storeid>
+#       Delete THIS node's now-EMPTY host groups (no LUN paths) on the array's configured
+#       ports — an "unmanage host" for a decommissioned/renamed node, so its <prefix>_<host>
+#       groups + initiator WWNs don't linger and slowly exhaust per-port host-group slots on
+#       a shared pool (N12). WWN-ownership-gated: only a group that holds THIS node's WWNs
+#       (no foreign initiators) AND no LUN paths is removed — a live or foreign group is
+#       never touched. Run it FROM the node whose groups you want reclaimed.
+#
+#   pve-fclu-host --help
+#
+use strict;
+use warnings;
+
+use PVE::Storage;
+
+sub usage {
+    my ($err) = @_;
+    print STDERR "$err\n\n" if $err;
+    print STDERR <<'USAGE';
+usage:
+  pve-fclu-host reclaim-groups <storeid>   # reap THIS node's empty host groups (ownership-gated)
+USAGE
+    exit( $err ? 2 : 0 );
+}
+
+usage() if !@ARGV || $ARGV[0] eq '--help' || $ARGV[0] eq '-h';
+
+my $cmd = shift @ARGV;
+
+if ( $cmd eq 'reclaim-groups' ) {
+    my $storeid = shift @ARGV or usage("reclaim-groups: missing <storeid>");
+    my $cfg    = PVE::Storage::config();
+    my $scfg   = PVE::Storage::storage_config( $cfg, $storeid );
+    my $pclass = PVE::Storage::Plugin->lookup( $scfg->{type} );
+    die "store '$storeid' (type '$scfg->{type}') is not an FCLU storage\n"
+        unless $pclass->isa('PVE::Storage::FCLU::Plugin');
+    my $reaped = $pclass->unmanage_host( $scfg, $storeid );
+    if (@$reaped) {
+        print "reclaimed empty host group: $_\n" for @$reaped;
+    } else {
+        print "no empty host groups to reclaim for this node on '$storeid'\n";
+    }
+}
+else {
+    usage("unknown command '$cmd'");
+}
+
+exit 0;

@@ -179,11 +179,14 @@ sub _new_snap {
     $s->{snaps}{$sid} = {
         snapshotId => $sid, pvolLdevId => $pvol, svolLdevId => $o{svol_ldev_id},
         snapshotGroupName => $o{snapshot_group}, status => $status,
+        can_cascade => $o{can_cascade}, is_dr_force => $o{is_data_reduction_force_copy},
     };
     return { resourceId => $sid };
 }
 sub create_snapshot      { my ( $s, %o ) = @_; $s->_c('create_snapshot');      return $s->_new_snap(%o) }
-sub clone_snapshot_to_ldev { my ( $s, %o ) = @_; $s->_c('clone_snapshot_to_ldev'); return $s->_new_snap(%o) }
+# isClone: the copy runs async then the pair AUTO-DELETES (S-VOL independent). Model the
+# completed state — leave no lingering pair — so the N7 completion wait resolves cleanly.
+sub clone_snapshot_to_ldev { my ( $s, %o ) = @_; $s->_c('clone_snapshot_to_ldev'); return { resourceId => "$o{svol_ldev_id}" } }
 sub list_snapshots {
     my ( $s, %f ) = @_; $s->_c('list_snapshots');
     return [ map { { %{ $s->{snaps}{$_} } } }

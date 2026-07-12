@@ -500,8 +500,16 @@ sub _create_pair {
             pvol_ldev_id   => $pvol,
             snap_pool_id   => $self->{snap_pool_id},
             snapshot_group => $opts{snapshot_group} // 'pve_snap',
-            ( defined $opts{auto_split}           ? ( auto_split => $opts{auto_split} )  : () ),
-            ( $opts{is_consistency_group}         ? ( is_consistency_group => 1 )        : () ),
+            # canCascade lets this snapshot's S-VOL later become a P-VOL of another pair
+            # (clone-from-snapshot / cascaded chains); isDataReductionForceCopy permits the
+            # pair when the P-VOL is a data-reduction (dedup/compression) volume. HBSD sets
+            # both on EVERY Thin Image pair — FCLU previously set them only on the linked
+            # clone, so a plain/CG snapshot of a DR P-VOL was array-rejected and a snapshot
+            # could not be used as a clone source (N1).
+            can_cascade                  => 1,
+            is_data_reduction_force_copy => 1,
+            ( defined $opts{auto_split}   ? ( auto_split => $opts{auto_split} ) : () ),
+            ( $opts{is_consistency_group} ? ( is_consistency_group => 1 )       : () ),
         );
     } );
 
@@ -537,14 +545,32 @@ sub delete_snapshot {
 }
 
 sub restore_snapshot {
-    my ($self, $snap_id) = @_;
+    my ($self, $snap_id, %opts) = @_;
+
+    # N3: verify the pair actually belongs to the target volume before a reverse copy.
+    # A stale/mis-recorded snap_id must never reverse-copy a FOREIGN P-VOL (HBSD's
+    # has_snap_pair pvolLdevId check). When the caller passes the expected P-VOL, confirm
+    # the array agrees; this also asserts the pair still exists.
+    if ( defined $opts{pvol} ) {
+        my $s   = $self->_call( sub { $self->{rest}->get_snapshot($snap_id) } );
+        my $got = $s->{pvolLdevId};
+        $self->_err( 'invalid',
+            "refusing to restore snapshot '$snap_id': its P-VOL (" . ( $got // 'undef' )
+            . ") does not match the target volume ($opts{pvol})" )
+            unless defined $got && "$got" eq "$opts{pvol}";
+    }
 
     # Reverse-copy S-VOL -> P-VOL, then RE-SPLIT so the snapshot stays a usable,
     # re-restorable PSUS pair (faithful to the reference #12 rollback: a restore
     # left un-split makes a later rollback to the same snapshot a silent no-op).
     $self->_call( sub { $self->{rest}->restore_snapshot($snap_id) } );
-    $self->_wait_snap_status( $snap_id, 'PAIR' )
-        or warn "FCLU Hitachi: restore of '$snap_id' did not settle to PAIR in time\n";
+    # N2: a reverse copy of a large volume can far exceed the generic op timeout; use a
+    # dedicated restore budget and FAIL rather than split mid-restore (which would leave
+    # the P-VOL half-reverted and the snapshot reflecting neither state).
+    $self->_wait_snap_status( $snap_id, 'PAIR', budget => $self->_restore_timeout )
+        or $self->_err( 'timeout',
+            "restore of '$snap_id' did not reach PAIR within the restore budget; NOT "
+            . "splitting (the P-VOL may still be receiving the reverse copy)" );
 
     eval {
         $self->_call( sub { $self->{rest}->split_snapshot($snap_id) } );
@@ -759,22 +785,68 @@ sub create_full_clone {
         unless $self->_is_defined_ldev($src);
 
     my $svol_id = $self->_alloc_svol( $src, %args );
+    my $group   = $args{snapshot_group} // 'pve_clone';
     $self->_call( sub {
         $self->{rest}->clone_snapshot_to_ldev(
             pvol_ldev_id   => $backend_id,
             svol_ldev_id   => $svol_id,
             snap_pool_id   => $self->{snap_pool_id},
-            snapshot_group => $args{snapshot_group} // 'pve_clone',
+            snapshot_group => $group,
         );
     } );
+    # N7: the isClone copy runs ASYNC after pair creation; wait for it to finish (the pair
+    # auto-deletes, leaving the S-VOL independent) and surface a PSUE copy failure — so a
+    # caller cannot use or delete the source before the copy is complete, nor mistake a
+    # failed copy for a good clone. Best-effort on timeout (warn; copy may still run). On a
+    # PSUE failure the S-VOL LDEV we just allocated is orphaned — best-effort delete it so a
+    # failed clone does not leak on the shared pool, then rethrow.
+    my $ok = eval { $self->_wait_clone_done( $backend_id, $group, $svol_id ) };
+    if ( my $err = $@ ) {
+        eval { $self->{rest}->delete_ldev( int($svol_id) ) };
+        warn "FCLU Hitachi: full-clone rollback: deleting failed S-VOL '$svol_id' failed"
+            . " — LEAKED on the shared pool: $@" if $@;
+        die ref $err ? $err : "create_full_clone failed: $err";
+    }
+    warn "FCLU Hitachi: full clone to '$svol_id' did not confirm completion in time; "
+        . "the copy may still be running\n" unless $ok;
     return $svol_id;
 }
 
-# Bounded poll for a snapshot pair to reach $want status. interval<=0 probes once
-# (the test fast-path); returns 1 on convergence, 0 on timeout (caller warns).
-sub _wait_snap_status {
-    my ($self, $snap_id, $want) = @_;
+# N7: poll the isClone pair on $pvol under $group until the copy completes. A full clone
+# pair AUTO-DELETES on completion (S-VOL becomes independent), so "pair gone" (or SMPL) =
+# done; PSUE = copy failed (fatal). interval<=0 probes once (test fast-path). Returns 1 on
+# completion, 0 on timeout.
+sub _wait_clone_done {
+    my ($self, $pvol, $group, $svol) = @_;
     my $budget   = $self->profile->{op_timeout_s} || 600;
+    my $interval = defined $self->{_snap_poll_interval} ? $self->{_snap_poll_interval} : 2;
+    my $elapsed  = 0;
+    while (1) {
+        my $snaps = eval { $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $pvol ) } ) } // [];
+        my ($pair) = grep { ( $_->{snapshotGroupName} // '' ) eq $group } @$snaps;
+        my $st = $pair ? ( $pair->{status} // '' ) : '';
+        $self->_err( 'internal', "full clone to S-VOL '$svol' failed (pair status PSUE)" )
+            if $st eq 'PSUE';
+        return 1 if !$pair || $st eq 'SMPL';   # copy done, pair auto-split/gone
+        last if $interval <= 0 || $elapsed >= $budget;
+        sleep($interval);
+        $elapsed += $interval;
+    }
+    return 0;
+}
+
+# Dedicated reverse-copy budget (N2): a restore can far outlast the generic op timeout.
+sub _restore_timeout {
+    my ($self) = @_;
+    return $self->profile->{restore_timeout_s} || 24 * 3600;
+}
+
+# Bounded poll for a snapshot pair to reach $want status. interval<=0 probes once
+# (the test fast-path); returns 1 on convergence, 0 on timeout (caller warns). A caller
+# may override the deadline with budget => <seconds> (e.g. the restore reverse-copy).
+sub _wait_snap_status {
+    my ($self, $snap_id, $want, %opts) = @_;
+    my $budget   = $opts{budget} // ( $self->profile->{op_timeout_s} || 600 );
     my $interval = defined $self->{_snap_poll_interval} ? $self->{_snap_poll_interval} : 2;
     my $elapsed  = 0;
     while (1) {
@@ -960,6 +1032,78 @@ sub _hg_name {
     return ( $self->{host_group_prefix} // 'PVE' ) . "_$hostname";
 }
 
+# N8: map a LUN idempotently + transient-tolerantly. On a shared array two concurrent
+# publishes of the SAME ldev into one host group race (both see an empty list_luns, both
+# call map_lun) — the loser gets "LU path already defined"; that path EXISTS, so treat it
+# as success. And the array transiently rejects a map during an LU-path state transition
+# (array_busy) — bounded retry, mirroring the snapshot-pair poll discipline. Test knobs:
+# _lun_op_tries / _lun_op_delay.
+sub _map_lun_settled {
+    my ($self, $port, $hg_num, $backend_id) = @_;
+    my $tries = $self->{_lun_op_tries} // 12;
+    my $delay = defined $self->{_lun_op_delay} ? $self->{_lun_op_delay} : 5;
+    for my $i ( 1 .. $tries ) {
+        return 1 if eval {
+            $self->{rest}->map_lun(
+                port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
+            1;
+        };
+        my $err = $self->_translate_rest_error($@);
+        return 1 if $err->code eq 'already_exists';   # path already defined = success
+        die $err unless $err->code eq 'array_busy' && $i < $tries;
+        sleep($delay);
+    }
+    return 1;
+}
+
+# N8: unmap a LUN path with the same bounded array_busy retry (an LU executing host I/O
+# transiently rejects the unmap). not_found is idempotent success.
+sub _unmap_lun_settled {
+    my ($self, $lun_id) = @_;
+    my $tries = $self->{_lun_op_tries} // 12;
+    my $delay = defined $self->{_lun_op_delay} ? $self->{_lun_op_delay} : 5;
+    for my $i ( 1 .. $tries ) {
+        return 1 if eval { $self->{rest}->unmap_lun($lun_id); 1 };
+        my $err = $self->_translate_rest_error($@);
+        return 1 if $err->code eq 'not_found';        # already gone = success
+        die $err unless $err->code eq 'array_busy' && $i < $tries;
+        sleep($delay);
+    }
+    return 1;
+}
+
+# N12: reap THIS node's host groups that are now EMPTY (hold no LUN paths), on every
+# configured port — "unmanage host". A decommissioned/renamed node otherwise leaves its
+# <prefix>_<host> groups + initiator WWNs on the array forever, slowly exhausting per-port
+# host-group slots on a shared pool and leaving stale WWNs that trip the foreign-WWN guard
+# if the hostname is later reused on another cluster. WWN-ownership-GATED: only a group we
+# resolve as OURS (holds our WWNs, no foreign — via _resolve_owned_hg) AND holding zero
+# LUNs is deleted; a live or foreign group is never touched. Returns the reaped [port,hgnum].
+sub reclaim_empty_host_groups {
+    my ($self, %ctx) = @_;
+    my $hostname = $self->_check_host_ctx(%ctx);
+    my $wwns     = $ctx{initiators};
+    my $hg_name  = $self->_hg_name($hostname);
+    my @reaped;
+    for my $port ( @{ $self->{array_ports} } ) {
+        # Resolve OUR group + prove ownership; a conflict (foreign WWNs) or absence => skip.
+        my $hg = eval { $self->_resolve_owned_hg( $port, $hg_name, $wwns ) };
+        next if $@ || !$hg;
+        my $hg_num = $hg->{hostGroupNumber};
+        # Only reap when the group holds NO LUN paths (unused by this or any node). Fail
+        # SAFE: an error OR any unexpected (non-arrayref) shape means "do not reap" — never
+        # read an ambiguous result as "empty" and delete a possibly-in-use group.
+        my $luns = eval { $self->{rest}->list_luns( port_id => $port, host_group_number => $hg_num ) };
+        next if $@ || ref $luns ne 'ARRAY' || @$luns;
+        if ( eval { $self->{rest}->delete_host_group("$port,$hg_num"); 1 } ) {
+            push @reaped, "$port,$hg_num";
+        } else {
+            warn "FCLU Hitachi: reclaim of empty host group ($port,#$hg_num) failed: $@";
+        }
+    }
+    return \@reaped;
+}
+
 sub publish_lu {
     my ($self, $backend_id, %ctx) = @_;
     my $hostname = $self->_check_host_ctx(%ctx);
@@ -990,10 +1134,7 @@ sub publish_lu {
                 port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
         } );
         if ( !@$luns ) {
-            $self->_call( sub {
-                $self->{rest}->map_lun(
-                    port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
-            } );
+            $self->_map_lun_settled( $port, $hg_num, $backend_id );   # N8: idempotent + retry
             $luns = $self->_call( sub {
                 $self->{rest}->list_luns(
                     port_id => $port, host_group_number => $hg_num, ldev_id => $backend_id );
@@ -1041,7 +1182,7 @@ sub unpublish_lu {
         } );
         for my $l (@$luns) {
             $attempted++;
-            unless ( eval { $self->{rest}->unmap_lun( $l->{lunId} ); 1 } ) {
+            unless ( eval { $self->_unmap_lun_settled( $l->{lunId} ); 1 } ) {   # N8: retry+idempotent
                 $failed++;
                 $last_err = $@;
                 warn "FCLU Hitachi: unmap warning (lun $l->{lunId}): $@";

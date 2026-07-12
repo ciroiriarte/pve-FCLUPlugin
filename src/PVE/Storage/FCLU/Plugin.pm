@@ -95,6 +95,13 @@ sub properties {
             description => "Default upper IOPS limit per volume (0 = unlimited).",
             type        => 'integer', minimum => 0, optional => 1,
         },
+        qos_upper_iops_per_gb => {
+            description => "Adaptive upper IOPS limit that SCALES with volume size:"
+                . " ceiling = size_GiB * this value (HBSD upperIopsPerGB). Takes precedence"
+                . " over qos_upper_iops when set. Useful when one storage backs many"
+                . " differently-sized disks.",
+            type        => 'integer', minimum => 1, optional => 1,
+        },
         qos_upper_mbps => {
             description => "Default upper throughput limit per volume in MB/s (0 = unlimited).",
             type        => 'integer', minimum => 0, optional => 1,
@@ -145,6 +152,7 @@ sub options {
         pool_id      => { fixed => 1 },
         snap_pool_id => { optional => 1 },
         qos_upper_iops => { optional => 1 },
+        qos_upper_iops_per_gb => { optional => 1 },
         qos_upper_mbps => { optional => 1 },
         qos_lower_iops => { optional => 1 },
         qos_lower_mbps => { optional => 1 },
@@ -379,11 +387,21 @@ sub _alloc_backend_id { return undef }
 # a vendor MAY add a stricter check (Hitachi: ldev_range). Default: allow.
 sub safe_delete_precheck { return 1 }
 
-# Map QoS storage.cfg knobs to the driver's qos hash (generic field names).
+# Map QoS storage.cfg knobs to the driver's qos hash (generic field names). $size_bytes
+# (when given) enables the adaptive per-GiB IOPS ceiling.
 sub _qos_from_scfg {
-    my ($class, $scfg) = @_;
+    my ($class, $scfg, $size_bytes) = @_;
     my %qos;
-    $qos{upper_iops}        = $scfg->{qos_upper_iops} if $scfg->{qos_upper_iops};
+    # N15: adaptive per-GiB upper IOPS — ceiling scales with volume size (HBSD
+    # upperIopsPerGB). Takes precedence over the static qos_upper_iops. Clamped to >=1.
+    if ( $scfg->{qos_upper_iops_per_gb} && $size_bytes ) {
+        my $gib  = $size_bytes / ( 1024 * 1024 * 1024 );
+        my $iops = int( $scfg->{qos_upper_iops_per_gb} * $gib );
+        $qos{upper_iops} = $iops > 0 ? $iops : 1;
+    }
+    elsif ( $scfg->{qos_upper_iops} ) {
+        $qos{upper_iops} = $scfg->{qos_upper_iops};
+    }
     $qos{upper_mbps}        = $scfg->{qos_upper_mbps} if $scfg->{qos_upper_mbps};
     $qos{lower_iops}        = $scfg->{qos_lower_iops} if $scfg->{qos_lower_iops};
     $qos{lower_mbps}        = $scfg->{qos_lower_mbps} if $scfg->{qos_lower_mbps};
@@ -464,7 +482,7 @@ sub alloc_image {
         # NOT the E series or VSP One, whose embedded REST has no QoS surface). Calling
         # it elsewhere only draws an [invalid] from the array. A limit-set failure must
         # never fail provisioning.
-        my $qos = $class->_qos_from_scfg($scfg);
+        my $qos = $class->_qos_from_scfg( $scfg, $size_bytes );
         if (%$qos) {
             if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'qos', 'per_lu' ) ) {
                 eval { $d->set_lu_qos( $backend_id, $qos ) };
@@ -949,8 +967,10 @@ sub volume_snapshot_rollback {
         unless $meta && defined $meta->{snap_id};
 
     # The driver owns the reverse-copy + re-split settle (#12): restore_snapshot
-    # MUST leave the snapshot a usable, re-restorable pair before returning.
-    $class->_driver( $storeid, $scfg )->restore_snapshot( $meta->{snap_id} );
+    # MUST leave the snapshot a usable, re-restorable pair before returning. Pass the
+    # target's backend id so the driver refuses a pair that isn't this volume's (N3).
+    $class->_driver( $storeid, $scfg )
+        ->restore_snapshot( $meta->{snap_id}, pvol => $backend_id );
 
     return 1;
 }
@@ -1446,6 +1466,15 @@ sub cg_snapshot_list {
 # Read helpers for the CLI (keep the registry encapsulated).
 sub cg_list    { return $_[0]->_registry( $_[1] )->list_cgs }
 sub cg_members { return $_[0]->_registry( $_[1] )->find_cg_members( $_[2] ) }
+
+# N12: operator "unmanage host" — reap THIS node's now-empty host groups on the array
+# (WWN-ownership-gated in the driver). Node-local: builds this node's host context.
+sub unmanage_host {
+    my ($class, $scfg, $storeid) = @_;
+    my $conn = $class->_connector;
+    my %hctx = %{ $conn->host_context( hostname => $class->_nodename ) };
+    return $class->_driver( $storeid, $scfg )->reclaim_empty_host_groups(%hctx);
+}
 
 sub update_volume_attribute {
     my ($class, $scfg, $storeid, $volname, $attribute, $value) = @_;

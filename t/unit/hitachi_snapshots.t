@@ -40,6 +40,44 @@ subtest 'create_snapshot returns a §12.1 descriptor; re-assert is idempotent' =
     is( scalar @{ $d->list_snapshots($bid) }, 1, 're-assert created no second pair' );
 };
 
+subtest 'N1: plain + CG snapshots set canCascade + isDataReductionForceCopy' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+    my $s = $d->create_snapshot($bid);
+    ok( $f->{snaps}{ $s->{snap_id} }{can_cascade}, 'plain snapshot sets canCascade' );
+    ok( $f->{snaps}{ $s->{snap_id} }{is_dr_force}, 'plain snapshot sets isDataReductionForceCopy' );
+    my $a = $d->create_lu( size_bytes => GIB );
+    my $b = $d->create_lu( size_bytes => GIB );
+    my $cg = $d->create_cg_snapshot( [ $a, $b ], snapshot_group => 'cg9' );
+    ok( $f->{snaps}{ $cg->[0]{snap_id} }{can_cascade}, 'CG snapshot sets canCascade' );
+    ok( $f->{snaps}{ $cg->[0]{snap_id} }{is_dr_force}, 'CG snapshot sets isDataReductionForceCopy' );
+};
+
+subtest 'N3: restore refuses a pair whose P-VOL is not the target' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+    my $s = $d->create_snapshot($bid);
+    is( $d->restore_snapshot( $s->{snap_id}, pvol => $bid ), 1, 'matching P-VOL restores' );
+    my $err;
+    eval { $d->restore_snapshot( $s->{snap_id}, pvol => '999999' ); 1 } or $err = $@;
+    is( ref $err && $err->code, 'invalid', 'foreign P-VOL refused' );
+};
+
+subtest 'N2: restore that never reaches PAIR fails and does NOT split' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+    my $s = $d->create_snapshot($bid);
+    my $err;
+    {
+        no warnings 'redefine';
+        # restore leaves the pair un-PAIRed (reverse copy still running past the budget).
+        local *FCLU::FakeHitachiRest::restore_snapshot = sub { 1 };
+        eval { $d->restore_snapshot( $s->{snap_id} ); 1 } or $err = $err = $@;
+    }
+    is( ref $err && $err->code, 'timeout', 'non-convergent restore => timeout' );
+    ok( !$f->{calls}{split_snapshot}, 'the pair was NOT split mid-restore (no torn P-VOL)' );
+};
+
 subtest 'delete_snapshot is idempotent' => sub {
     my ( $d, $f ) = setup();
     my $bid = $d->create_lu( size_bytes => GIB );
@@ -156,6 +194,25 @@ subtest 'create_full_clone uses the clone (full-copy) path' => sub {
     my $clone = $d->create_full_clone($bid);
     isnt( $clone, $bid, 'distinct LU' );
     is( $f->{calls}{clone_snapshot_to_ldev}, 1, 'used clone_snapshot_to_ldev (isClone)' );
+};
+
+subtest 'N7: full clone waits for completion and surfaces a PSUE copy failure' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+    # Happy path: the fake isClone leaves no lingering pair -> completion resolves cleanly.
+    my $c = $d->create_full_clone($bid);
+    ok( $d->get_lu($c), 'clone LU created' );
+    # PSUE: the source shows a copy-failed pair under the clone group.
+    my $err;
+    {
+        no warnings 'redefine';
+        local *FCLU::FakeHitachiRest::list_snapshots = sub {
+            return [ { snapshotId => 'x,9', snapshotGroupName => 'pve_clone',
+                       status => 'PSUE', pvolLdevId => 'x' } ];
+        };
+        eval { $d->create_full_clone( $bid, snapshot_group => 'pve_clone' ); 1 } or $err = $@;
+    }
+    is( ref $err && $err->code, 'internal', 'PSUE copy failure surfaced as an error' );
 };
 
 done_testing();

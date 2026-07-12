@@ -908,6 +908,21 @@ subtest 'base _connector loads its connector_class (regression: missing require)
     isa_ok( $conn, 'PVE::Storage::FCLU::Host::FCMultipath', 'base _connector returns a loaded connector instance' );
 };
 
+subtest 'N15: adaptive per-GiB QoS scales the IOPS ceiling by size' => sub {
+    my $GiB = 1 << 30;
+    my $q = $P->_qos_from_scfg( { qos_upper_iops_per_gb => 10 }, 5 * $GiB );
+    is( $q->{upper_iops}, 50, 'ceiling = size_GiB * per_gb (5 GiB * 10)' );
+    # Per-GiB takes precedence over the static value when both are set.
+    my $q2 = $P->_qos_from_scfg( { qos_upper_iops_per_gb => 100, qos_upper_iops => 999 }, 2 * $GiB );
+    is( $q2->{upper_iops}, 200, 'per-GiB overrides the static qos_upper_iops' );
+    # Sub-1-GiB clamps to at least 1 (never 0 = unlimited by accident).
+    my $q3 = $P->_qos_from_scfg( { qos_upper_iops_per_gb => 1 }, $GiB / 4 );
+    is( $q3->{upper_iops}, 1, 'clamped to >= 1' );
+    # Static path unchanged when per-GiB is absent.
+    my $q4 = $P->_qos_from_scfg( { qos_upper_iops => 3000 }, 8 * $GiB );
+    is( $q4->{upper_iops}, 3000, 'static qos_upper_iops still honored' );
+};
+
 subtest 'consistency groups: cg attribute + explicit crash-consistent group snapshot' => sub {
     local $T::Plugin::FAKE = T::FakeDriver->new;
     local $T::Plugin::CONN = T::FakeConn->new;
