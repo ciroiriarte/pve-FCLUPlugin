@@ -88,6 +88,15 @@ systemctl restart pvedaemon
   `pve-storage-hitachiblock` and rollback.
 - **[`docs/packaging-obs.md`](docs/packaging-obs.md)** — the OBS build/release pipeline.
 
+### Contributing a driver
+
+- **[`docs/driver-authoring.md`](docs/driver-authoring.md)** — add support for a new array
+  vendor: the 18-method driver contract, the typed error vocabulary, capability
+  advertisement, the ~40-line PVE shim, and the parametrized conformance suite that
+  defines what "conforms to `fclu-driver-api-1`" means. **A driver for a second vendor is
+  the most valuable contribution this project can take right now** — it is what proves or
+  corrects the vendor-neutral abstraction.
+
 ## Design provenance
 
 The architecture was produced as a **joint multi-model review**: drafted by Claude from
