@@ -9,11 +9,26 @@ policies — natively into the Proxmox VE ecosystem.*
 >
 > The framework is **implemented and packaged** — the generic core, the Hitachi
 > reference driver, the `type: hitachiblock` plugin (`FCLU::Plugin` cutover), and the
-> multi-binary Debian packaging are in place with a green unit suite. The core data
-> path has been **validated live on a Hitachi VSP E590H** cluster: package swap +
-> registry migration, alloc/map/IO/free, snapshots, Thin Image linked clones, and
-> multi-disk `qm clone`. It has **not** been validated against other arrays or at
-> production scale; treat it as lab/test only until verified on your own hardware.
+> multi-binary Debian packaging are in place, with **214 unit tests** green against
+> fakes and simulators.
+>
+> It has been **validated live on a Hitachi VSP E590H** cluster, well past the core
+> data path:
+>
+> - package swap + registry migration, alloc/map/IO/free, online resize;
+> - hardware snapshots, Thin Image linked clones, and multi-disk `qm clone`;
+> - **crash-consistent consistency-group snapshots** (hardware CTG);
+> - a **destructive/robustness battery** — migration and adopt/release, manage/unmanage,
+>   concurrent-lock and persistent-reservation readiness, and byte-verified data
+>   integrity under load with no corruption;
+> - both control planes: the array's **embedded** REST endpoint and **Ops Center
+>   Configuration Manager**.
+>
+> **Why it is still alpha:** the multi-vendor claim is unproven. There is exactly one
+> production driver (Hitachi) plus a mock, so the vendor-neutral abstraction has never
+> been exercised by a second array vendor; replication remains a design, not an
+> implementation. It has not been validated against other arrays or at production
+> scale — treat it as lab/test only until verified on your own hardware.
 
 A vendor-neutral [Proxmox VE](https://www.proxmox.com/) storage framework that
 delivers **first-class per-virtual-disk volume** service over Fibre Channel: **one array LUN per virtual

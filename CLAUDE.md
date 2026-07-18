@@ -11,9 +11,20 @@ implementation) into a reusable multi-vendor framework.
 
 # Status
 
-Design phase — this repo holds the architecture proposal (`ARCHITECTURE.md`). No
-implementation has landed yet; it will be migrated in from `pve-HitachiBlockPlugin`
-per the staged plan in `ARCHITECTURE.md` §9.
+Alpha — implemented, packaged, and live-validated on one array.
+
+The migration from `pve-HitachiBlockPlugin` (`ARCHITECTURE.md` §9) is **done**: the
+generic core, the Hitachi reference driver, the `type: hitachiblock` plugin, and the
+multi-binary Debian packaging are all in tree, with 214 unit tests against
+fakes/simulators. Validated live on a Hitachi VSP E590H — data path, snapshots, linked
+clones, multi-disk `qm clone`, consistency-group snapshots, the destructive/robustness
+battery, and both control planes (embedded REST and Ops Center Configuration Manager).
+See `docs/test-plan.md` §5 for per-phase results.
+
+Still alpha because the multi-vendor claim is unproven: `src/PVE/Storage/FCLU/Driver/`
+holds exactly one production driver (Hitachi) plus a mock, so the vendor-neutral
+abstraction has never been exercised by a second vendor. Replication is designed, not
+implemented. `ARCHITECTURE.md` remains the authoritative design.
 
 # References
 

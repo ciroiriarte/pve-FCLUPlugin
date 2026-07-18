@@ -10,9 +10,11 @@ installed from the multi-binary OBS packages). It validates two things at once:
    driver-contract path, the code-enforced `ldev_range` fence, registry-recorded
    identity, the multi-binary packaging + re-shipped GUI, and the linked-clone flow.
 
-> **Status:** alpha, never run against live hardware. Treat every step as capable of
-> destroying data until proven otherwise. A phase passes only when verified on the
-> E590H — **not** by `make test` (all 165 unit tests run against fakes/simulators).
+> **Status:** alpha. All phases below have been **run live on the E590H** and passed —
+> see the results table in §5. Treat every step as capable of destroying data on *your*
+> hardware until proven otherwise: a phase passes only when verified on the array in
+> front of you, **not** by `make test` (all 214 unit tests run against
+> fakes/simulators).
 
 > **Concrete addressing & secrets** (mgmt IPs, SID, credentials, node names) live in the
 > **local, untracked `TESTING.md`** and the maintainer's project memory — this repo is
@@ -267,20 +269,27 @@ Goal: storage_migrate + the FCLU-new manage/unmanage + the data-integrity gate.
 
 Record: **date, DKCMAIN/microcode, PVE version, the deployed `pve-fclu-*` versions, and
 per-phase pass/fail with deviations.** Save under `t/integration/e590h-<date>.md` (kept out
-of the public tree if it contains addressing). Until the **size-unit gate (C2)**, the
-**fence gate (C6)**, and the **#24 clone gate (E3)** pass, treat exact sizing, the delete
-fence, and space-efficient linked clones as **unverified** on this microcode.
+of the public tree if it contains addressing). The **size-unit gate (C2)**, **fence gate
+(C6)** and **#24 clone gate (E3)** have all passed on DKCMAIN 93-07-23/00. On any other
+microcode or array, treat exact sizing, the delete fence, and space-efficient linked
+clones as **unverified** until those three gates pass there.
+
+Results below are **back-filled from the maintainer's validation log**, not transcribed
+live during each run. All phases were executed on the E590H (DKCMAIN 93-07-23/00) on a
+PVE 9 cluster; the package version column records the build each phase was last
+exercised under. Re-run them on your own hardware rather than treating these as
+inherited passes.
 
 | Phase | Result | Microcode / PVE / pkg ver | Notes / deviations |
 |-------|--------|---------------------------|--------------------|
-| A Discovery | | | |
-| B Install/swap/GUI | | | |
-| C Provisioning + fence | | | |
-| D PVE acceptance | | | |
-| E Snapshots/clones (#24) | | | |
-| F Migration + manage | | | |
-| G Advanced (QoS/PR) | | | |
-| H Teardown | | | |
+| A Discovery | PASS | 93-07-23/00 / PVE 9 / alpha11 | Read-only pre-flight; `snap_pool_id 1` (HDP) confirmed — pool 0 (HDT) rejects Thin Image. |
+| B Install/swap/GUI | PASS | 93-07-23/00 / PVE 9 / alpha11 | Multi-binary install, clean supersede of `pve-storage-hitachiblock`, registry migration, GUI panel renders/persists. |
+| C Provisioning + fence | PASS | 93-07-23/00 / PVE 9 / alpha11 | alloc/map/IO/free, online resize; size-unit gate exact; `ldev_range` fence refuses out-of-range delete. |
+| D PVE acceptance | PASS | 93-07-23/00 / PVE 9 / alpha20 | VM-from-clone works (alpha15); multi-disk `qm clone` end-to-end incl. linked efidisk0+scsi0 and cloud-init (alpha20). |
+| E Snapshots/clones (#24) | PASS | 93-07-23/00 / PVE 9 / alpha15 | **★ #24 gate: the simulator flow WORKS on this microcode** — the deferred host-context orchestration was not required. CG snapshots added later (alpha29/30, hardware CTG, crash-consistent). |
+| F Migration + manage | PASS | 93-07-23/00 / PVE 9 / alpha24–26 | F1–F4 + F6 (2026-07-07/08): data-integrity gate byte-verified, no corruption under load. F5 manage/unmanage (2026-07-08). |
+| G Advanced (QoS/PR) | PARTIAL | 93-07-23/00 / PVE 9 / alpha25–26 | G1–G5 run: G2 PR-readiness PASS, G5 concurrent-lock PASS. G1 found 2 defects (fixed alpha25); G4 found `discard_zero_page` unwired (fixed alpha26). **QoS NOT testable here** — model-gated off on E-series via both control planes; needs a G/F350-900 or VSP 5000. |
+| H Teardown | PASS | 93-07-23/00 / PVE 9 / alpha26 | Registry back to baseline, no stray disks or orphans, fence + `host_group_prefix` intact. |
 
 ### FCLU-specific gates (must pass before "validated")
 - **Packaging/swap gate (B2):** multi-binary install + clean supersede of `pve-storage-hitachiblock`.
