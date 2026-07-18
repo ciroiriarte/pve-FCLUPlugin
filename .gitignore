@@ -21,6 +21,8 @@ debian/pve-fclu/
 # Local agent/orchestration tooling state — never commit (may contain lab specifics).
 # Root-anchored so committed docs/ is unaffected.
 /.claude/
-/.omc/
+# OMC operational state. Unanchored so a nested docs/.omc/ (created when a tool
+# runs with a subdirectory as cwd) is ignored too, not just the repo-root one.
+.omc/
 /.codex/
 /reference/
