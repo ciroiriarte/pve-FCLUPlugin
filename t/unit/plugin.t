@@ -977,4 +977,61 @@ subtest 'consistency groups: cg attribute + explicit crash-consistent group snap
     is_deeply( $reg->find_cg_members('logs'), [], 'cleared CG membership' );
 };
 
+# check_connection() builds a THROWAWAY driver, so unlike the singleton-fake
+# plugins above this one hands out a FRESH driver per _build_driver call — the real
+# semantic, and the only way to tell a probe's session apart from a cached one.
+{
+    package T::ProbePlugin;
+    use parent -norequire, 'PVE::Storage::FCLU::Plugin';
+    our @BUILT;
+    our $FAIL_STATUS = 0;
+    sub type          { 'testblock' }
+    sub vendor        { 'test' }
+    sub driver_class  { 'T::FakeDriver' }
+    sub driver_config { { platform => 'vsp_e', pool_id => '63' } }
+    sub _nodename     { 'node-x' }
+    sub _build_driver {
+        my $d = T::FakeDriver->new;
+        $d->{fail_status} = $FAIL_STATUS;
+        push @BUILT, $d;
+        return $d;
+    }
+}
+
+subtest 'check_connection: probes without disturbing the session cache' => sub {
+    my $PP = 'T::ProbePlugin';
+    local @T::ProbePlugin::BUILT = ();
+    local $T::ProbePlugin::FAIL_STATUS = 0;
+    $PP->deactivate_storage( 'store1', {} );   # start with an empty %DRIVERS
+
+    ok( $PP->check_connection( 'store1', {} ), 'reachable array probes true' );
+    is( scalar @T::ProbePlugin::BUILT, 1, 'probe built one driver' );
+    ok( !$T::ProbePlugin::BUILT[0]{connected}, 'probe tore its own session down' );
+    is( $T::ProbePlugin::BUILT[0]{calls}{disconnect}, 1, 'disconnected exactly once' );
+
+    # The probe must not leave a cached session behind for an inactive storage:
+    # a later deactivate_storage() would have nothing to reap and the session leaks.
+    $PP->deactivate_storage( 'store1', {} );
+    is( $T::ProbePlugin::BUILT[0]{calls}{disconnect}, 1, 'probe cached no driver to reap' );
+
+    # An unreachable pool is "offline", not fatal — PVE::Storage wraps this in eval
+    # and reports a false return as "storage is not online".
+    {
+        local $T::ProbePlugin::FAIL_STATUS = 1;
+        my $res = eval { $PP->check_connection( 'store1', {} ) };
+        ok( !$@, 'unreachable pool does not die' );
+        ok( !$res, 'unreachable pool probes false' );
+        is( $T::ProbePlugin::BUILT[-1]{calls}{disconnect}, 1, 'session torn down on failure too' );
+    }
+
+    # An active storage's cached session must survive a probe.
+    $PP->activate_storage( 'store1', {} );
+    my $active = $T::ProbePlugin::BUILT[-1];
+    ok( $PP->check_connection( 'store1', {} ), 'probe while active' );
+    isnt( $T::ProbePlugin::BUILT[-1], $active, 'probe used a separate driver' );
+    ok( $active->{connected}, 'active session left connected' );
+    ok( !$active->{calls}{disconnect}, 'active session never disconnected by the probe' );
+    $PP->deactivate_storage( 'store1', {} );
+};
+
 done_testing();

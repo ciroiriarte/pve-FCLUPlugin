@@ -267,6 +267,32 @@ sub deactivate_storage {
     return 1;
 }
 
+# Reachability probe for PVE::Storage::activate_storage(), which calls this before
+# activation and reports "storage '$storeid' is not online" when it returns false.
+#
+# Deliberately uses a THROWAWAY session rather than _driver(): the probe must not
+# populate %DRIVERS (a cached session would outlive a probe on an inactive storage)
+# nor tear down a session an active storage is using. Never dies — the caller wraps
+# this in eval and treats a false return as offline, so an unreachable array must
+# read as "offline", not as a fatal error.
+sub check_connection {
+    my ($class, $storeid, $scfg) = @_;
+
+    my $ok = eval {
+        my $d = $class->_build_driver( $storeid, $scfg );
+        eval {
+            $d->connect;
+            $d->storage_status;   # reaching the pool, not just the endpoint
+        };
+        my $err = $@;
+        eval { $d->disconnect };  # guaranteed teardown, success or failure
+        die $err if $err;
+        1;
+    };
+
+    return $ok ? 1 : 0;
+}
+
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
     my ( $total, $free, $used ) = $class->_driver( $storeid, $scfg )->storage_status;
