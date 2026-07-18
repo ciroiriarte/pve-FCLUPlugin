@@ -8,3 +8,5 @@ lib/systemd/system/qemu-pr-helper.socket
 lib/systemd/system/qemu-pr-helper.service
 usr/share/doc/pve-fclu-hitachi/storage.cfg.example
 usr/share/doc/pve-fclu-hitachi/hitachiblock-vsp.conf
+usr/share/doc/pve-fclu-hitachi/driver-hitachi.md
+usr/share/doc/pve-fclu-hitachi/migration-hitachi.md

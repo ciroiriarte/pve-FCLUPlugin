@@ -1,3 +1,24 @@
+pve-fclu (0.1.0~alpha35) stable; urgency=medium
+
+  * fclu: implement check_connection() — the plugin inherited the base method, which
+    always returns 1, so PVE::Storage::activate_storage() could never report an
+    unreachable array as offline. It now connects and reaches the pool, using a
+    throwaway session so the probe neither populates nor tears down the driver cache,
+    and returns false (not die) so an unreachable array reads as offline.
+  * packaging: ship the operator documentation. usr/share/doc/pve-fclu-core now carries
+    user-guide.md, and usr/share/doc/pve-fclu-hitachi carries driver-hitachi.md and
+    migration-hitachi.md. Previously an operator who installed the .deb got the sample
+    configs but no guide, with the documentation only readable from the git tree.
+    Developer docs (test-plan, packaging-obs, implementation-plan, branding) stay
+    in-tree deliberately — they describe building the project, not running it.
+  * docs: correct stale project-status claims. CLAUDE.md said "design phase, no
+    implementation"; docs/test-plan.md said "never run against live hardware" with an
+    empty A–H results table. Both contradicted many releases of live validation. The
+    alpha label is kept, with the structural reason stated: one production driver plus
+    a mock, so the vendor-neutral abstraction is still unproven by a second vendor.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Sat, 18 Jul 2026 15:40:00 -0300
+
 pve-fclu (0.1.0~alpha34) stable; urgency=medium
 
   * hitachi: cut clone host-mapping REST amplification (HBSD backlog T2, GH #17).

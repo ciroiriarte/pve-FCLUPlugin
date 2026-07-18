@@ -14,6 +14,7 @@ FCLU=$(DESTDIR)$(PERL_VENDORLIB)/PVE/Storage/FCLU
 CUSTOM=$(DESTDIR)$(PERL_VENDORLIB)/PVE/Storage/Custom
 PVE_MANAGER_JS=$(DESTDIR)$(PREFIX)/share/pve-manager/js
 SYSTEMD_UNIT_DIR=$(DESTDIR)/lib/systemd/system
+CORE_DOC=$(DESTDIR)$(PREFIX)/share/doc/pve-fclu-core
 HITACHI_DOC=$(DESTDIR)$(PREFIX)/share/doc/pve-fclu-hitachi
 INDEX_TPL=$(PREFIX)/share/pve-manager/index.html.tpl
 GUI_JS=pve-fclu-hitachi.js
@@ -63,9 +64,17 @@ install:
 	install -d $(SYSTEMD_UNIT_DIR)
 	install -m0644 conf/systemd/qemu-pr-helper.socket  $(SYSTEMD_UNIT_DIR)/
 	install -m0644 conf/systemd/qemu-pr-helper.service $(SYSTEMD_UNIT_DIR)/
+	# Operator documentation ships with the package it documents: the vendor-neutral
+	# guide with the core, the driver/migration guides with the Hitachi driver.
+	# Developer-facing docs (test-plan, packaging-obs, implementation-plan, branding)
+	# stay in-tree — they document how to BUILD the project, not how to run it.
+	install -d $(CORE_DOC)
+	install -m0644 docs/user-guide.md $(CORE_DOC)/
 	install -d $(HITACHI_DOC)
 	install -m0644 conf/storage.cfg.example                    $(HITACHI_DOC)/
 	install -m0644 conf/multipath.conf.d/hitachiblock-vsp.conf $(HITACHI_DOC)/
+	install -m0644 docs/driver-hitachi.md                      $(HITACHI_DOC)/
+	install -m0644 docs/migration-hitachi.md                   $(HITACHI_DOC)/
 	# Source installs (empty DESTDIR) wire the UI <script> into the live index
 	# template; the .deb does this via debian/pve-fclu-hitachi.{postinst,triggers}.
 	@if [ -z "$(DESTDIR)" ] && [ -f "$(INDEX_TPL)" ]; then \
