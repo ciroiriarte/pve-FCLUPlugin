@@ -90,12 +90,16 @@ systemctl restart pvedaemon
 
 ### Contributing a driver
 
-- **[`docs/driver-authoring.md`](docs/driver-authoring.md)** — add support for a new array
-  vendor: the 18-method driver contract, the typed error vocabulary, capability
-  advertisement, the ~40-line PVE shim, and the parametrized conformance suite that
-  defines what "conforms to `fclu-driver-api-1`" means. **A driver for a second vendor is
-  the most valuable contribution this project can take right now** — it is what proves or
-  corrects the vendor-neutral abstraction.
+- **[`docs/driver-authoring.md`](docs/driver-authoring.md)** — the tutorial: a runnable
+  driver skeleton, the conformance test, and the make-it-fail-then-pass loop, plus the PVE
+  shim and packaging. Start here.
+- **[`docs/driver-contract.md`](docs/driver-contract.md)** — the reference for
+  `fclu-driver-api-1`: the 18 mandatory and 10 capability-gated methods, data shapes, the
+  idempotency/retry table, the typed error vocabulary, capability advertisement, and the
+  host-access safety invariants.
+
+**A driver for a second vendor is the most valuable contribution this project can take
+right now** — it is what proves or corrects the vendor-neutral abstraction.
 
 ## Design provenance
 
