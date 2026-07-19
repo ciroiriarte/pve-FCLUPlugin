@@ -876,6 +876,10 @@ sub create_full_clone {
 #
 # The caller owns $group and MUST pass it; every pair sharing a group name is captured
 # together. Returns the S-VOL backend id.
+# NOTE on copying FROM A SNAPSHOT: $backend_id is whatever LDEV is to be copied, which
+# for a snapshot source is that snapshot's S-VOL, not the volume's P-VOL. Resolving
+# which one that is belongs to the caller. Getting this wrong copies live data while
+# reporting success -- the copy would look correct and hold the wrong contents.
 sub prepare_full_clone {
     my ($self, $backend_id, %args) = @_;
 
