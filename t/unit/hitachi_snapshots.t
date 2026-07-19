@@ -215,4 +215,75 @@ subtest 'N7: full clone waits for completion and surfaces a PSUE copy failure' =
     is( ref $err && $err->code, 'internal', 'PSUE copy failure surfaced as an error' );
 };
 
+subtest 'grouped full clone: prepare is idle, one group action starts every pair' => sub {
+    my ( $d, $f ) = setup();
+    my $a = $d->create_lu( size_bytes => GIB );
+    my $b = $d->create_lu( size_bytes => GIB );
+    my $grp = 'pveRoleA';
+
+    my $sa = $d->prepare_full_clone( $a, snapshot_group => $grp );
+    my $sb = $d->prepare_full_clone( $b, snapshot_group => $grp );
+    isnt( $sa, $sb, 'each prepare allocated its own S-VOL' );
+    is( $f->{calls}{clone_snapshot_to_ldev}, 2, 'one pair created per disk' );
+
+    # The array rejects a consistency group with autoSplit on, so the driver must ask
+    # for the grouped shape -- otherwise each pair would fire at its own instant.
+    ok( $f->{last_clone_opts}{is_consistency_group}, 'pairs created as a consistency group' );
+
+    # Nothing has copied yet: prepare must not move data, so the freeze can be entered
+    # after every disk is prepared.
+    ok( !$f->{calls}{clone_snapshotgroup}, 'prepare did not trigger the group' );
+    is( $d->clone_copy_state( $a, $grp, $sa ), 'pending', 'disk A idle before trigger' );
+    is( $d->clone_copy_state( $b, $grp, $sb ), 'pending', 'disk B idle before trigger' );
+
+    # ONE action for the whole group, regardless of disk count: this is what keeps the
+    # guest freeze to a single request.
+    ok( $d->start_clone_group($grp), 'group started' );
+    is( $f->{calls}{clone_snapshotgroup}, 1, 'exactly one array action for both disks' );
+
+    is( $d->clone_copy_state( $a, $grp, $sa ), 'complete', 'disk A independent' );
+    is( $d->clone_copy_state( $b, $grp, $sb ), 'complete', 'disk B independent' );
+};
+
+subtest 'grouped full clone: several role groups are independent' => sub {
+    my ( $d, $f ) = setup();
+    my $a = $d->create_lu( size_bytes => GIB );
+    my $b = $d->create_lu( size_bytes => GIB );
+
+    my $sa = $d->prepare_full_clone( $a, snapshot_group => 'pveData' );
+    my $sb = $d->prepare_full_clone( $b, snapshot_group => 'pveLog' );
+
+    # Triggering one role's group must not start the other's -- disks grouped by role
+    # are captured per group, and only the caller's freeze spans them.
+    $d->start_clone_group('pveData');
+    is( $d->clone_copy_state( $a, 'pveData', $sa ), 'complete', 'triggered group ran' );
+    is( $d->clone_copy_state( $b, 'pveLog',  $sb ), 'pending',  'other group untouched' );
+
+    $d->start_clone_group('pveLog');
+    is( $d->clone_copy_state( $b, 'pveLog', $sb ), 'complete', 'second group ran' );
+};
+
+subtest 'grouped full clone: rollback and argument guards' => sub {
+    my ( $d, $f ) = setup();
+    my $bid = $d->create_lu( size_bytes => GIB );
+
+    my $err;
+    eval { $d->prepare_full_clone($bid); 1 } or $err = $@;
+    is( ref $err && $err->code, 'invalid', 'prepare requires a group name' );
+
+    $err = undef;
+    eval { $d->start_clone_group(''); 1 } or $err = $@;
+    is( ref $err && $err->code, 'invalid', 'start requires a group name' );
+
+    # A failed pair creation must not leak the S-VOL it just allocated on the shared pool.
+    my $before = scalar @{ $d->list_lus };
+    {
+        no warnings 'redefine';
+        local *FCLU::FakeHitachiRest::clone_snapshot_to_ldev = sub { die "boom\n" };
+        eval { $d->prepare_full_clone( $bid, snapshot_group => 'pveX' ); 1 };
+        ok( $@, 'prepare failure surfaced' );
+    }
+    is( scalar @{ $d->list_lus }, $before, 'unpaired S-VOL was rolled back, not leaked' );
+};
+
 done_testing();

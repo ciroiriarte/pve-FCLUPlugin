@@ -675,7 +675,14 @@ sub create_snapshot {
     # autoSplit=true splits the pair right after creation so the S-VOL becomes host
     # R/W-accessible (PSUS) while still sharing unchanged blocks with the P-VOL via
     # the pool (copy-on-write). Default on; pass auto_split=0 only to leave the pair
-    # un-split (reference-only S-VOL). NOTE: must NOT be combined with isClone=true.
+    # un-split (reference-only S-VOL).
+    #
+    # NOTE: auto_split=0 combines with isClone=true ONLY as part of a consistency
+    # group; that is the grouped-clone recipe (see clone_snapshot_to_ldev). Verified
+    # live on the E590H (93-07-23/00): isClone+isConsistencyGroup+autoSplit=true is
+    # rejected with KART20016-E ("combination of the specified parameters is
+    # invalid"), because a group's whole point is that the group action, not pair
+    # creation, is the trigger.
     my $auto_split = (exists $opts{auto_split} && !$opts{auto_split}) ? JSON::false : JSON::true;
 
     my $body = {
@@ -808,19 +815,52 @@ sub clone_snapshot_to_ldev {
     croak "svol_ldev_id is required"  unless defined $opts{svol_ldev_id};
     croak "snap_pool_id is required"  unless defined $opts{snap_pool_id};
 
+    # Two shapes, and the array rejects any mix of them (verified live on the E590H,
+    # microcode 93-07-23/00):
+    #
+    #   standalone  isConsistencyGroup=false, autoSplit=true
+    #               the copy starts at pair creation -- one clone, fire and forget.
+    #   grouped     isConsistencyGroup=true,  autoSplit=false
+    #               the pair is created idle (reaches PAIR) and the copy starts only
+    #               when clone_snapshotgroup() triggers the whole group, so every
+    #               S-VOL in it is captured at the same instant.
+    #
+    # Asking for a consistency group with autoSplit=true is rejected with KART20016-E,
+    # since a group exists precisely so the group action is the trigger.
+    my $grouped = $opts{is_consistency_group} ? 1 : 0;
+
     my $body = {
         snapshotGroupName  => $opts{snapshot_group} || 'pve_clone',
         snapshotPoolId     => int($opts{snap_pool_id}),
         pvolLdevId         => int($opts{pvol_ldev_id}),
         svolLdevId         => int($opts{svol_ldev_id}),
         isClone            => JSON::true,
-        isConsistencyGroup => JSON::false,
-        autoSplit          => JSON::true,
+        isConsistencyGroup => $grouped ? JSON::true  : JSON::false,
+        autoSplit          => $grouped ? JSON::false : JSON::true,
     };
 
     $body->{copySpeed} = int($opts{copy_speed}) if defined $opts{copy_speed};
 
     my $res = $self->_request('POST', $self->_url('/snapshots'), $body);
+    return $self->_wait_for_job($res);
+}
+
+# Start every clone pair in a snapshot group, in one action: all S-VOLs begin copying
+# from the same instant. The object id is the group NAME.
+#
+# Clone groups take the `clone` action, NOT `split` -- the snapshot CG path's
+# split_snapshotgroup() is rejected on clone pairs with "The clone option (indicated or
+# not) in the command does not match the clone attribute of the specified snapshot
+# pairs", and passing isClone to split is rejected with KART40038-E. Body is
+# {"parameters":{}}, the same empty-params form the other actions take on this
+# microcode. Verified live on the E590H (93-07-23/00).
+sub clone_snapshotgroup {
+    my ($self, $group_name) = @_;
+
+    croak "group_name is required" unless defined $group_name;
+
+    my $res = $self->_request('POST',
+        $self->_url("/snapshot-groups/$group_name/actions/clone/invoke"), { parameters => {} });
     return $self->_wait_for_job($res);
 }
 

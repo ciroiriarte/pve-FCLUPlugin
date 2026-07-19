@@ -865,6 +865,91 @@ sub create_full_clone {
     return $svol_id;
 }
 
+# Grouped full clone, phase 1 of 2: allocate the S-VOL and create the clone pair IDLE
+# under $group. NO DATA MOVES until start_clone_group() triggers the group, so this may
+# be done ahead of time -- outside a guest freeze -- for every disk of a VM.
+#
+# That split is the whole point: on this array the copy's point in time is fixed by the
+# GROUP ACTION, not by pair creation, so a caller can prepare N disks at leisure and then
+# capture all of them with a single request while the guest is frozen. The freeze holds
+# one request regardless of disk count.
+#
+# The caller owns $group and MUST pass it; every pair sharing a group name is captured
+# together. Returns the S-VOL backend id.
+sub prepare_full_clone {
+    my ($self, $backend_id, %args) = @_;
+
+    my $group = $args{snapshot_group};
+    $self->_err( 'invalid', 'prepare_full_clone requires a snapshot_group' )
+        unless defined $group && length $group;
+
+    my $src = $self->_call( sub { $self->{rest}->get_ldev($backend_id) } );
+    $self->_err( 'not_found', "no such ldev '$backend_id'" )
+        unless $self->_is_defined_ldev($src);
+
+    my $svol_id = $self->_alloc_svol( $src, %args );
+
+    my $ok = eval {
+        $self->_call( sub {
+            $self->{rest}->clone_snapshot_to_ldev(
+                pvol_ldev_id         => $backend_id,
+                svol_ldev_id         => $svol_id,
+                snap_pool_id         => $self->{snap_pool_id},
+                snapshot_group       => $group,
+                is_consistency_group => 1,
+            );
+        } );
+        1;
+    };
+    if ( !$ok ) {
+        my $err = $@;
+        # The S-VOL we just allocated has no pair: drop it rather than leak it on the
+        # shared pool.
+        eval { $self->{rest}->delete_ldev( int($svol_id) ) };
+        warn "FCLU Hitachi: grouped-clone rollback: deleting unpaired S-VOL '$svol_id'"
+            . " failed — LEAKED on the shared pool: $@" if $@;
+        die ref $err ? $err : "prepare_full_clone failed: $err";
+    }
+
+    return $svol_id;
+}
+
+# Grouped full clone, phase 2 of 2: start every prepared pair in $group with ONE array
+# action, so all S-VOLs are captured at the same instant.
+#
+# Cheap and non-blocking by design -- the caller may hold a guest filesystem freeze
+# across it. The data movement runs afterwards; poll clone_copy_state() for completion.
+sub start_clone_group {
+    my ($self, $group) = @_;
+
+    $self->_err( 'invalid', 'start_clone_group requires a group name' )
+        unless defined $group && length $group;
+
+    $self->_call( sub { $self->{rest}->clone_snapshotgroup($group) } );
+
+    return 1;
+}
+
+# Non-blocking state of one prepared/started clone: 'complete' once the pair is gone or
+# SMPL (the S-VOL is then INDEPENDENT of its source), otherwise 'pending'. Dies on PSUE,
+# a failed copy. A pair still sitting in PAIR is prepared-but-not-yet-triggered, which is
+# also 'pending' from the caller's point of view.
+sub clone_copy_state {
+    my ($self, $pvol, $group, $svol) = @_;
+
+    my $snaps =
+        eval { $self->_call( sub { $self->{rest}->list_snapshots( pvol_ldev_id => $pvol ) } ) }
+        // [];
+    my ($pair) = grep { ( $_->{snapshotGroupName} // '' ) eq $group } @$snaps;
+    my $st = $pair ? ( $pair->{status} // '' ) : '';
+
+    $self->_err( 'internal', "full clone to S-VOL '$svol' failed (pair status PSUE)" )
+        if $st eq 'PSUE';
+
+    return 'complete' if !$pair || $st eq 'SMPL';
+    return 'pending';
+}
+
 # N7: poll the isClone pair on $pvol under $group until the copy completes. A full clone
 # pair AUTO-DELETES on completion (S-VOL becomes independent), so "pair gone" (or SMPL) =
 # done; PSUE = copy failed (fatal). interval<=0 probes once (test fast-path). Returns 1 on

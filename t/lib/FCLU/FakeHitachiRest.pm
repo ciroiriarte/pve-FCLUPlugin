@@ -186,7 +186,38 @@ sub _new_snap {
 sub create_snapshot      { my ( $s, %o ) = @_; $s->_c('create_snapshot');      return $s->_new_snap(%o) }
 # isClone: the copy runs async then the pair AUTO-DELETES (S-VOL independent). Model the
 # completed state — leave no lingering pair — so the N7 completion wait resolves cleanly.
-sub clone_snapshot_to_ldev { my ( $s, %o ) = @_; $s->_c('clone_snapshot_to_ldev'); return { resourceId => "$o{svol_ldev_id}" } }
+sub clone_snapshot_to_ldev {
+    my ( $s, %o ) = @_;
+    $s->_c('clone_snapshot_to_ldev');
+    $s->{last_clone_opts} = {%o};
+    # Grouped: the pair is created IDLE (PAIR) and copies nothing until the group is
+    # triggered, so it must linger. Standalone: modelled as already complete (above).
+    if ( $o{is_consistency_group} ) {
+        my $sid = "$o{pvol_ldev_id},g";
+        $s->{snaps}{$sid} = {
+            snapshotId        => $sid,
+            snapshotGroupName => $o{snapshot_group},
+            status            => 'PAIR',
+            pvolLdevId        => "$o{pvol_ldev_id}",
+            svolLdevId        => "$o{svol_ldev_id}",
+        };
+    }
+    return { resourceId => "$o{svol_ldev_id}" };
+}
+# One action starts every pair in the group; model completion (pair dissolves to SMPL,
+# S-VOL independent) so clone_copy_state() reports 'complete' afterwards.
+sub clone_snapshotgroup {
+    my ( $s, $group ) = @_;
+    $s->_c('clone_snapshotgroup');
+    my $n = 0;
+    for my $sn ( values %{ $s->{snaps} } ) {
+        next if ( $sn->{snapshotGroupName} // '' ) ne $group;
+        $sn->{status} = 'SMPL';
+        $n++;
+    }
+    die "API request failed: no such snapshot group '$group' -> 404 Not Found\n" if !$n;
+    return 1;
+}
 sub list_snapshots {
     my ( $s, %f ) = @_; $s->_c('list_snapshots');
     return [ map { { %{ $s->{snaps}{$_} } } }
