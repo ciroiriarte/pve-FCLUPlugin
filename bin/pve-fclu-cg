@@ -142,7 +142,7 @@ elsif ( $cmd eq 'clone' ) {
     printf "cloned cg '%s' -> %d independent full-clone volume(s) for VM %s:\n",
         $cgname, scalar @$vols, $vmid;
     print "  $_\n" for @$vols;
-    print "(attach them to VM $vmid's config, e.g. `qm set $vmid -scsiN <volid>`)\n";
+    print "(attach them to VM $vmid config, e.g. `qm set $vmid -scsiN <volid>`)\n";
 }
 else {
     usage("unknown command '$cmd'");

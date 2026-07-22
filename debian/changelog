@@ -1,3 +1,13 @@
+pve-fclu (0.1.0~alpha37) stable; urgency=medium
+
+  * pve-fclu-cg: fix a `$vmid's` in the `clone` output that Perl parsed as the archaic
+    `'` package separator ($vmid::s), so the attach hint rendered "VM  config" (blank)
+    and warned "Old package separator used in string" on every invocation. Drop the
+    possessive apostrophe. Found during the alpha36 grouped-clone live validation on the
+    E590H (which otherwise PASSED: 2 independent full clones, correct size, no parent).
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Tue, 21 Jul 2026 11:10:00 -0300
+
 pve-fclu (0.1.0~alpha36) stable; urgency=medium
 
   * fclu: wire the grouped full-clone primitives to a consumer. New `pve-fclu-cg clone
