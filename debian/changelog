@@ -1,3 +1,18 @@
+pve-fclu (0.1.0~alpha39) stable; urgency=medium
+
+  * hitachi: shard nodes across FC target-port groups (#5). Optional port_groups +
+    node_port_groups (default off => every node maps to all target_ports, unchanged).
+    A LU path is consumed per (LDEV x host-group x port) and the per-FE-port budget is
+    the aggregate across all host groups on that port, so a whole cluster sharing two
+    ports caps at ~2,048 mapped disks regardless of node count; sharding nodes across N
+    disjoint port groups multiplies that ceiling by N, within one storeid so migration
+    is preserved. _resolve_local_ports narrows the four per-node mapping loops; validation
+    fails loud on stranding typos and warns on a single-port (non-HA) group. Manual zoning
+    prerequisite; derive-from-login + auto-policy deferred to the Fabric plane. New
+    docs/adr/0003 + driver-hitachi.md section. 223 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 22 Jul 2026 14:31:47 -0300
+
 pve-fclu (0.1.0~alpha38) stable; urgency=medium
 
   * hitachi: offload a linked clone from a LIVE ('current') volume (#19). A Thin Image
