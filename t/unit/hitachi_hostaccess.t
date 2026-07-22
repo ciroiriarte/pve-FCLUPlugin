@@ -129,6 +129,8 @@ sub drv {
         host_mode_options => $o{hmo} // [ 2, 22, 25, 68 ],
         ( $o{skip_unmap} ? ( skip_unmap_io_check => 1 ) : () ),
         ( defined $o{prefix} ? ( host_group_prefix => $o{prefix} ) : () ),
+        ( defined $o{port_groups} ? ( port_groups => $o{port_groups} ) : () ),
+        ( defined $o{node_port_groups} ? ( node_port_groups => $o{node_port_groups} ) : () ),
     );
     $d->{_lun_op_delay} = 0;   # N8: no real sleeps in the map/unmap retry loops under test
     return $d;
@@ -184,6 +186,63 @@ subtest 'skip_unmap_io_check appends HMO 91' => sub {
     my $d = drv( $f, array_ports => ['CL1-A'], skip_unmap => 1 );
     $d->ensure_host_access( ctx('node-a') );
     ok( ( grep { $_ == 91 } @{ $f->{hgs}{'CL1-A,0'}{hostModeOptions} } ), 'HMO 91 present' );
+};
+
+# ── Port-group sharding (#5) ──
+
+subtest '#5 _resolve_local_ports: off => all; mapped => group; unmapped => all; intersect' => sub {
+    my $f = FakeRest->new;
+    my $all = [ 'CL1-A', 'CL2-A', 'CL3-A', 'CL4-A' ];
+
+    my $off = drv( $f, array_ports => $all );
+    is_deeply( $off->_resolve_local_ports('pve01'), $all, 'feature off => all target_ports' );
+
+    my $d = drv( $f, array_ports => $all,
+        port_groups      => 'g1=CL1-A,CL2-A g2=CL3-A,CL4-A',
+        node_port_groups => 'pve01=g1 pve02=g1 pve03=g2' );
+    is_deeply( $d->_resolve_local_ports('pve01'), [ 'CL1-A', 'CL2-A' ], 'node in g1 => g1 ports' );
+    is_deeply( $d->_resolve_local_ports('pve03'), [ 'CL3-A', 'CL4-A' ], 'node in g2 => g2 ports' );
+    is_deeply( $d->_resolve_local_ports('pve99'), $all, 'unmapped node => all ports (safe fallback)' );
+};
+
+subtest '#5 ensure_host_access + publish only touch the node\'s group ports' => sub {
+    my $f = FakeRest->new;
+    my $d = drv( $f, array_ports => [ 'CL1-A', 'CL2-A', 'CL3-A', 'CL4-A' ],
+        port_groups      => 'g1=CL1-A,CL2-A g2=CL3-A,CL4-A',
+        node_port_groups => 'pve01=g1 pve03=g2' );
+
+    $d->ensure_host_access( ctx('pve01') );
+    is( $f->{calls}{create_host_group}, 2, 'pve01 (g1): host groups on exactly its 2 ports' );
+    ok(  $f->find_host_group_by_name( 'CL1-A', 'PVE_pve01' ), 'group on CL1-A (in g1)' );
+    ok(  $f->find_host_group_by_name( 'CL2-A', 'PVE_pve01' ), 'group on CL2-A (in g1)' );
+    ok( !$f->find_host_group_by_name( 'CL3-A', 'PVE_pve01' ), 'NO group on CL3-A (g2, not pve01\'s)' );
+    ok( !$f->find_host_group_by_name( 'CL4-A', 'PVE_pve01' ), 'NO group on CL4-A (g2, not pve01\'s)' );
+
+    # publish_lu maps the LU only on g1's ports.
+    $d->publish_lu( '256', ctx('pve01') );
+    my %mapped_ports = map { $_->{portId} => 1 } grep { $_->{ldevId} eq '256' } @{ $f->{luns} };
+    is_deeply( [ sort keys %mapped_ports ], [ 'CL1-A', 'CL2-A' ],
+        'LU 256 mapped on exactly g1\'s ports (not g2)' );
+};
+
+subtest '#5 validation: bad port + undefined group die; <2 ports warns' => sub {
+    my $f = FakeRest->new;
+    eval { drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ], port_groups => 'g1=CL1-A,CL9-Z',
+        node_port_groups => 'pve01=g1' ) };
+    like( $@, qr/not in target_ports/, 'a group port outside target_ports dies' );
+
+    eval { drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ], port_groups => 'g1=CL1-A,CL2-A',
+        node_port_groups => 'pve01=nope' ) };
+    like( $@, qr/undefined group/, 'a node assigned to an undefined group dies' );
+
+    eval { drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ], port_groups => 'g1=',
+        node_port_groups => 'pve01=g1' ) };
+    like( $@, qr/has no ports/, 'an empty group dies (would silently fall back to all ports)' );
+
+    my @warn;
+    local $SIG{__WARN__} = sub { push @warn, $_[0] };
+    drv( $f, array_ports => [ 'CL1-A', 'CL2-A' ], port_groups => 'g1=CL1-A', node_port_groups => 'pve01=g1' );
+    ok( ( grep { /single port/ } @warn ), 'a single-port group warns (no MPIO/HA)' );
 };
 
 subtest 'host_ctx validation' => sub {

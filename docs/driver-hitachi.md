@@ -80,6 +80,8 @@ not the control plane). `mgmt_port` overrides the port either way.
 | `port_scheduler`     | 0              | Spread LUN mappings across target ports with stable, deterministic per-LDEV port selection. |
 | `group_delete`       | 0              | Auto-delete empty host groups on storage deactivation. |
 | `host_group_prefix`  | `PVE`          | See below + the user guide's shared-pool section. |
+| `port_groups`        | — (off)        | Port-group sharding (#5): named groups, `g1=CL1-A,CL2-A g2=CL3-A,CL4-A`. See below. |
+| `node_port_groups`   | — (off)        | Node→group assignment for `port_groups`, `pve01=g1 pve02=g1 pve03=g2`. |
 
 **Host groups** are named `<host_group_prefix>_<hostname>`, one per FC target port.
 The prefix defaults to a stable short **`PVE`** (matching groups created as
@@ -99,6 +101,46 @@ prefix per cluster on a shared pool.
   `get_ldev->{ports}` **view**, so `list_lu_mappings` keys on `(port,
   hostGroupNumber)` — never on the name — and name resolution is
   truncation-tolerant.
+
+### Port-group sharding (`port_groups` / `node_port_groups`, #5)
+
+By default every node maps its host groups + LU paths onto **all** `target_ports`. A "LU
+path" is consumed per **(LDEV × host-group × port)**, and the per-FE-port budget (**2,048**
+LU paths on midrange, **4,096** on high-end; **255** host groups/port) is the aggregate
+across *all* host groups on that physical port. So if the whole cluster shares two ports,
+those two ports cap the cluster at **~2,048 mapped disks regardless of node count**.
+
+Shard nodes across **disjoint** port groups to multiply that ceiling — within **one**
+storage (migration preserved):
+
+```
+target_ports      CL1-A,CL2-A,CL3-A,CL4-A
+port_groups       g1=CL1-A,CL2-A g2=CL3-A,CL4-A
+node_port_groups  pve01=g1 pve02=g1 pve03=g2 pve04=g2
+```
+
+```
+4 groups × 2,048 ≈ 8,192  live disks (midrange)
+4 groups × 4,096 ≈ 16,384 live disks (high-end)
+```
+
+- **Default off** — unset ⇒ today's behavior (all nodes on all ports), byte-for-byte.
+- **≥2 ports per group on different controllers** for MPIO + controller-failover HA (a
+  single-port group **warns**). A node **not** listed in `node_port_groups` safely falls
+  back to all ports.
+- **Manual zoning is a prerequisite:** zone each node's HBAs to exactly its group's ports.
+  A node that cannot reach any of its group's ports fails loud on activation. The plugin
+  does not program the fabric (that is #1, auto-zoning).
+- **Migration** stays free (one `storeid`). Size each group with headroom — a same-group
+  migration briefly double-counts LU paths during handover; the destination's zoning must
+  pre-exist. WWID/NAA is derived from the LDEV, so multipath identity is stable across ports.
+- **Drain before reassigning.** Per-node resolution narrows unpublish/reclaim to a node's
+  *current* ports, so **unpublish/migrate a node's volumes off before changing its
+  `node_port_groups` entry or first enabling the feature** — otherwise mappings left on the
+  old ports leak until the volume is deleted (`free_image` reaps them via the LDEV's actual
+  ports). See [ADR 0003](adr/0003-port-group-sharding.md).
+- Composes with `port_scheduler` (spread volumes *within* a group); deriving the port set
+  from the array's fabric-login table is deferred — see [ADR 0003](adr/0003-port-group-sharding.md).
 
 ## Thin Image snapshots & clones
 

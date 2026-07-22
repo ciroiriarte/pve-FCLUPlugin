@@ -112,6 +112,12 @@ sub new {
             ? $opts{host_group_prefix} : 'PVE',
     }, $class;
 
+    # Port-group sharding (#5): parsed like array_ports; validated only when the feature is
+    # on, so an off store (no port_groups) behaves exactly as before with no new errors.
+    $self->{port_groups}      = _parse_port_groups( $opts{port_groups} );
+    $self->{node_port_groups} = _parse_node_port_groups( $opts{node_port_groups} );
+    $self->_validate_port_groups if %{ $self->{port_groups} };
+
     # Build a real transport unless one was injected (tests inject a mock).
     unless ( $self->{rest} ) {
         my $prof = $self->profile;
@@ -1046,7 +1052,9 @@ sub ensure_host_access {
     my @hmo = @{ $self->{host_mode_options} };
     push @hmo, 91 if $self->{skip_unmap_io_check} && !grep { $_ == 91 } @hmo;
 
-    for my $port ( @{ $self->{array_ports} } ) {
+    # #5: only THIS node's port group (all target_ports when the feature is off).
+    my $ports = $self->_resolve_local_ports($hostname);
+    for my $port ( @$ports ) {
         # Idempotent: reuse an existing group (by our name, else by any of our
         # WWNs); only create when truly absent, then re-look-up for the
         # array-assigned hostGroupNumber.
@@ -1170,8 +1178,8 @@ sub ensure_host_access {
     # zoning / HBA-login misconfig (every freshly-created group came up empty + was rolled
     # back). A subset of working ports (asymmetric zoning) is fine and proceeds.
     $self->_err( 'internal',
-        "node '$hostname' registered none of its WWNs (@$wwns) on ANY configured array port "
-        . "(@{ $self->{array_ports} }) — check FC zoning and HBA fabric login." )
+        "node '$hostname' registered none of its WWNs (@$wwns) on ANY of its array ports "
+        . "(@$ports) — check FC zoning and HBA fabric login." )
         unless $any_access;
 
     return $access_ref // $hg_name;
@@ -1239,7 +1247,7 @@ sub reclaim_empty_host_groups {
     my $wwns     = $ctx{initiators};
     my $hg_name  = $self->_hg_name($hostname);
     my @reaped;
-    for my $port ( @{ $self->{array_ports} } ) {
+    for my $port ( @{ $self->_resolve_local_ports($hostname) } ) {
         # Resolve OUR group + prove ownership; a conflict (foreign WWNs) or absence => skip.
         my $hg = eval { $self->_resolve_owned_hg( $port, $hg_name, $wwns ) };
         next if $@ || !$hg;
@@ -1300,7 +1308,7 @@ sub publish_lu {
     my $wwns = $ctx{initiators};
 
     my ( $head_lun, $access_ref );
-    for my $port ( @{ $self->{array_ports} } ) {
+    for my $port ( @{ $self->_resolve_local_ports($hostname) } ) {
         # #1 SAFETY GATE: resolve the node's group AND prove ownership (fresh WWN read)
         # before mapping — never map into a foreign/number-reused group.
         my $hg = $self->_resolve_owned_hg( $port, $hg_name, $wwns );
@@ -1332,7 +1340,7 @@ sub unpublish_lu {
     # Remove ONLY this node's mapping (the host group matched by the node's WWNs);
     # other nodes' host groups are left intact (§12.2 live-migration rule).
     my ( $attempted, $failed, $last_err ) = ( 0, 0, undef );
-    for my $port ( @{ $self->{array_ports} } ) {
+    for my $port ( @{ $self->_resolve_local_ports($hostname) } ) {
         # #1 SAFETY GATE, symmetric with publish_lu: resolve the node's group AND prove
         # ownership with a fresh read — INCLUDING the invalidate-and-re-resolve-once on a
         # stale-cache number alias (so a recycled number doesn't leave the node's real
@@ -1478,6 +1486,82 @@ sub _as_list {
     return []        unless defined $v;
     return [ @$v ]   if ref $v eq 'ARRAY';
     return [ grep { length } map { s/^\s+|\s+$//gr } split /,/, $v ];
+}
+
+# ── Port-group sharding (#5) ──
+#
+# Narrow which of the configured target_ports a given node's host groups and LU paths land
+# on. A "LU path" is consumed per (LDEV × host-group × port), and the Hitachi per-FE-port
+# budget is the aggregate across all host groups on that physical port — so mapping every
+# node onto the same ports caps the whole cluster at one port's budget. Sharding nodes onto
+# disjoint port groups multiplies that ceiling by the number of groups, within ONE storeid
+# so migration is preserved. Rationale + rejected/deferred alternatives: docs/adr/0003.
+
+# "g1=CL1-A,CL2-A g2=CL3-A,CL4-A" -> { g1 => ['CL1-A','CL2-A'], g2 => ['CL3-A','CL4-A'] }
+sub _parse_port_groups {
+    my ($v) = @_;
+    my %groups;
+    return \%groups unless defined $v && length $v;
+    for my $entry ( grep { length } map { s/^\s+|\s+$//gr } split /\s+/, $v ) {
+        my ($name, $ports) = split /=/, $entry, 2;
+        next unless defined $name && length $name && defined $ports;
+        $groups{$name} = _as_list($ports);
+    }
+    return \%groups;
+}
+
+# "pve01=g1 pve02=g1 pve03=g2" -> { pve01 => 'g1', pve02 => 'g1', pve03 => 'g2' }
+sub _parse_node_port_groups {
+    my ($v) = @_;
+    my %map;
+    return \%map unless defined $v && length $v;
+    for my $entry ( grep { length } map { s/^\s+|\s+$//gr } split /\s+/, $v ) {
+        my ($node, $group) = split /=/, $entry, 2;
+        $map{$node} = $group if defined $node && length $node && defined $group && length $group;
+    }
+    return \%map;
+}
+
+# Fail fast on a mis-typed port or an assignment to an undefined group (either would
+# silently strand a node); warn (not fatal) on a group with <2 ports, which has no
+# MPIO/controller-failover HA. Only called when the feature is on.
+sub _validate_port_groups {
+    my ($self) = @_;
+    my %known = map { $_ => 1 } @{ $self->{array_ports} };
+    for my $g ( sort keys %{ $self->{port_groups} } ) {
+        my $ports = $self->{port_groups}{$g};
+        # A group with no ports is never intentional — and its nodes would silently fall
+        # back to ALL ports (inverting the sharding intent), so it is fatal. A single-port
+        # group can be deliberate (a non-HA path), so that only warns.
+        croak "port_groups: group '$g' has no ports — remove it or list its ports"
+            unless @$ports;
+        if ( my @bad = grep { !$known{$_} } @$ports ) {
+            croak "port_groups: group '$g' lists port(s) not in target_ports: @bad";
+        }
+        warn "FCLU Hitachi: port group '$g' has a single port (@$ports) — its nodes have no"
+            . " MPIO / controller-failover redundancy\n"
+            if @$ports < 2;
+    }
+    for my $node ( sort keys %{ $self->{node_port_groups} } ) {
+        my $g = $self->{node_port_groups}{$node};
+        croak "node_port_groups: node '$node' assigned to undefined group '$g'"
+            unless $self->{port_groups}{$g};
+    }
+}
+
+# The array FC ports THIS node's host groups + LU paths live on. Feature off (no
+# port_groups) or an unassigned node => ALL configured ports (today's behavior, and the
+# safe fallback — never strand a node with no ports). A node assigned to a group => that
+# group's ports (already validated to be a subset of target_ports at construction). With
+# the feature off this returns $self->{array_ports} unchanged, so every mapping loop keeps
+# its exact behavior.
+sub _resolve_local_ports {
+    my ($self, $hostname) = @_;
+    return $self->{array_ports} unless %{ $self->{port_groups} };
+    my $group = defined $hostname ? $self->{node_port_groups}{$hostname} : undef;
+    return $self->{array_ports} unless defined $group;
+    my $ports = $self->{port_groups}{$group};
+    return ( $ports && @$ports ) ? $ports : $self->{array_ports};
 }
 
 sub _check_host_ctx {

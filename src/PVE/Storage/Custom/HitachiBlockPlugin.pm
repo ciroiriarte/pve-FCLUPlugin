@@ -46,6 +46,11 @@ sub driver_config {
         # per-array session cap on large clusters.
         sessionless         => ( $scfg->{rest_keepalive} ? 0 : 1 ),
         array_ports         => $scfg->{target_ports},
+        # Port-group sharding (#5): narrow which of target_ports each node's host groups +
+        # LU paths land on, to spread the cluster's LU-path budget across disjoint FC ports.
+        # Both unset => feature off => every node maps to all target_ports (today).
+        port_groups         => $scfg->{port_groups},
+        node_port_groups    => $scfg->{node_port_groups},
         host_mode           => $scfg->{host_mode},
         host_mode_options   => $scfg->{host_mode_options},
         skip_unmap_io_check => $scfg->{skip_unmap_io_check},
@@ -89,6 +94,22 @@ sub properties {
         target_ports => {
             description => "Comma-separated list of target FC port IDs (e.g. CL1-A,CL2-A).",
             type        => 'string',
+        },
+        port_groups => {
+            description => "Port-group sharding (#5): named disjoint front-end port groups,"
+                . " space-separated 'name=port,port' (e.g. 'g1=CL1-A,CL2-A g2=CL3-A,CL4-A')."
+                . " Each group SHOULD have >=2 ports on different controllers for MPIO/HA."
+                . " Unset => every node maps to all target_ports (default). Requires the"
+                . " fabric to be zoned so each node reaches its group's ports.",
+            type        => 'string',
+            optional    => 1,
+        },
+        node_port_groups => {
+            description => "Node->port-group assignment for port_groups, space-separated"
+                . " 'node=group' (e.g. 'pve01=g1 pve02=g1 pve03=g2'). A node not listed maps"
+                . " to all target_ports (safe fallback). Ignored unless port_groups is set.",
+            type        => 'string',
+            optional    => 1,
         },
         host_mode => {
             description => "Host mode for host group creation.",
@@ -217,6 +238,8 @@ sub options {
         %{ $class->SUPER::options },
         storage_id          => { fixed => 1 },
         target_ports        => { fixed => 1 },
+        port_groups         => { optional => 1 },
+        node_port_groups    => { optional => 1 },
         host_mode           => { optional => 1 },
         host_mode_options   => { optional => 1 },
         skip_unmap_io_check => { optional => 1 },
