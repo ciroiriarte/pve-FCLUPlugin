@@ -1,3 +1,24 @@
+pve-fclu (0.1.0~alpha38) stable; urgency=medium
+
+  * hitachi: offload a linked clone from a LIVE ('current') volume (#19). A Thin Image
+    pair binds its S-VOL directly onto a live P-VOL, so `qm clone` (linked) of a running
+    / non-template disk is now offloaded instead of falling back to a host-side copy. No
+    intermediate snapshot object is created — the auto_split IS the crash-consistent
+    instant — and the backing pair is released on free like any linked clone (#23). Gated
+    on a new `clone.from_current` capability leaf, so a backend whose clone API requires a
+    snapshot source (Nimble model) declines and PVE keeps host-copying (core stays
+    vendor-neutral). Crash-consistent only for a running guest; fsfreeze for app
+    consistency. 220 unit tests.
+  * tools: add `validate-copy-offload-freeze.sh` + docs (#22) — a supervised live-
+    validation harness for the upstream copy-offload freeze bracket (all-offloaded /
+    vm_suspend fallback / mixed / last-disk-deferred; asserts guest-always-thawed and a
+    real torn-vs-consistent multi-disk check). Dry-run by default; refuses to run unless
+    BOTH patched packages are installed (else a running clone falls back to drive-mirror
+    and false-PASSes) and positively asserts the offload path ran. Prod-VMID denylist +
+    test-window backstops; the live run is a gated operator step.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 22 Jul 2026 00:42:58 -0300
+
 pve-fclu (0.1.0~alpha37) stable; urgency=medium
 
   * pve-fclu-cg: fix a `$vmid's` in the `clone` output that Perl parsed as the archaic
