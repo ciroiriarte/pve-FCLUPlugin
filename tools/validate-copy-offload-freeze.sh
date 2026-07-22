@@ -57,6 +57,7 @@ set -euo pipefail
 OFFLOAD_STORE="${OFFLOAD_STORE:-ec2-1}"        # copy-offload-enabled storage (RBD)
 MIRROR_STORE="${MIRROR_STORE:-}"               # a NON-offload storage for S2's mirrored disk
 CLOUD_IMAGE="${CLOUD_IMAGE:-}"                  # path to a Debian cloud .qcow2/.img on the node
+TEMPLATE_VMID="${TEMPLATE_VMID:-}"              # alt to --cloud-image: clone this template (needs a guest agent)
 BRIDGE="${BRIDGE:-vmbr0}"
 VMID_BASE="${VMID_BASE:-79000}"                 # test VMIDs live in [VMID_BASE, VMID_BASE+99]
 DISK_GIB="${DISK_GIB:-2}"                       # size of each data disk
@@ -93,6 +94,7 @@ while [ $# -gt 0 ]; do
         --offload-store) OFFLOAD_STORE="$2"; shift ;;
         --mirror-store)  MIRROR_STORE="$2"; shift ;;
         --cloud-image)   CLOUD_IMAGE="$2"; shift ;;
+        --from-template) TEMPLATE_VMID="$2"; shift ;;
         --bridge)        BRIDGE="$2"; shift ;;
         --vmid-base)     VMID_BASE="$2"; shift ;;
         --scenarios)     SCENARIOS="$2"; shift ;;
@@ -167,9 +169,16 @@ preflight() {
         pass "mirror storage '$MIRROR_STORE' present"
     fi
 
-    [ -n "$CLOUD_IMAGE" ] || fail "--cloud-image is required for --run"
-    [ -r "$CLOUD_IMAGE" ] || fail "cloud image '$CLOUD_IMAGE' not readable"
-    pass "cloud image '$CLOUD_IMAGE' readable"
+    if [ -n "$TEMPLATE_VMID" ]; then
+        qm config "$TEMPLATE_VMID" >/dev/null 2>&1 || fail "--from-template $TEMPLATE_VMID not found"
+        qm config "$TEMPLATE_VMID" 2>/dev/null | grep -q '^agent:.*enabled=1' \
+            || fail "template $TEMPLATE_VMID has no guest agent (agent: enabled=1) — the probe needs it"
+        pass "guest source: template $TEMPLATE_VMID (with agent)"
+    else
+        [ -n "$CLOUD_IMAGE" ] || fail "need --from-template <vmid> or --cloud-image <path> for --run"
+        [ -r "$CLOUD_IMAGE" ] || fail "cloud image '$CLOUD_IMAGE' not readable"
+        pass "guest source: cloud image '$CLOUD_IMAGE'"
+    fi
 
     # Every VMID we might use must be free and inside the test window.
     local i v
@@ -193,13 +202,20 @@ build_guest() {
     assert_not_prod "$vmid"
     log "build VM $vmid (data2 on $data2_store)"
 
-    qm create "$vmid" --name "fclu-frz-$vmid" --memory 2048 --cores 2 \
-        --net0 "virtio,bridge=$BRIDGE" --agent enabled=1 --serial0 socket --vga serial0
-    qm importdisk "$vmid" "$CLOUD_IMAGE" "$OFFLOAD_STORE" >/dev/null
-    qm set "$vmid" --scsihw virtio-scsi-single --scsi0 "$OFFLOAD_STORE:vm-$vmid-disk-0"
-    qm set "$vmid" --ide2 "$OFFLOAD_STORE:cloudinit"
-    qm set "$vmid" --boot order=scsi0 --ciuser fclu --cipassword fcluvalidate
-    # Two data disks: the consistency probe writes a shared clock into BOTH.
+    if [ -n "$TEMPLATE_VMID" ]; then
+        # Full-clone a template that already carries a guest agent; the boot disk lands on
+        # the offload storage. This SETUP clone is not the path under test.
+        qm clone "$TEMPLATE_VMID" "$vmid" --name "fclu-frz-$vmid" --full --storage "$OFFLOAD_STORE"
+    else
+        qm create "$vmid" --name "fclu-frz-$vmid" --memory 2048 --cores 2 \
+            --net0 "virtio,bridge=$BRIDGE" --agent enabled=1 --serial0 socket --vga serial0
+        qm importdisk "$vmid" "$CLOUD_IMAGE" "$OFFLOAD_STORE" >/dev/null
+        qm set "$vmid" --scsihw virtio-scsi-single --scsi0 "$OFFLOAD_STORE:vm-$vmid-disk-0"
+        qm set "$vmid" --ide2 "$OFFLOAD_STORE:cloudinit"
+        qm set "$vmid" --boot order=scsi0 --ciuser fclu --cipassword fcluvalidate
+    fi
+    # Two data disks (scsi1/scsi2 -> /dev/sdb,/dev/sdc): the consistency probe writes a
+    # shared clock into BOTH.
     qm set "$vmid" --scsi1 "$OFFLOAD_STORE:$DISK_GIB"
     qm set "$vmid" --scsi2 "$data2_store:$DISK_GIB"
 
@@ -315,7 +331,11 @@ clone_running() {
     CLONE_LOG="$(mktemp "/tmp/fclu-clone-${dst}.XXXXXX.log")"
     log "qm clone $src -> $dst --full (guest RUNNING); task log: $CLONE_LOG"
     qm clone "$src" "$dst" --name "clone-$dst" --full 1 2>&1 | tee "$CLONE_LOG"
-    return "${PIPESTATUS[0]}"
+    local rc="${PIPESTATUS[0]}"
+    # A non-zero clone is a scenario failure in its own right (e.g. the offload copy or
+    # its flatten-to-independence errored). Report it cleanly with the log pointer rather
+    # than proceeding to assert on a clone that was rolled back.
+    [ "$rc" = 0 ] || fail "clone of $src -> $dst FAILED (rc=$rc) — see $CLONE_LOG (offload/flatten error?)"
 }
 
 # Prove the offload path executed. mode=all (S1/S3): the 'offloaded copy' marker MUST be
