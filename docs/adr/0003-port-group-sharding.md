@@ -32,8 +32,11 @@ free live migration is preserved.
 
 - Two optional Hitachi config properties, **default off** (unset ⇒ today's behavior,
   byte-for-byte):
-  - `port_groups` — named groups: `g1=CL1-A,CL2-A g2=CL3-A,CL4-A`
-  - `node_port_groups` — node→group: `pve01=g1 pve02=g1 pve03=g2 pve04=g2`
+  - `port_groups` — named groups: `g1=CL1-A,CL2-A g2=CL3-A,CL4-A` (group labels arbitrary
+    but unique; every port must be in `target_ports`).
+  - `node_port_groups` — node→group: `pve01=g1 pve02=g1 pve03=g2 pve04=g2`. The node key is
+    the **PVE cluster node name** (`PVE::INotify::nodename()` — what `pvecm nodes` shows and
+    what the `PVE_<node>` host groups are named after).
 - A driver helper **`_resolve_local_ports($hostname)`** returns the node's port subset
   (feature off or node unmapped ⇒ all `target_ports`; assigned ⇒ its group's ports). The
   four per-node mapping loops — `ensure_host_access`, `publish_lu`, `unpublish_lu`,

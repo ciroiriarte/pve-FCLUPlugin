@@ -106,7 +106,8 @@ sub properties {
         },
         node_port_groups => {
             description => "Node->port-group assignment for port_groups, space-separated"
-                . " 'node=group' (e.g. 'pve01=g1 pve02=g1 pve03=g2'). A node not listed maps"
+                . " '<pvenode>=group' where <pvenode> is the PVE cluster node name (as in"
+                . " 'pvecm nodes'), e.g. 'pve01=g1 pve02=g1 pve03=g2'. A node not listed maps"
                 . " to all target_ports (safe fallback). Ignored unless port_groups is set.",
             type        => 'string',
             optional    => 1,

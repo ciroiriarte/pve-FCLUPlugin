@@ -119,9 +119,16 @@ port_groups       g1=CL1-A,CL2-A g2=CL3-A,CL4-A
 node_port_groups  pve01=g1 pve02=g1 pve03=g2 pve04=g2
 ```
 
+The node names in `node_port_groups` are the **PVE cluster node names** — exactly what
+`pvecm nodes` / `hostname` returns and what the array host groups are named after
+(`PVE_<node>`). Group names (`g1`, `g2`) are arbitrary labels, unique within `port_groups`.
+Every port in a group must appear in `target_ports`. The example above (2 groups) doubles
+the ceiling; each additional group adds one port-budget's worth of headroom:
+
 ```
-4 groups × 2,048 ≈ 8,192  live disks (midrange)
-4 groups × 4,096 ≈ 16,384 live disks (high-end)
+2 groups × 2,048 ≈ 4,096   live disks (midrange, the example above)
+4 groups × 2,048 ≈ 8,192   live disks (midrange, 8 ports)
+4 groups × 4,096 ≈ 16,384  live disks (high-end, 8 ports)
 ```
 
 - **Default off** — unset ⇒ today's behavior (all nodes on all ports), byte-for-byte.

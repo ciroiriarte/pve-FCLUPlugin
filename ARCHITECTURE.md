@@ -173,6 +173,13 @@ The current `_ensure_host_groups` / `_map_lun_to_local` / `_unmap_lun_from_local
 moves **into `Driver::Hitachi` verbatim** — it is Hitachi-specific and does not belong
 in the generic plugin.
 
+**Per-node port resolution is a scaling lever, not just a mapping detail.** An FC array
+meters a finite budget of LU paths and host groups *per front-end port* (aggregate across
+all host groups on that port), so mapping every node onto the same ports caps the whole
+cluster at one port's budget regardless of node count. Sharding nodes across disjoint
+target-port groups — resolved per node at map time, within one storeid so migration is
+preserved — multiplies that ceiling. See [ADR 0003](docs/adr/0003-port-group-sharding.md).
+
 **`list_lu_mappings` must be driver-authoritative** [Codex, important]. Today
 `_unmap_lun_from_local` leans on `list_luns`, whose server-side `ldevId` filter is a
 no-op on Hitachi (it filters client-side — a documented quirk). The contract instead

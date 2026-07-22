@@ -97,6 +97,9 @@ systemctl restart pvedaemon
   `fclu-driver-api-1`: the 18 mandatory and 10 capability-gated methods, data shapes, the
   idempotency/retry table, the typed error vocabulary, capability advertisement, and the
   host-access safety invariants.
+- **[`docs/adr/`](docs/adr/)** — architecture decision records (the *why* behind a design
+  choice + the alternatives rejected). [ADR 0003](docs/adr/0003-port-group-sharding.md):
+  sharding nodes across FC target-port groups to scale past the per-port LU-path budget.
 
 **A driver for a second vendor is the most valuable contribution this project can take
 right now** — it is what proves or corrects the vendor-neutral abstraction.
