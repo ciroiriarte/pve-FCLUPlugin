@@ -194,8 +194,20 @@ pve-fclu-cg snapshot        <store> db before-upgrade
 pve-fclu-cg snapshots       <store> db
 pve-fclu-cg snapshot-delete <store> db before-upgrade
 
+# crash-consistent FULL CLONE of the whole group into a new VM (all disks captured at
+# one instant): each member becomes an INDEPENDENT full copy — no CoW parent. Attach
+# the results to the target VM (`qm set <vmid> -scsiN <volid>`).
+pve-fclu-cg clone <store> db 9010       # clone group 'db' -> new disks for VM 9010
+
 pve-fclu-cg untag <store> vm-100-disk-2  # remove from its group
 ```
+
+The group **clone** prepares every member's S-VOL and idle pair up front, then triggers
+the whole group in one array action so every disk's copy starts at the **same instant**
+(freeze cost scales with the number of groups, ~2s each on a VSP, not with disk count);
+the copies then run and are polled to completion. As with the group snapshot, crash
+consistency is at the array trigger instant — **application** consistency still needs a
+guest quiesce first if the source VM is running.
 
 CG snapshots are recorded **separately** from PVE's per-volume snapshot view, so they
 never appear in `qm`'s snapshot list. Rollback/restore of a whole group is manual

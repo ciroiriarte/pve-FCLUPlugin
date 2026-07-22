@@ -65,7 +65,26 @@ use PVE::Storage::FCLU::Plugin;
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
     sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
         $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
-    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1 }, copy => {}, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1 }, copy => { full => 1 }, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    # Grouped full clone: prepare allocates an S-VOL + an IDLE pair under a group; the
+    # group action triggers all pairs at one instant; clone_copy_state reports completion.
+    sub prepare_full_clone {
+        my ( $s, $src, %o ) = @_; $s->{calls}{prepare_full_clone}++;
+        die "BOOM prepare\n" if $s->{fail_prepare};
+        my $svol = $s->_id( $o{requested_id} );
+        $s->{lus}{$svol} = { backend_id => $svol,
+            size_bytes => ( $s->{lus}{$src} ? $s->{lus}{$src}{size_bytes} : 1 << 30 ),
+            identity => { protocol => 'scsi-fc', ids => { naa => '60060e80' . sprintf( '%08x', $SEQ ) } } };
+        push @{ $s->{snaps}{$src} },
+            { snap_id => "$src,gc" . scalar( @{ $s->{snaps}{$src} // [] } ),
+              group => $o{snapshot_group}, svol => $svol, status => 'pending' };
+        return $svol;
+    }
+    sub start_clone_group { my ( $s, $g ) = @_; $s->{calls}{start_clone_group}++; $s->{clone_started}{$g} = 1; 1 }
+    sub clone_copy_state {
+        my ( $s, $src, $group, $svol ) = @_; $s->{calls}{clone_copy_state}++;
+        return $s->{clone_started}{$group} ? 'complete' : 'pending';
+    }
     # One crash-consistent group snapshot across all given LDEVs: one pair per id under
     # a shared group, returning the §12.1 descriptors the plugin records.
     sub create_cg_snapshot {
@@ -1032,6 +1051,53 @@ subtest 'check_connection: probes without disturbing the session cache' => sub {
     ok( $active->{connected}, 'active session left connected' );
     ok( !$active->{calls}{disconnect}, 'active session never disconnected by the probe' );
     $PP->deactivate_storage( 'store1', {} );
+};
+
+subtest 'grouped full clone: prepare all, ONE group trigger, register for target VM' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    local $PVE::Storage::FCLU::Plugin::CLONE_POLL_INTERVAL = 0;   # probe once, no sleep
+    $P->deactivate_storage( 'store1', {} );
+
+    my @v = map { $P->alloc_image( 'store1', { pool_id => '63' }, 800, 'raw', undef, 1 << 30 ) } 1 .. 2;
+    $P->update_volume_attribute( {}, 'store1', $_, 'cg', 'gc1' ) for @v;
+
+    my $vols = $P->cg_clone_create( {}, 'store1', 'gc1', 810 );
+    is( scalar @$vols, 2, 'one clone volume per group member' );
+    is( $T::Plugin::FAKE->{calls}{prepare_full_clone}, 2, 'prepared each member idle' );
+    is( $T::Plugin::FAKE->{calls}{start_clone_group}, 1, 'the WHOLE group triggered in ONE action' );
+    ok( $T::Plugin::FAKE->{calls}{clone_copy_state} >= 2, 'each clone polled to completion' );
+    like( $vols->[0], qr{^store1:vm-810-disk-\d+$}, 'clone registered as a target-VM disk' );
+    my ($nm) = $vols->[0] =~ /:(.+)$/;
+    my ( $cbid, $cmeta ) = reg()->lookup($nm);
+    ok( $cbid, 'clone backend id recorded in the registry' );
+    ok( $cmeta->{size_mb}, 'clone size_mb recorded (else the volume reports size 0)' );
+};
+
+subtest 'grouped full clone rolls back prepared S-VOLs (and reservations) on failure' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    local $PVE::Storage::FCLU::Plugin::CLONE_POLL_INTERVAL = 0;
+    $P->deactivate_storage( 'store1', {} );
+
+    my @v = map { $P->alloc_image( 'store1', { pool_id => '63' }, 801, 'raw', undef, 1 << 30 ) } 1 .. 2;
+    $P->update_volume_attribute( {}, 'store1', $_, 'cg', 'gc2' ) for @v;
+
+    my $err;
+    {
+        no warnings 'redefine';
+        my $orig = \&T::FakeDriver::prepare_full_clone;
+        my $n = 0;
+        # Fail the SECOND prepare → the first prepared clone + the 2nd's reservation roll back.
+        local *T::FakeDriver::prepare_full_clone = sub { die "boom prepare\n" if ++$n == 2; $orig->(@_) };
+        local $SIG{__WARN__} = sub { };
+        eval { $P->cg_clone_create( {}, 'store1', 'gc2', 811 ); 1 } or $err = $@;
+    }
+    ok( $err, 'cg_clone_create dies on a prepare failure' );
+    is( $T::Plugin::FAKE->{calls}{delete_lu}, 1, 'the one prepared clone S-VOL was deleted' );
+    is( $T::Plugin::FAKE->{calls}{start_clone_group} // 0, 0, 'the group was never triggered' );
+    my @left = grep { /^vm-811-/ } keys %{ reg()->list };
+    is_deeply( \@left, [], 'no rolled-back clone or stale reservation left in the registry' );
 };
 
 done_testing();

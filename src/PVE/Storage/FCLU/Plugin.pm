@@ -1493,6 +1493,120 @@ sub cg_snapshot_list {
 sub cg_list    { return $_[0]->_registry( $_[1] )->list_cgs }
 sub cg_members { return $_[0]->_registry( $_[1] )->find_cg_members( $_[2] ) }
 
+# ── Grouped full clone (crash-consistent, over a consistency group) ──
+#
+# Clones every member of a CG as an INDEPENDENT full copy, all captured at the SAME
+# instant. Because the array fixes the point-in-time by the GROUP ACTION (not pair
+# creation), all the expensive work — S-VOL allocation + idle pair creation — is done
+# ahead (prepare_full_clone), then ONE array action triggers the whole group
+# (start_clone_group), then the copies run and are polled to completion (clone_copy_state).
+# Out-of-band, like cg_snapshot_create: the new volumes are registered for $target_vmid;
+# the operator wires them into the target VM config. (This is the array-side consumer the
+# grouped-clone primitives were built for; the #7780 copy-offload hook can drive the same
+# primitives once upstream lands.)
+
+my $_cg_clone_seq = 0;
+sub cg_clone_create {
+    my ($class, $scfg, $storeid, $cgname, $target_vmid) = @_;
+    die "consistency-group name is required\n" unless defined $cgname && length $cgname;
+    die "target vmid is required\n" unless defined $target_vmid && "$target_vmid" =~ /^\d+$/;
+
+    my $reg     = $class->_registry($storeid);
+    my $members = $reg->find_cg_members($cgname);
+    die "consistency group '$cgname' has no members on '$storeid'\n" unless @$members;
+
+    my $d = $class->_driver($storeid, $scfg);
+    die "storage '$storeid' does not support grouped full clone\n"
+        unless PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'copy', 'full' )
+            && $d->can('prepare_full_clone') && $d->can('start_clone_group')
+            && $d->can('clone_copy_state');
+
+    # One clone group: start_clone_group fixes the crash-consistent point-in-time across
+    # every member at once. Unique name so concurrent grouped clones never collide (≤29) —
+    # mix the PID with a per-process counter so two processes cloning to the same target VMID
+    # within one wall-clock second still get distinct group names.
+    $_cg_clone_seq = ( $_cg_clone_seq + 1 ) & 0xffff;
+    my $group = substr(
+        sprintf( 'pveGC%x_%x_%x', $target_vmid, time(), ( $$ ^ $_cg_clone_seq ) & 0xffff ), 0, 29 );
+
+    my @prepared;   # { src, src_bid, new, svol }
+    my $ok = eval {
+        # 1. Prepare every member IDLE under the group (allocates S-VOLs; NO data moves yet).
+        for my $src (@$members) {
+            my ($src_bid) = $reg->lookup($src);
+            my $new_name  = $reg->reserve_volname($target_vmid);
+            # Track the entry BEFORE prepare (svol undef) so a prepare failure still rolls
+            # back the reservation placeholder rather than leaking it.
+            my $entry = { src => $src, src_bid => $src_bid, new => $new_name, svol => undef };
+            push @prepared, $entry;
+            my $rid  = $class->_alloc_backend_id( $storeid, $scfg, $d );
+            $entry->{svol} = $d->prepare_full_clone( $src_bid, snapshot_group => $group,
+                ( defined $rid ? ( requested_id => $rid ) : () ) );
+            # Read the real S-VOL size + pool and register them: size_mb does NOT self-heal
+            # (unlike identity, which activate_volume resolves post-publish), so an omitted
+            # size would make volume_size_info/list_images report 0 → an unusable clone.
+            my $lu = $d->get_lu( $entry->{svol} );
+            $reg->register( $new_name, $entry->{svol},
+                size_mb  => ceil( $lu->{size_bytes} / ( 1024 * 1024 ) ),
+                pool_ref => $lu->{pool_ref},
+                ( defined $lu->{identity} ? ( identity => $lu->{identity} ) : () ),
+            );
+        }
+        # 2. Trigger the WHOLE group in one action → the shared point-in-time.
+        $d->start_clone_group($group);
+        # 3. Wait for every independent full copy to finish (dies on a PSUE copy failure).
+        for my $p (@prepared) {
+            $class->_await_clone_complete( $d, $p->{src_bid}, $group, $p->{svol} )
+                or die "clone of '$p->{src}' did not complete in time\n";
+        }
+        1;
+    };
+    if ( !$ok ) {
+        my $err = $@;
+        $class->_rollback_prepared_clones( $d, $reg, $group, \@prepared );
+        die ref $err ? $err : "cg_clone_create failed: $err";
+    }
+    return [ map { "$storeid:$_->{new}" } @prepared ];
+}
+
+# Poll a grouped-clone pair to completion. Bounded; returns 1 on complete, 0 on timeout.
+# Propagates a PSUE copy failure from the driver. Package-var cadence (these are CLASS
+# methods, so no instance to hang a knob on); tests set $CLONE_POLL_INTERVAL = 0 to probe
+# once. ~1h budget by default for a large full copy.
+our $CLONE_POLL_INTERVAL = 2;
+our $CLONE_POLL_TRIES    = 7200;   # ~4h ceiling; a very large full copy on a busy shared
+                                   # array can run long, and a timeout here rolls the copy
+                                   # back. Raise (or set INTERVAL) for multi-TB clones.
+sub _await_clone_complete {
+    my ($class, $d, $src_bid, $group, $svol) = @_;
+    my $tries = $CLONE_POLL_INTERVAL > 0 ? $CLONE_POLL_TRIES : 1;   # interval 0 → probe once
+    for ( 1 .. $tries ) {
+        return 1 if $d->clone_copy_state( $src_bid, $group, $svol ) eq 'complete';
+        last if $CLONE_POLL_INTERVAL <= 0;
+        sleep($CLONE_POLL_INTERVAL);
+    }
+    return 0;
+}
+
+# Best-effort teardown of a partially-built grouped clone: release each S-VOL's clone pair
+# (idle or PSUE — a COMPLETED isClone pair already auto-deleted, so that's a no-op), delete
+# the S-VOL LU, and drop the registry entry, so nothing leaks on the shared pool.
+sub _rollback_prepared_clones {
+    my ($class, $d, $reg, $group, $prepared) = @_;
+    for my $p (@$prepared) {
+        eval {
+            if ( defined $p->{svol} ) {   # prepared → release its pair + delete the S-VOL
+                my ($pair) = grep { ( $_->{meta}{group} // '' ) eq $group }
+                    @{ $d->list_snapshots( $p->{src_bid} ) };
+                $d->delete_snapshot( $pair->{snap_id} ) if $pair;
+                $d->delete_lu( $p->{svol} );
+            }
+            $reg->unregister( $p->{new} );   # drops a finalized entry OR a bare reservation
+            1;
+        } or warn "FCLU: cg_clone rollback warning for '$p->{new}': $@";
+    }
+}
+
 # N12: operator "unmanage host" — reap THIS node's now-empty host groups on the array
 # (WWN-ownership-gated in the driver). Node-local: builds this node's host context.
 sub unmanage_host {

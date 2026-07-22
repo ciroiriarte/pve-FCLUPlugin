@@ -1,3 +1,21 @@
+pve-fclu (0.1.0~alpha36) stable; urgency=medium
+
+  * fclu: wire the grouped full-clone primitives to a consumer. New `pve-fclu-cg clone
+    <store> <cg> <target-vmid>` (Plugin cg_clone_create): clones every member of a
+    consistency group as an INDEPENDENT full copy, all captured at the SAME instant.
+    Because the array fixes the point-in-time by the GROUP ACTION, it prepares every
+    member's S-VOL + idle pair up front (prepare_full_clone), triggers the whole group
+    in ONE action (start_clone_group), then polls each copy to completion
+    (clone_copy_state). New clones are registered as disks of the target VM (independent —
+    no CoW parent); the operator attaches them (`qm set <vmid> -scsiN <volid>`). Rolls back
+    prepared S-VOLs AND reservations on any failure with no double-free (prepare_full_clone
+    already reaps its own unpaired S-VOL). Capability-gated on copy.full. This is the
+    array-side consumer the sister session's primitives were built for; the #7780
+    copy-offload hook can drive the same primitives once upstream lands. 219 unit tests;
+    independent code review. user-guide CG section updated.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Tue, 21 Jul 2026 10:30:00 -0300
+
 pve-fclu (0.1.0~alpha35) stable; urgency=medium
 
   * fclu: implement check_connection() — the plugin inherited the base method, which

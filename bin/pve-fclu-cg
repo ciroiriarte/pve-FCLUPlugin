@@ -42,8 +42,11 @@ usage:
   pve-fclu-cg snapshot  <storeid> <cgname> <label>
   pve-fclu-cg snapshots <storeid> [<cgname>]
   pve-fclu-cg snapshot-delete <storeid> <cgname> <label>
+  pve-fclu-cg clone     <storeid> <cgname> <target-vmid>
 
   <volume> is a volname (vm-100-disk-0) or a volid (store:vm-100-disk-0).
+  `clone` makes an INDEPENDENT crash-consistent full clone of every group member for
+  <target-vmid> (all disks captured at one instant); attach the results to that VM.
 USAGE
     exit( $err ? 2 : 0 );
 }
@@ -131,6 +134,15 @@ elsif ( $cmd eq 'snapshot-delete' ) {
     my $label  = shift @ARGV or usage("snapshot-delete: missing <label>");
     $pclass->cg_snapshot_delete( $scfg, $storeid, $cgname, $label );
     print "deleted cg snapshot '$cgname/$label'\n";
+}
+elsif ( $cmd eq 'clone' ) {
+    my $cgname = shift @ARGV or usage("clone: missing <cgname>");
+    my $vmid   = shift @ARGV or usage("clone: missing <target-vmid>");
+    my $vols = $pclass->cg_clone_create( $scfg, $storeid, $cgname, $vmid );
+    printf "cloned cg '%s' -> %d independent full-clone volume(s) for VM %s:\n",
+        $cgname, scalar @$vols, $vmid;
+    print "  $_\n" for @$vols;
+    print "(attach them to VM $vmid's config, e.g. `qm set $vmid -scsiN <volid>`)\n";
 }
 else {
     usage("unknown command '$cmd'");
