@@ -140,10 +140,18 @@ prefix per cluster on a shared pool.
     image only (in-flight, un-flushed guest writes are not quiesced) — same guarantee an
     array-side snapshot of a live volume gives. Freeze the guest / use fsfreeze for
     application consistency.
-  - **PVE routing (pending live confirmation):** this relies on PVE's `clone_disk` routing a
-    `current`-source *linked* clone through `clone_image` (rather than forcing `--full`) for a
-    running VM. That path is exercised by the unit tests against the plugin API; confirm the
-    live `pvedaemon` routing on the E590H before marking #19 closed.
+  - **⚠️ PVE routing (live-confirmed NEGATIVE on PVE 9.2, E590H, alpha38):** stock PVE does
+    **not** route a `current`-source (non-template) clone through `clone_image`. `qm clone`
+    of a non-template VM forces a **full** clone regardless of `clone.from_current` — a
+    running source goes through drive-mirror (suspend/resume), a stopped source through
+    `qemu-img convert`; both produce a full independent copy with no CoW parent. `clone_image`
+    (linked clone) is only reached when the **source is a template**. So the plugin capability
+    + `clone_image` handling here are correct and forward-compatible **but currently inert**:
+    delivering #19's instant array linked-clone of a live volume needs an **upstream PVE
+    change** to route a `current`-source clone through `clone_image` when the storage
+    advertises `clone.from_current` — the same class of gap as full-clone copy-offload
+    (Bugzilla #7780). Until then, live-source clones full-copy exactly as before (no
+    regression). Verified live on the E590H: 2026-07-22.
 
 ## Advanced services
 
