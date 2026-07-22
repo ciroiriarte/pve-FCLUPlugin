@@ -1013,9 +1013,11 @@ sub volume_snapshot_rollback {
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snap, $running, $target) = @_;
 
-    # Source must be a base image or a snapshot AND the driver must advertise the
-    # linked-clone capability — volume_has_feature enforces both (role + capability).
-    die "clone_image only supports a base image or a snapshot as the source\n"
+    # Source must be a base image, a snapshot, OR a live volume whose driver can pair
+    # a CoW child straight onto a live P-VOL — volume_has_feature enforces the whole
+    # rule (role table + the array-offloaded clone capability, incl. from_current).
+    die "clone_image: source '$volname' does not support a linked clone here"
+        . " (needs a base image, a snapshot, or a driver with live-source cloning)\n"
         unless $class->volume_has_feature( $scfg, 'clone', $storeid, $volname, $snap );
 
     my $reg = $class->_registry($storeid);
@@ -1023,7 +1025,11 @@ sub clone_image {
     die "source volume '$volname' not found in registry\n" unless defined $src_backend;
 
     # The CoW parent: the snapshot's S-VOL when cloning from a snapshot, else the
-    # (base) volume's own LU.
+    # source volume's own LU. For a LIVE ('current') source that own LU is the running
+    # volume itself — the Thin Image auto_split binds the child at that instant, so the
+    # backing pair (P-VOL = the live source, S-VOL = the clone) IS the crash-consistent
+    # point-in-time; no separate implicit snapshot object is created, and free_image
+    # releases that one pair like any other linked clone (#23).
     my $clone_source = $src_backend;
     if ($snap) {
         my $sm = $reg->lookup_snapshot( $volname, $snap );
@@ -1331,12 +1337,14 @@ sub parse_volname {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
-    # Keyed by the volume's role (block-storage / LVM-thin model): a linked clone
-    # is a CoW Thin Image S-VOL, so 'clone' is offered only FROM a base image or a
-    # snapshot (not an arbitrary live volume); full copies use 'copy'.
+    # Keyed by the volume's role (block-storage / LVM-thin model): a linked clone is
+    # a CoW Thin Image S-VOL. It is offered from a base image, a snapshot, OR a live
+    # ('current') volume — the last one is capability-gated below, since a backend can
+    # only clone off a live source if its array can pair a CoW child directly onto a
+    # live P-VOL (#19). Full copies use 'copy'.
     my $features = {
         snapshot   => { current => 1 },
-        clone      => { base => 1, snap => 1 },
+        clone      => { base => 1, snap => 1, current => 1 },
         copy       => { base => 1, current => 1, snap => 1 },
         sparseinit => { base => 1, current => 1 },
         template   => { current => 1 },
@@ -1350,14 +1358,23 @@ sub volume_has_feature {
     return undef unless $features->{$feature} && $features->{$feature}{$key};
 
     # Array-offloaded features (snapshot/clone) ALSO require the driver to advertise
-    # the matching capability (§6, via Capabilities::pve_feature). Fail SOFT: only
-    # downgrade to "unsupported" when the driver POSITIVELY lacks it — a driver
-    # build/connection hiccup must not make PVE think a normally-supported feature
-    # vanished, so any lookup error falls through to the role-table "yes". Host and
-    # registry features (copy/sparseinit/template/rename/resize) are not array-gated.
+    # the matching capability (§6, via Capabilities). Fail SOFT: only downgrade to
+    # "unsupported" when the driver POSITIVELY lacks it — a driver build/connection
+    # hiccup must not make PVE think a normally-supported feature vanished, so any
+    # lookup error falls through to the role-table "yes". Host and registry features
+    # (copy/sparseinit/template/rename/resize) are not array-gated.
     if ( defined $storeid && ( $feature eq 'snapshot' || $feature eq 'clone' ) ) {
         my $gated = eval {
-            $class->_driver_supports( $class->_driver( $storeid, $scfg ), $feature );
+            my $d  = $class->_driver( $storeid, $scfg );
+            my $ok = $class->_driver_supports( $d, $feature );   # snapshot.single / clone.linked
+            # A live-source linked clone additionally needs clone.from_current: the
+            # array must be able to bind a CoW child straight onto a live P-VOL. A
+            # backend that advertises clone.linked but not from_current (snapshot-only
+            # clone source) declines a live clone and PVE falls back to a host copy.
+            $ok = PVE::Storage::FCLU::Capabilities->has_feature(
+                $d->capabilities, 'clone', 'from_current' )
+                if $ok && $feature eq 'clone' && $key eq 'current';
+            $ok;
         };
         return undef if defined $gated && !$gated;
     }

@@ -170,7 +170,11 @@ sub capabilities {
                       rollback => $c->{snapshot} ? 1 : 0 },
         clone    => { linked => $c->{clone} ? 1 : 0,
                       from_snapshot => $c->{clone} ? 1 : 0,
-                      from_base => $c->{clone} ? 1 : 0 },
+                      from_base => $c->{clone} ? 1 : 0,
+                      # A Thin Image pair can bind its S-VOL directly to a LIVE P-VOL,
+                      # so a linked clone of a `current` volume needs no intermediate
+                      # snapshot object — the auto_split IS the crash-consistent instant (#19).
+                      from_current => $c->{clone} ? 1 : 0 },
         copy     => { full => $c->{clone} ? 1 : 0, from_snapshot => 1, from_base => 1 },
         qos      => { per_lu => $c->{qos} ? 1 : 0 },
         resize   => { grow_online => 1, shrink => 0 },

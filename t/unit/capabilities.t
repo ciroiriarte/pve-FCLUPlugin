@@ -108,6 +108,12 @@ subtest 'OO wrapper: has / to_hash / merged / pve_feature' => sub {
     is( $m->has( 'qos', 'per_lu' ),   1, 'merged() applied override' );
     is( $cap->has( 'qos', 'per_lu' ), 0, 'merged() did not mutate the original' );
 
+    # clone.from_current is a distinct leaf: a live-source linked clone (#19). Absent
+    # here (snapshot-only clone backend), so it reads 0 even though clone.linked is 1.
+    is( $cap->has( 'clone', 'from_current' ), 0, 'clone.from_current absent -> 0 (snapshot-only clone)' );
+    my $livecap = $C->new( { clone => { linked => 1, from_current => 1 } } );
+    is( $livecap->has( 'clone', 'from_current' ), 1, 'clone.from_current advertised -> 1' );
+
     # PVE feature glue.
     is( $cap->pve_feature('snapshot'), 1,     'PVE snapshot -> snapshot.single' );
     is( $cap->pve_feature('clone'),    1,     'PVE clone -> clone.linked' );

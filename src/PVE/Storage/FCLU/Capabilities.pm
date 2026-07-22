@@ -31,7 +31,7 @@ my @BRANCHES = qw(snapshot clone copy qos resize transfer replication);
 # (replication is intentionally open-ended).
 my %KNOWN_LEAVES = (
     snapshot    => [qw(single consistency_group rollback)],
-    clone       => [qw(linked from_snapshot from_base)],
+    clone       => [qw(linked from_snapshot from_base from_current)],
     copy        => [qw(full from_snapshot from_base)],
     qos         => [qw(per_lu)],
     resize      => [qw(grow_online shrink)],

@@ -128,6 +128,23 @@ prefix per cluster on a shared pool.
   (teardown symmetry with the `create_linked_clone(host_ctx)` mapping). Skipping the
   pair release would orphan an unfreeable S-VOL+pair.
 
+- **#19 linked clone from a *live* volume.** The driver advertises the
+  `clone.from_current` capability, so `qm clone` (linked) of a **running / non-template**
+  disk is offloaded instead of falling back to a host-side copy. A Thin Image pair binds
+  its S-VOL directly onto a **live P-VOL**, so no separate intermediate snapshot object is
+  created — the `autoSplit` **is** the point-in-time. The clone's backing pair (P-VOL = the
+  live source, S-VOL = the clone) is recorded and released on `free_image` exactly like a
+  base/snapshot linked clone (#23). Backends whose clone API *requires* a snapshot source
+  (e.g. the Nimble model) leave `clone.from_current` off and PVE keeps host-copying.
+  - **Crash-consistency caveat:** cloning a *running* guest captures a **crash-consistent**
+    image only (in-flight, un-flushed guest writes are not quiesced) — same guarantee an
+    array-side snapshot of a live volume gives. Freeze the guest / use fsfreeze for
+    application consistency.
+  - **PVE routing (pending live confirmation):** this relies on PVE's `clone_disk` routing a
+    `current`-source *linked* clone through `clone_image` (rather than forcing `--full`) for a
+    running VM. That path is exercised by the unit tests against the plugin API; confirm the
+    live `pvedaemon` routing on the E590H before marking #19 closed.
+
 ## Advanced services
 
 - **QoS** — upper/lower IOPS + MB/s and I/O priority, set per volume from the store's

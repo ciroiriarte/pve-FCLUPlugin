@@ -65,7 +65,7 @@ use PVE::Storage::FCLU::Plugin;
     sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
     sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
         $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
-    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1 }, copy => { full => 1 }, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1, from_current => 1 }, copy => { full => 1 }, qos => {}, resize => {}, transfer => {}, replication => {} } }
     # Grouped full clone: prepare allocates an S-VOL + an IDLE pair under a group; the
     # group action triggers all pairs at one instant; clone_copy_state reports completion.
     sub prepare_full_clone {
@@ -206,7 +206,7 @@ subtest 'parse_volname / vmid_from_volname (§7)' => sub {
 
 subtest 'volume_has_feature role table' => sub {
     is( $P->volume_has_feature( {}, 'snapshot', 's', 'vm-1-disk-0' ), 1, 'snapshot on current' );
-    is( $P->volume_has_feature( {}, 'clone', 's', 'vm-1-disk-0' ), undef, 'no clone from a live volume' );
+    is( $P->volume_has_feature( {}, 'clone', 's', 'vm-1-disk-0' ), 1, 'clone from a live volume (driver advertises clone.from_current)' );
     is( $P->volume_has_feature( {}, 'clone', 's', 'base-1-disk-0' ), 1, 'clone from a base' );
     is( $P->volume_has_feature( {}, 'clone', 's', 'vm-1-disk-0', 'snap1' ), 1, 'clone from a snapshot' );
     is( $P->volume_has_feature( {}, 'rename', 's', 'vm-1-disk-0' ), 1, 'rename on current' );
@@ -618,6 +618,30 @@ subtest 'volume_has_feature capability gating (fail soft when the driver lacks i
     $P->deactivate_storage( 'store1', {} );
     is( $P->volume_has_feature( {}, 'snapshot', 'store1', 'vm-1-disk-0' ), 1, 'snapshot allowed with capability' );
     is( $P->volume_has_feature( {}, 'clone', 'store1', 'base-1-disk-0' ), 1, 'clone allowed with capability' );
+
+    # A backend that clones only FROM a snapshot (Nimble-style, #19): advertises
+    # clone.linked but NOT clone.from_current. base/snap clones stay offloaded; a
+    # live-source clone declines so PVE falls back to a host copy.
+    package T::SnapCloneDriver;
+    our @ISA = ('T::FakeDriver');
+    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1 } } }
+
+    package T::SnapClonePlugin;
+    use parent -norequire, 'T::Plugin';
+    our $D;
+    sub _build_driver { return $D //= T::SnapCloneDriver->new }
+
+    package main;
+    local $T::SnapClonePlugin::D = T::SnapCloneDriver->new;
+    T::SnapClonePlugin->deactivate_storage( 'store1', {} );
+    is( T::SnapClonePlugin->volume_has_feature( {}, 'clone', 'store1', 'base-1-disk-0' ), 1,
+        'clone from a base stays available without from_current' );
+    T::SnapClonePlugin->deactivate_storage( 'store1', {} );
+    is( T::SnapClonePlugin->volume_has_feature( {}, 'clone', 'store1', 'vm-1-disk-0', 'snap1' ), 1,
+        'clone from a snapshot stays available without from_current' );
+    T::SnapClonePlugin->deactivate_storage( 'store1', {} );
+    is( T::SnapClonePlugin->volume_has_feature( {}, 'clone', 'store1', 'vm-1-disk-0' ), undef,
+        'live-source clone declined when the driver lacks clone.from_current' );
 };
 
 subtest 'clone_image: linked clone from a base + backing-pair release on free (#23)' => sub {
@@ -661,6 +685,43 @@ subtest 'clone_image: from a snapshot uses the snapshot S-VOL as the CoW source'
     is( $cmeta->{parent_snap}, 'snapA', 'parent snapshot recorded' );
     ok( scalar @{ $T::Plugin::FAKE->{snaps}{ $sm->{svol} } // [] } >= 1,
         'CoW pair created on the snapshot S-VOL, not the base LU' );
+};
+
+subtest 'clone_image: linked clone from a CURRENT (live) volume, CoW off the live LU (#19)' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    # A plain live volume — not a base, no snapshot. Unique vmids (980/981) so the
+    # shared registry tempdir does not collide disk indices with other subtests.
+    my $live = $P->alloc_image( 'store1', { pool_id => '63' }, 980, 'raw', undef, 1 << 30 );
+    like( $live, qr/^vm-980-disk-\d+$/, 'live source is a current volume' );
+    my ($src_bid) = reg()->lookup($live);
+
+    my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $live, 981, undef, 1 );
+    like( $clone, qr/^vm-981-disk-\d+$/, 'clone returns a fresh volname' );
+    is( $T::Plugin::FAKE->{calls}{create_linked_clone}, 1, 'driver create_linked_clone called' );
+
+    # The CoW parent is the LIVE volume's own LU — the backing pair lands on it (no
+    # intermediate implicit snapshot object), which is the crash-consistent instant.
+    ok( scalar @{ $T::Plugin::FAKE->{snaps}{$src_bid} // [] } >= 1,
+        'backing CoW pair created directly on the live source LU' );
+
+    my ( $cbid, $cmeta ) = reg()->lookup($clone);
+    ok( defined $cbid, 'clone committed to the registry' );
+    is( $cmeta->{parent_volname}, $live, 'parent linkage recorded' );
+    ok( !defined $cmeta->{parent_snap}, 'no parent_snap for a live-source clone' );
+    ok( defined $cmeta->{clone_backing_snap}, 'backing CoW pair id recorded (#23)' );
+
+    # The live source cannot be freed while the clone depends on it.
+    eval { $P->free_image( 'store1', {}, $live ) };
+    like( $@, qr/linked clone\(s\) depend/, 'live source refused while a clone depends on it' );
+
+    # Freeing the clone releases the backing pair and leaves no orphan on the source.
+    is( $P->free_image( 'store1', {}, $clone ), undef, 'clone freed' );
+    is( $T::Plugin::FAKE->{calls}{delete_snapshot}, 1, 'backing CoW pair released (#23)' );
+    is_deeply( $T::Plugin::FAKE->{snaps}{$src_bid}, [], 'no backing pair left on the live source' );
+    is( reg()->lookup($clone), undef, 'clone unregistered' );
 };
 
 subtest 'clone_image rolls back the reservation on an in-create failure (nothing built yet)' => sub {
