@@ -298,6 +298,14 @@ sub options      { ... }   # vendor knobs + inherited generic ones
   `rename_volume`, and `get_volume_attribute`/`update_volume_attribute` for the
   `protected` and `notes` attributes (§7, #15). These are host/registry-level and
   vendor-neutral — drivers add no code for them.
+- **The registration lifecycle also lives in the base**: `on_add_hook` /
+  `on_update_hook` / `on_delete_hook` persist and tear down credentials through
+  `FCLU::Credentials`, and `check_connection` (#14) probes reachability. `on_add_hook`
+  additionally runs a connectivity probe (build driver → connect → reach the pool) that
+  is *always* torn down, so a failed validation never leaves an array session or an
+  orphan credential file. Vendor-neutral — a driver adds no code here either. (Code gap
+  #12 was closing exactly this: a cutover that built only to the surface list above would
+  re-omit these hooks.)
 - Generic, safe-to-share properties (`pool_id`, generic QoS defaults, `tls_*`,
   `lock_timeout` (cluster-lock acquisition budget, #10),
   `content`/`nodes`/`shared`/`disable`) live in the base; vendor specifics
@@ -306,7 +314,11 @@ sub options      { ... }   # vendor knobs + inherited generic ones
 - **Avoid a single `driver_options` blob** [Codex] — it kills schema validation and
   produces a poor GUI. Declare real typed properties per vendor.
 - Keep the `'sensitive-properties'` pattern and *reference-don't-redeclare* discipline
-  for `username`/`password` (the existing `SectionConfig` landmine).
+  for `username`/`password` (the existing `SectionConfig` landmine). The credential split
+  is explicit: **`username` arrives via `$scfg`** (an ordinary property), **`password`
+  via `%sensitive`** (a sensitive-property, never written to `storage.cfg`), and both are
+  persisted to the cluster-private (0600) store by `FCLU::Credentials`. The base's
+  `on_add`/`on_update`/`on_delete_hook` (above) are the methods that consume `%sensitive`.
 
 ---
 
