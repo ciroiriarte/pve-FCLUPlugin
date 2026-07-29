@@ -1,3 +1,18 @@
+pve-fclu (0.1.0~alpha41) stable; urgency=medium
+
+  * feat(#7): surface array-side (out-of-band) snapshots, read-only + opt-in. Thin Image
+    snapshots taken outside PVE (array schedules, replication, the array UI/CLI) were
+    invisible; a new `surface_oob_snapshots` store option (default off) lists them as
+    read-only `oob-*` entries. Classification is registry-authoritative (snap_id in neither
+    the PVE nor CG records, and S-VOL not a registered volume — excludes clone backing
+    pairs); they are added as detached roots (never spliced into the `current` rollback
+    ancestry); the `oob-` prefix is reserved (create + rename reject it); and delete/rollback
+    of an `oob-` entry are refused so an array replication/retention base cannot be destroyed
+    through PVE. Fail-soft (discovery errors surface zero OOB snaps). Architect-designed,
+    independently code-reviewed; live-validated on the E590H. 228 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 29 Jul 2026 12:30:41 -0300
+
 pve-fclu (0.1.0~alpha40) stable; urgency=medium
 
   * hitachi: memoize the ensure-time WWN reconcile per (port,hg) (#17). A multi-disk
