@@ -154,19 +154,30 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
 - **Snapshots:** an `autoSplit` pair; **restore = reverse-copy + re-split** (issue
   #12 — the driver owns the RCPY→PAIR→re-split settle).
 
-- **#24 linked clone — the real-array flow.** The E590H microcode **rejects** a Thin
-  Image pair created *with* `svolLdevId` ("the specified snapshot S-VOL does not have
-  LU paths"). The driver therefore:
+- **Linked clone — the real-array flow (§6, #24).** A linked clone is a **single**
+  `autoSplit` Thin Image pair: **P-VOL = the shared source LU**, **S-VOL = the new
+  clone** (a DP volume sized to the P-VOL), created in **one** `create_snapshot` call
+  with `svolLdevId` + `canCascade` + `isDataReductionForceCopy`. Both volumes are left
+  **unmapped** — the S-VOL is bound at pair creation and mapped later on activate, so no
+  host context is needed. This is the OpenStack HBSD recipe, verified live on the E590H
+  (0 used blocks on the S-VOL, CoW reads of the P-VOL). Rollback is reverse-order and
+  leak-free (release the pair, then delete the S-VOL).
+  - **Supersedes the old 4-step #24 workaround** (TI v-vol `poolId -1` → data-only pair
+    → map S-VOL → `assign_snapshot_volume`), which existed only because the microcode
+    rejected a plain `svolLdevId` ("the specified snapshot S-VOL does not have LU
+    paths"); `canCascade` + `isDataReductionForceCopy` remove that constraint. `host_ctx`
+    is still accepted for §2 back-compat but ignored.
 
-  1. creates the S-VOL as a TI **virtual** volume (`create_ldev`, `poolId -1`);
-  2. creates a **data-only** `autoSplit` pair (`create_snapshot`, **no**
-     `svolLdevId`);
-  3. **maps the S-VOL** (`ensure_host_access` + `publish_lu` with `host_ctx`) so it
-     has LU paths;
-  4. calls `assign_snapshot_volume(pairId, svol)`.
-
-  Rollback is reverse-order and leak-free. The core passes `host_ctx` into
-  `create_linked_clone` precisely so the driver can do the map-before-assign step.
+- **One shared base, not one snapshot per clone (#3).** `create_base` takes **no**
+  snapshot — it relabels the template LU in place (`base-<vmid>-disk-<n>`, read-only per
+  the role table); the base **is** the LU. Every linked clone then binds its own pair
+  **directly onto that one shared base LU as the P-VOL**, so N clones from a template
+  create **N clone-pairs sharing the single base — and zero intermediate/base snapshot
+  objects**. There is nothing per-clone to deduplicate: the object-minimal shared-base
+  model is inherent to using the base LU directly as the CoW source (cloning from a
+  *snapshot* instead uses that snapshot's S-VOL as the shared P-VOL, identically). Each
+  clone S-VOL is an independent writable DP volume; the template cannot be converted or
+  deleted while any clone depends on it (dependency guard in `create_base` / `free_image`).
 
 - **`OPEN-0V` multipath:** a clone S-VOL presents SCSI product **`OPEN-0V`** (TI
   v-vol). Multipath must match `OPEN-.*` or the clone never gets a `/dev/mapper`
@@ -174,7 +185,7 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
 
 - **#23 free ordering:** `free_image` **releases the backing CoW pair before**
   deleting the S-VOL; `delete_lu` is called only **after** a cluster-wide unpublish
-  (teardown symmetry with the `create_linked_clone(host_ctx)` mapping). Skipping the
+  (the S-VOL is mapped on activate, so teardown unmaps it symmetrically). Skipping the
   pair release would orphan an unfreeable S-VOL+pair.
 
 - **#19 linked clone from a *live* volume.** The driver advertises the

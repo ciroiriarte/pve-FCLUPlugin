@@ -188,6 +188,34 @@ subtest 'create_linked_clone: single-step pair with svolLdevId (DP S-VOL, no map
     ok( $d->get_lu($c2), 'host_ctx is tolerated (ignored), clone still created' );
 };
 
+subtest '#3: N linked clones share ONE base LU as P-VOL, no per-clone base snapshot' => sub {
+    my ( $d, $f ) = setup();
+    my $base = $d->create_lu( size_bytes => GIB );
+
+    # Three linked clones off the SAME template LU (the create_base model: the base IS
+    # the LU, relabelled read-only; clones bind directly onto it — no base snapshot).
+    my @clones = map { $d->create_linked_clone($base) } 1 .. 3;
+    is( scalar( grep { defined } @clones ), 3, 'three clones created' );
+
+    # Exactly N pairs, every one anchored on the ONE shared base as its P-VOL — not a
+    # per-clone intermediate base snapshot (which would multiply objects on the array).
+    my $pairs = $d->list_snapshots($base);
+    is( scalar @$pairs, 3, 'exactly N pairs on the base (one per clone)' );
+    is_deeply( [ map { $_->{parent_backend_id} } @$pairs ], [ ("$base") x 3 ],
+        'all N pairs share the single base LU as P-VOL' );
+    is_deeply( [ sort map { $_->{meta}{svol} // '' } @$pairs ], [ sort @clones ],
+        'each pair binds a distinct clone S-VOL (the clones, exactly)' );
+
+    # No hidden intermediate object: the only LDEVs are the base + its N clones. This is
+    # the object-minimal shared-base model — zero dedicated base-snapshot LDEVs (#3 AC1).
+    is( scalar keys %{ $f->{ldevs} }, 1 + 3,
+        'only base + N clones exist — zero intermediate/base-snapshot LDEVs' );
+
+    # Each clone is an independent writable DP volume from the pool (CoW from the base).
+    is( $f->{ldevs}{$_}{poolId}, '63', "clone $_ is a DP volume from the pool" )
+        for @clones;
+};
+
 subtest 'create_full_clone uses the clone (full-copy) path' => sub {
     my ( $d, $f ) = setup();
     my $bid = $d->create_lu( size_bytes => GIB );
