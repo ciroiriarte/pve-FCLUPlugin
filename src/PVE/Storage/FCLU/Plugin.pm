@@ -143,6 +143,14 @@ sub properties {
                 . " presentation is slow under load (default 120).",
             type        => 'integer', minimum => 10, default => 120, optional => 1,
         },
+        surface_oob_snapshots => {
+            description => "Show array-side (out-of-band) snapshots — created by array"
+                . " schedules, replication, or the array UI/CLI, not through PVE — in the"
+                . " snapshot listing (as read-only 'oob-*' entries). Off by default: it adds"
+                . " a live array read per snapshot-info call. Out-of-band snapshots are"
+                . " display-only; delete/rollback of them is refused (manage on the array).",
+            type        => 'boolean', default => 0, optional => 1,
+        },
     };
 }
 
@@ -161,6 +169,7 @@ sub options {
         tls_ca_file  => { optional => 1 },
         lock_timeout => { optional => 1 },
         device_timeout => { optional => 1 },
+        surface_oob_snapshots => { optional => 1 },
         debug        => { optional => 1 },
         # Inherited PVE properties — referenced, never redeclared in properties().
         nodes    => { optional => 1 },
@@ -869,6 +878,11 @@ sub _driver_supports {
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
+    # #7: 'oob-' is reserved for surfaced array-side (out-of-band) snapshots, so a PVE
+    # snapshot can never collide with — or be mistaken for — an array-managed one.
+    die "snapshot name '$snap' is reserved ('oob-' marks array-managed snapshots)\n"
+        if $snap =~ /^oob-/;
+
     my $reg = $class->_registry($storeid);
     my ($backend_id) = $reg->lookup($volname);
     die "volume '$volname' not found in registry\n" unless defined $backend_id;
@@ -900,6 +914,11 @@ sub volume_snapshot {
 
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    # #7: never delete a surfaced array-side (out-of-band) snapshot through PVE — it may be
+    # a replication/retention base whose loss breaks array-side data protection irrecoverably.
+    die "snapshot '$snap' is an array-managed (out-of-band) snapshot; manage it on the array\n"
+        if $snap =~ /^oob-/;
 
     my $reg = $class->_registry($storeid);
     my ($backend_id) = $reg->lookup($volname);
@@ -949,13 +968,89 @@ sub volume_snapshot_info {
     $info->{current}{parent} = $prev eq 'current' ? undef : $prev;
     $info->{current}{order}  = $order;
 
+    # #7: optionally surface array-side (out-of-band) snapshots. They are added as DETACHED
+    # roots (parent => undef, order AFTER the registry tip) and NEVER threaded into the
+    # `current` ancestry — that linear chain drives rollback/delta and must reflect only
+    # PVE-created state. Opt-in (a live array read per call); read-only (delete/rollback of
+    # an oob- name is refused below).
+    if ( $scfg->{surface_oob_snapshots} ) {
+        my $reg = $class->_registry($storeid);
+        my ($backend_id) = $reg->lookup($volname);
+        my $d = defined $backend_id ? eval { $class->_driver( $storeid, $scfg ) } : undef;
+        for my $o ( @{ $class->_oob_snapshots( $storeid, $volname, $backend_id, $reg, $d ) } ) {
+            next if exists $info->{ $o->{name} };   # never shadow a real chain entry
+            $info->{ $o->{name} } = {
+                description => 'array-managed (out-of-band)',
+                parent      => undef,
+                timestamp   => $o->{timestamp},
+                order       => ++$order,
+            };
+        }
+    }
+
     return $info;
+}
+
+# #7: discover array-side (out-of-band) snapshots on this volume's LDEV — Thin Image pairs
+# the array holds that PVE did NOT create (schedules, replication, the array UI/CLI).
+# Classification is REGISTRY-AUTHORITATIVE, never a group-name heuristic: a pair is OOB iff
+# its snap_id is in neither the volume's PVE `snapshots` nor its `cg_snapshots` record set,
+# AND its S-VOL is not a registered volume (which would make it a linked/full-clone backing
+# pair, not a snapshot). Names are `oob-<sanitized snap_id>` — stable across list calls,
+# config-id-safe (starts with a letter), and round-trippable back to the pair. Fails SOFT:
+# a driver/array read error surfaces zero OOB snaps rather than breaking the snapshot tree.
+sub _oob_snapshots {
+    my ($class, $storeid, $volname, $backend_id, $reg, $d) = @_;
+    return [] unless defined $backend_id && $d;
+
+    # Fully fail-soft: ANY error discovering OOB snaps yields an empty list, never an
+    # exception that would break the snapshot tree for the array-reachable case.
+    my $oob = eval {
+        my %known;   # snap_ids PVE owns for this volume (plain + CG snapshots)
+        $known{ $_->{snap_id} } = 1
+            for grep { defined $_->{snap_id} }
+                ( values %{ $reg->list_snapshots($volname) },
+                  values %{ $reg->list_cg_snapshots($volname) } );
+
+        my @out;
+        my %seen;
+        for my $p ( @{ $d->list_snapshots($backend_id) } ) {
+            my $sid = $p->{snap_id};
+            next unless defined $sid;
+            next if $known{$sid};                                # PVE / CG snapshot
+            my $svol = $p->{meta}{svol};
+            # A registered S-VOL means a linked/full-clone backing pair, not a snapshot.
+            # Require length so an empty svol is treated as OOB, not fed to a croaking lookup.
+            next if defined $svol && length $svol
+                && defined $reg->find_volname_by_backend($svol);
+            ( my $name = "oob-$sid" ) =~ s/[^A-Za-z0-9]+/-/g;    # config-id-safe, stable
+            # Distinct snap_ids sanitizing to the same name would hide one — warn rather
+            # than drop silently (inert for Hitachi's "pvol,mu" ids; a guard for drivers
+            # whose ids differ only in punctuation).
+            if ( $seen{$name}++ ) {
+                warn "FCLU: out-of-band snapshot '$sid' maps to an already-surfaced name"
+                    . " '$name' on '$volname' — hidden (snapshot-id name collision)\n";
+                next;
+            }
+            push @out, { name => $name, snap_id => $sid, timestamp => $p->{created} };
+        }
+        \@out;
+    };
+    if ( my $err = $@ ) {
+        warn "FCLU: out-of-band snapshot discovery for '$volname' failed: $err";
+        return [];
+    }
+    return $oob // [];
 }
 
 # Registry-only rename (#34): every op resolves the pair via the recorded snap_id,
 # so the array group label may keep the old name — renaming the key is sufficient.
 sub rename_snapshot {
     my ($class, $scfg, $storeid, $volname, $source, $target) = @_;
+    # #7: keep 'oob-' reserved on rename too — renaming a real snapshot INTO oob-* would
+    # make it permanently unmanageable through PVE (delete/rollback refuse the prefix).
+    die "snapshot name '$target' is reserved ('oob-' marks array-managed snapshots)\n"
+        if $target =~ /^oob-/;
     $class->_registry($storeid)->rename_snapshot( $volname, $source, $target );
     return;
 }
@@ -967,6 +1062,9 @@ sub rename_snapshot {
 sub volume_rollback_is_possible {
     my ($class, $scfg, $storeid, $volname, $snap, $blockers) = @_;
     $blockers //= [];
+
+    die "can't rollback to '$snap': it is an array-managed (out-of-band) snapshot;"
+        . " roll it back on the array\n" if $snap =~ /^oob-/;
 
     my $reg = $class->_registry($storeid);
     die "can't rollback, snapshot '$snap' does not exist on '$volname'\n"
@@ -983,6 +1081,9 @@ sub volume_rollback_is_possible {
 
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    die "can't rollback to '$snap': it is an array-managed (out-of-band) snapshot;"
+        . " roll it back on the array\n" if $snap =~ /^oob-/;
 
     my $reg = $class->_registry($storeid);
     my ($backend_id) = $reg->lookup($volname);

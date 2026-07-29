@@ -1161,4 +1161,53 @@ subtest 'grouped full clone rolls back prepared S-VOLs (and reservations) on fai
     is_deeply( \@left, [], 'no rolled-back clone or stale reservation left in the registry' );
 };
 
+subtest '#7: surface array-side (out-of-band) snapshots, read-only + reserved prefix' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );   # drop cached driver so _driver picks up this FAKE
+    my $fake = $P->_driver( 'store1', {} );
+
+    my $r = reg();
+    $r->register( 'vm-700-disk-0', '7000', size_mb => 1024 );
+    $r->register( 'vm-701-disk-0', '8000', size_mb => 1024 );   # a clone volume (bid 8000 = a pair svol)
+    $r->register_snapshot( 'vm-700-disk-0', 'snapA',
+        snap_id => '7000,0', group => 'pve_store1_7000_snapA', seq => 0 );
+    $r->add_cg_snapshot( 'vm-700-disk-0', 'cg1', snap_id => '7000,1', group => 'pveCg', cg => 'grp' );
+
+    # The array reports FOUR pairs on the P-VOL: a PVE snap, a CG snap, a linked-clone
+    # backing pair (svol = the registered clone 8000), and ONE genuine OOB array snapshot.
+    $fake->{snaps}{'7000'} = [
+        { snap_id => '7000,0',  group => 'pve_store1_7000_snapA', svol => 's0',   status => 'PSUS' },
+        { snap_id => '7000,1',  group => 'pveCg',                 svol => 's1',   status => 'PSUS' },
+        { snap_id => '7000,lc', group => 'pve_lc_8000',           svol => '8000', status => 'PSUS' },
+        { snap_id => '7000,9',  group => 'SCHED_DAILY',           svol => 's9',   status => 'PSUS' },
+    ];
+
+    # Flag OFF: registry-only, no OOB (byte-for-byte today's behavior).
+    my $off = $P->volume_snapshot_info( { surface_oob_snapshots => 0 }, 'store1', 'vm-700-disk-0' );
+    ok( $off->{snapA}, 'PVE snapshot present' );
+    ok( !( grep { /^oob-/ } keys %$off ), 'flag off: no OOB entries' );
+
+    # Flag ON: exactly ONE OOB entry — the PVE snap, CG snap, and clone backing pair are
+    # all excluded by the registry-authoritative filter.
+    my $on = $P->volume_snapshot_info( { surface_oob_snapshots => 1 }, 'store1', 'vm-700-disk-0' );
+    is_deeply( [ grep { /^oob-/ } keys %$on ], ['oob-7000-9'],
+        'only the genuine array snapshot surfaced (PVE/CG/clone pairs excluded)' );
+    is( $on->{'oob-7000-9'}{parent}, undef, 'OOB snap is a detached root (parent undef)' );
+    is( $on->{current}{parent}, 'snapA', 'current still tips the registry chain, not the OOB snap' );
+    ok( $on->{'oob-7000-9'}{order} > $on->{current}{order}, 'OOB ordered after the registry tip' );
+
+    # Reserved prefix: a PVE snapshot can never be named oob-* (create OR rename-to).
+    eval { $P->volume_snapshot( {}, 'store1', 'vm-700-disk-0', 'oob-x' ); 1 };
+    like( $@, qr/reserved/, 'volume_snapshot rejects a reserved oob- name' );
+    eval { $P->rename_snapshot( {}, 'store1', 'vm-700-disk-0', 'snapA', 'oob-x' ); 1 };
+    like( $@, qr/reserved/, 'rename_snapshot rejects a reserved oob- target' );
+
+    # Read-only: delete + rollback of an OOB snap are refused, with no driver op issued.
+    eval { $P->volume_snapshot_delete( {}, 'store1', 'vm-700-disk-0', 'oob-7000-9' ); 1 };
+    like( $@, qr/array-managed/, 'delete of an OOB snap refused' );
+    eval { $P->volume_snapshot_rollback( {}, 'store1', 'vm-700-disk-0', 'oob-7000-9' ); 1 };
+    like( $@, qr/out-of-band/, 'rollback of an OOB snap refused' );
+    is( $fake->{calls}{delete_snapshot} // 0, 0, 'no driver delete_snapshot issued for the OOB snap' );
+};
+
 done_testing();

@@ -213,6 +213,26 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
     (Bugzilla #7780). Until then, live-source clones full-copy exactly as before (no
     regression). Verified live on the E590H: 2026-07-22.
 
+- **#7 out-of-band snapshots (`surface_oob_snapshots`, default off).** Thin Image
+  snapshots taken *outside* PVE — array schedules, replication, the array UI/CLI — are
+  invisible by default (the snapshot view is registry-driven). Set
+  `surface_oob_snapshots 1` on the store to also list them, as read-only `oob-<snap-id>`
+  entries. Classification is **registry-authoritative**, not a name heuristic: a pair is
+  out-of-band only if its snapshot id is in neither the volume's PVE nor its CG snapshot
+  records **and** its S-VOL is not a registered volume (so linked/full-clone backing pairs
+  are never mistaken for snapshots). They are added as **detached roots** (never spliced
+  into the `current` ancestry that drives rollback), and **delete/rollback of an `oob-`
+  entry is refused** — an array replication/retention base must be managed on the array,
+  not destroyed through PVE. The `oob-` prefix is reserved (a PVE snapshot cannot use it).
+  - **Cost/scope:** the flag adds a live `list_snapshots` REST call per snapshot-info
+    render — hence off by default. And `volume_snapshot_info` feeds `pvesm` and the storage
+    layer; the per-**VM** GUI snapshot tab is driven by the VM config, so full appearance
+    there needs the same upstream per-VM wiring as transparent CG snapshots (Bugzilla #7812).
+  - **Caveat:** `oob-` snapshots are refused for delete/rollback, but **deleting the owning
+    PVE volume still reaps them** — `free_image` must release *every* Thin Image pair on the
+    LDEV before the array will delete it. Keep array-managed snapshots on volumes PVE does
+    not own, or detach them on the array first.
+
 ## Advanced services
 
 - **QoS** — upper/lower IOPS + MB/s and I/O priority, set per volume from the store's

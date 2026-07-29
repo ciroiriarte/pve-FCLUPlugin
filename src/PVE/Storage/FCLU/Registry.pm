@@ -454,6 +454,18 @@ sub list_snapshots {
     return $entry->{snapshots} || {};
 }
 
+# The volume's CG-snapshot records (label => {snap_id, group, cg, timestamp}), symmetric
+# with list_snapshots. Used by #7's OOB filter to exclude CG-snapshot pairs from the
+# array-side out-of-band discovery (they are PVE-created, just tracked separately).
+sub list_cg_snapshots {
+    my ($self, $volname) = @_;
+
+    my $reg   = $self->load();
+    my $entry = $reg->{$volname} or return {};
+
+    return $entry->{cg_snapshots} || {};
+}
+
 # ── Consistency groups (§6 snapshot.consistency_group) ──
 #
 # CG membership is a plain per-volume attribute (`cg` => "<name>", set via
