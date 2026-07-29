@@ -1,3 +1,18 @@
+pve-fclu (0.1.0~alpha42) stable; urgency=medium
+
+  * feat(#8): auto-assign new volumes to a consistency/protection group. New optional store
+    property `auto_cg <group>`: alloc_image tags every newly allocated volume's `cg`
+    attribute to that group, so new disks automatically join `pve-fclu-cg` group snapshots
+    without per-disk tagging (schedule the snapshot op via cron for hands-off protection).
+    On Hitachi VSP One / E-series the CM REST exposes no bare-LDEV protection construct or
+    native schedule, so the mechanism is the existing per-volume `cg` tag — a registry-only
+    write inside the alloc register(), so it never issues an array call and cannot fail
+    provisioning; idempotent, and register()'s merge preserves the tag on resize. Fresh
+    allocations only (not clones/adopted volumes); empty auto_cg = unset. Live-validated on
+    the E590H. 229 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 29 Jul 2026 12:46:47 -0300
+
 pve-fclu (0.1.0~alpha41) stable; urgency=medium
 
   * feat(#7): surface array-side (out-of-band) snapshots, read-only + opt-in. Thin Image
