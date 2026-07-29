@@ -647,4 +647,62 @@ subtest 'target_ports surfaces configured ports (WWPN deferred to fabric §14)' 
         'configured ports surfaced, no fabricated wwpn' );
 };
 
+# ── GH#17: the _wwn_ok ensure-time reconcile memo ──
+
+subtest 'GH#17: _wwn_ok memo collapses the ensure-time guard read across a clone burst' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);   # 2 ports, 1 WWN
+
+    # Mirror activate_volume (ensure THEN publish; publish self-ensures internally) for a
+    # 3-disk qm-clone burst on one node. Without the memo each disk re-issues the never-
+    # cached guard read on both the caller-ensure and publish's internal ensure: 6/disk = 18.
+    $d->ensure_host_access( ctx('node-a') ), $d->publish_lu( $_, ctx('node-a') )
+        for ( '256', '257', '258' );
+
+    # With the memo: per port exactly ONE cold ensure-time guard read (disk 1), then only
+    # the fresh pre-map ownership gate on every publish (3). 2 ports -> (1 + 3) * 2 = 8.
+    is( $f->{calls}{list_host_wwns}, 8,
+        'fresh WWN reads = (1 cold ensure + 3 pre-map) x 2 ports; ensures 2..N skip the guard' );
+    is( $f->{calls}{create_host_group},    2, 'group created once per port (unchanged)' );
+    is( $f->{calls}{add_wwn_to_host_group}, 2, 'WWN added once per port (memo skips re-add)' );
+};
+
+subtest 'GH#17: the memo does NOT bypass the pre-map foreign-WWN guard' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->ensure_host_access( ctx('node-a') );          # cold ensure -> _wwn_ok set both ports
+    ok( $d->{_wwn_ok}{'CL1-A,0'}, 'memo set after the cold ensure' );
+
+    # A foreign cluster injects a WWN into node-a's group on the FIRST port AFTER the memo.
+    $f->{hgs}{'CL1-A,0'}{wwns}{'10000000c9ff'} = 1;
+
+    # publish_lu must still fail closed — its pre-map _assert_hg_ownership reads fresh.
+    my $err;
+    eval { $d->publish_lu( '256', ctx('node-a') ); 1 } or $err = $@;
+    ok( $err, 'publish_lu dies on the foreign WWN despite the ensure-time memo' );
+    like( "$err", qr/not owned|foreign/i, 'classified as an ownership/foreign conflict' );
+    is( $f->{calls}{map_lun} // 0, 0, 'no LUN mapped before the guard fired' );
+};
+
+subtest 'GH#17: reclaim + a pre-map conflict both drop the stale _wwn_ok memo' => sub {
+    my $f = FakeRest->new;
+    my $d = drv($f);
+    $d->ensure_host_access( ctx('node-a') );
+    ok( $d->{_wwn_ok}{'CL1-A,0'}, 'memo set' );
+
+    # (a) reaping the empty group clears its memo (mirrors _hmo_ok invalidation).
+    $d->reclaim_empty_host_groups( ctx('node-a') );
+    ok( !$d->{_wwn_ok}{'CL1-A,0'}, 'memo cleared when the group is reaped' );
+
+    # (b) a pre-map ownership conflict must also drop the memo so a recycled/aliased
+    # number never rides a stale reconcile flag.
+    my $f2 = FakeRest->new;
+    my $d2 = drv($f2);
+    $d2->ensure_host_access( ctx('node-a') );
+    ok( $d2->{_wwn_ok}{'CL1-A,0'}, 'memo set (second driver)' );
+    $f2->{hgs}{'CL1-A,0'}{wwns}{'10000000c9ff'} = 1;   # foreign WWN appears
+    eval { $d2->publish_lu( '256', ctx('node-a') ); 1 };
+    ok( !$d2->{_wwn_ok}{'CL1-A,0'}, 'stale memo dropped on the conflict re-resolve' );
+};
+
 done_testing();

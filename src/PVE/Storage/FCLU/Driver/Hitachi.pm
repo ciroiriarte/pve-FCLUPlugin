@@ -1101,71 +1101,23 @@ sub ensure_host_access {
             warn "FCLU Hitachi: HMO reconcile warning ($port,$hg_num): $@" if $@;
         }
 
-        # Read current membership FRESH (never cached). A read FAILURE here must NOT be
-        # treated as "empty" — that would bypass the foreign-WWN guard below and let us
-        # add this node's WWN INTO a possibly-foreign group (isolation pollution the
-        # pre-map gate cannot undo). Classify a transient read as array_busy (retryable),
-        # exactly like the pre-map gate _assert_hg_ownership.
-        my $existing = eval {
-            $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
-        };
-        $self->_err( 'array_busy',
-            "host-wwn read for $port (#$hg_num) did not return; refusing to reconcile an "
-            . "unverified group" )
-            if $@ || ref $existing ne 'ARRAY';
-        my %present = map { lc( $_->{hostWwn} // '' ) => 1 } @$existing;
-        delete $present{''};   # ignore a malformed/empty hostWwn (no spurious "foreign" key)
-
-        # SAFETY (multi-cluster shared pool): refuse to add THIS node's WWNs to a host
-        # group that already holds FOREIGN initiators. On a shared array two clusters can
-        # collide on <prefix>_<hostname> (same prefix AND hostname), or a group can be
-        # mis-created; silently merging would expose this cluster's LUNs to the foreign
-        # node (concurrent-write corruption). Fail LOUD instead. A group holding only our
-        # own WWNs — normal re-bring-up, or a legacy PVE_<hostname> group adopted by WWN —
-        # passes. Relies on host_context listing ALL of this node's PRESENT initiators, so a
-        # stale WWN left by a REPLACED/REMOVED HBA on this node also trips it (still safe:
-        # fail-loud, remedy = delete the stale WWN from the host group).
-        my %ours = map { lc($_) => 1 } @$wwns;
-        my @foreign = sort grep { !$ours{$_} } keys %present;
-        $self->_err( 'conflict',
-            "host group '$hg->{hostGroupName}' on $port (#$hg_num) already contains initiators "
-            . "not owned by node '$hostname' (foreign WWN(s): @foreign); refusing to add this "
-            . "node's WWNs. Likely a cross-cluster host-group collision on a shared pool — give "
-            . "each cluster a distinct host_group_prefix + a disjoint ldev_range (or an array "
-            . "Resource Group). If instead an HBA on THIS node was replaced/removed, delete the "
-            . "stale WWN from the host group." )
-            if @foreign;
-
-        # Register any of our WWNs not already present (best-effort, idempotent).
-        my $added = 0;
-        for my $wwn (@$wwns) {
-            next if $present{ lc $wwn };
-            if ( eval {
-                $self->{rest}->add_wwn_to_host_group(
-                    port_id => $port, host_group_number => $hg_num, wwn => $wwn );
-                1;
-            } ) {
-                $added++;
-            } else {
-                warn "FCLU Hitachi: WWN add warning ($port $wwn): $@";
-            }
-        }
-
-        # #4 Atomic create: a group we JUST created that registered NONE of this node's
-        # initiators would still be a valid map target — publish_lu would map LUNs into a
-        # group the host cannot see, and it dangles empty on the shared array. That means
-        # the node is not zoned to THIS port (or every add failed): roll the empty group
-        # back (HBSD's NO_HBA_WWN_ADDED) and treat this port as no-access — but do NOT
-        # abort, since other ports may be validly zoned (asymmetric fabric). We fail loud
-        # only if NO port yields a path (after the loop). EXISTING groups stay additive/
-        # best-effort (a partial add on re-bring-up only warns — %present holds our WWNs).
-        if ( $created && !$added && !%present ) {
-            eval { $self->{rest}->delete_host_group("$port,$hg_num") };
-            delete $self->{_hmo_ok}{"$port,$hg_num"};   # the (port,hgnum) is gone; drop its HMO cache
-            warn "FCLU Hitachi: host group '$hg_name' on $port registered none of node "
-                . "'$hostname' WWNs (@$wwns) — rolled back the empty group (node likely not "
-                . "zoned to $port).\n";
-            next;
+        # Reconcile our WWNs into ($port,$hg): fresh foreign-WWN guard read, additive WWN
+        # registration, and the #4 empty-created-group rollback — but ONLY ONCE per
+        # (port,hg_num) per process (T2-5 sibling _wwn_ok, GH#17). A multi-disk qm clone
+        # re-activates the same node for every disk, and each publish's internal ensure
+        # re-enters here; without this memo each pass re-issues the never-cached
+        # list_host_wwns read (3 per disk/port), the dominant clone host-mapping cost.
+        #
+        # SAFETY: this guard is NOT the map authorization. publish_lu's _assert_hg_ownership
+        # reads WWNs FRESH before every map_lun, so a foreign WWN that appears after this
+        # memo is set is still caught before any LUN maps. That pre-map gate must never be
+        # memoized (a recycled host-group number would slip a foreign group past the map —
+        # the real corruption TOCTOU). Self-heal gap (mirrors _hmo_ok): our OWN WWNs removed
+        # out-of-band mid-process won't be re-added, surfacing as a loud no-path failure at
+        # multipath attach, never as foreign exposure. Invalidated wherever _hmo_ok is, plus
+        # on a pre-map conflict re-resolve (see _resolve_owned_hg).
+        if ( !$self->{_wwn_ok}{"$port,$hg_num"} ) {
+            next unless $self->_reconcile_hg_wwns( $port, $hg, $hg_name, $hostname, $wwns, $created );
         }
 
         # This port resolved a usable group — the canonical <prefix>_<host> we just
@@ -1183,6 +1135,91 @@ sub ensure_host_access {
         unless $any_access;
 
     return $access_ref // $hg_name;
+}
+
+# Reconcile THIS node's WWNs into the host group ($port,$hg): the fresh foreign-WWN guard
+# read + additive WWN registration + the #4 empty-created-group rollback. Split out of
+# ensure_host_access so it can be gated by _wwn_ok (GH#17): run once per (port,hg_num) per
+# process instead of on every disk of a clone burst. Returns 1 when the port yields a
+# usable group (memo set), 0 when a freshly-created group registered none of our WWNs and
+# was rolled back (caller skips the port). NOT the map authorization — see the memo comment
+# in ensure_host_access and the fresh pre-map gate in _assert_hg_ownership.
+sub _reconcile_hg_wwns {
+    my ($self, $port, $hg, $hg_name, $hostname, $wwns, $created) = @_;
+    my $hg_num = $hg->{hostGroupNumber};
+
+    # Read current membership FRESH (never cached). A read FAILURE here must NOT be
+    # treated as "empty" — that would bypass the foreign-WWN guard below and let us
+    # add this node's WWN INTO a possibly-foreign group (isolation pollution the
+    # pre-map gate cannot undo). Classify a transient read as array_busy (retryable),
+    # exactly like the pre-map gate _assert_hg_ownership.
+    my $existing = eval {
+        $self->{rest}->list_host_wwns( port_id => $port, host_group_number => $hg_num );
+    };
+    $self->_err( 'array_busy',
+        "host-wwn read for $port (#$hg_num) did not return; refusing to reconcile an "
+        . "unverified group" )
+        if $@ || ref $existing ne 'ARRAY';
+    my %present = map { lc( $_->{hostWwn} // '' ) => 1 } @$existing;
+    delete $present{''};   # ignore a malformed/empty hostWwn (no spurious "foreign" key)
+
+    # SAFETY (multi-cluster shared pool): refuse to add THIS node's WWNs to a host
+    # group that already holds FOREIGN initiators. On a shared array two clusters can
+    # collide on <prefix>_<hostname> (same prefix AND hostname), or a group can be
+    # mis-created; silently merging would expose this cluster's LUNs to the foreign
+    # node (concurrent-write corruption). Fail LOUD instead. A group holding only our
+    # own WWNs — normal re-bring-up, or a legacy PVE_<hostname> group adopted by WWN —
+    # passes. Relies on host_context listing ALL of this node's PRESENT initiators, so a
+    # stale WWN left by a REPLACED/REMOVED HBA on this node also trips it (still safe:
+    # fail-loud, remedy = delete the stale WWN from the host group).
+    my %ours = map { lc($_) => 1 } @$wwns;
+    my @foreign = sort grep { !$ours{$_} } keys %present;
+    $self->_err( 'conflict',
+        "host group '$hg->{hostGroupName}' on $port (#$hg_num) already contains initiators "
+        . "not owned by node '$hostname' (foreign WWN(s): @foreign); refusing to add this "
+        . "node's WWNs. Likely a cross-cluster host-group collision on a shared pool — give "
+        . "each cluster a distinct host_group_prefix + a disjoint ldev_range (or an array "
+        . "Resource Group). If instead an HBA on THIS node was replaced/removed, delete the "
+        . "stale WWN from the host group." )
+        if @foreign;
+
+    # Register any of our WWNs not already present (best-effort, idempotent).
+    my $added = 0;
+    for my $wwn (@$wwns) {
+        next if $present{ lc $wwn };
+        if ( eval {
+            $self->{rest}->add_wwn_to_host_group(
+                port_id => $port, host_group_number => $hg_num, wwn => $wwn );
+            1;
+        } ) {
+            $added++;
+        } else {
+            warn "FCLU Hitachi: WWN add warning ($port $wwn): $@";
+        }
+    }
+
+    # #4 Atomic create: a group we JUST created that registered NONE of this node's
+    # initiators would still be a valid map target — publish_lu would map LUNs into a
+    # group the host cannot see, and it dangles empty on the shared array. That means
+    # the node is not zoned to THIS port (or every add failed): roll the empty group
+    # back (HBSD's NO_HBA_WWN_ADDED) and treat this port as no-access — but do NOT
+    # abort, since other ports may be validly zoned (asymmetric fabric). We fail loud
+    # only if NO port yields a path (after the loop). EXISTING groups stay additive/
+    # best-effort (a partial add on re-bring-up only warns — %present holds our WWNs).
+    if ( $created && !$added && !%present ) {
+        eval { $self->{rest}->delete_host_group("$port,$hg_num") };
+        delete $self->{_hmo_ok}{"$port,$hg_num"};   # the (port,hgnum) is gone; drop its HMO cache
+        warn "FCLU Hitachi: host group '$hg_name' on $port registered none of node "
+            . "'$hostname' WWNs (@$wwns) — rolled back the empty group (node likely not "
+            . "zoned to $port).\n";
+        return 0;
+    }
+
+    # Clean reconcile: our WWNs are present and no foreign initiator — memoize so the rest
+    # of the clone burst skips this fresh read (invalidated with _hmo_ok + on a pre-map
+    # conflict, so a recycled/aliased number never rides a stale flag).
+    $self->{_wwn_ok}{"$port,$hg_num"} = 1;
+    return 1;
 }
 
 # Host group name for this node, namespaced by the (per-cluster) prefix so two PVE
@@ -1259,6 +1296,7 @@ sub reclaim_empty_host_groups {
         next if $@ || ref $luns ne 'ARRAY' || @$luns;
         if ( eval { $self->{rest}->delete_host_group("$port,$hg_num"); 1 } ) {
             delete $self->{_hmo_ok}{"$port,$hg_num"};   # reaped — drop its HMO cache
+            delete $self->{_wwn_ok}{"$port,$hg_num"};   # ...and its WWN-reconcile memo (GH#17)
             push @reaped, "$port,$hg_num";
         } else {
             warn "FCLU Hitachi: reclaim of empty host group ($port,#$hg_num) failed: $@";
@@ -1691,6 +1729,9 @@ sub _resolve_owned_hg {
 
     # Confirmed conflict: the cached topology list may name-alias a stale number. Drop
     # it, re-resolve fresh once, and re-assert — dies if the group is genuinely foreign.
+    # Also drop this number's _wwn_ok memo (GH#17): the ensure-time reconcile flag must not
+    # survive a number recycle/alias, or a later ensure would skip its guard on a bad number.
+    delete $self->{_wwn_ok}{"$port,$hg->{hostGroupNumber}"};
     $self->{rest}->_invalidate_hg_list_cache($port);
     $hg = $self->_call( sub { $self->{rest}->find_host_group_by_name( $port, $hg_name ) } )
         // $self->_find_node_hg( $port, $wwns, $hg_name );
