@@ -151,6 +151,14 @@ sub properties {
                 . " display-only; delete/rollback of them is refused (manage on the array).",
             type        => 'boolean', default => 0, optional => 1,
         },
+        auto_cg => {
+            description => "Consistency/protection group to auto-assign every newly allocated"
+                . " volume to (sets the volume's 'cg' attribute at alloc). New disks then"
+                . " automatically join 'pve-fclu-cg' group snapshots — schedule those (e.g."
+                . " via cron) for hands-off protection. Membership only; taking the snapshots"
+                . " stays an explicit/scheduled pve-fclu-cg operation. Unset = no auto-assign.",
+            type        => 'string', optional => 1,
+        },
     };
 }
 
@@ -170,6 +178,7 @@ sub options {
         lock_timeout => { optional => 1 },
         device_timeout => { optional => 1 },
         surface_oob_snapshots => { optional => 1 },
+        auto_cg      => { optional => 1 },
         debug        => { optional => 1 },
         # Inherited PVE properties — referenced, never redeclared in properties().
         nodes    => { optional => 1 },
@@ -535,6 +544,12 @@ sub alloc_image {
             identity => $lu->{identity},
             size_mb  => ceil( $lu->{size_bytes} / ( 1024 * 1024 ) ),
             pool_ref => $lu->{pool_ref},
+            # #8: auto-join a standing consistency/protection group so newly allocated disks
+            # are covered by pve-fclu-cg group snapshots without per-disk config. This is the
+            # per-volume `cg` tag (same field update_volume_attribute sets), a registry-only
+            # write — it never issues an array call, so it cannot fail provisioning.
+            ( defined $scfg->{auto_cg} && length $scfg->{auto_cg}
+                ? ( cg => $scfg->{auto_cg} ) : () ),
         );
         $committed = 1;
     };

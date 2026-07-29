@@ -1210,4 +1210,26 @@ subtest '#7: surface array-side (out-of-band) snapshots, read-only + reserved pr
     is( $fake->{calls}{delete_snapshot} // 0, 0, 'no driver delete_snapshot issued for the OOB snap' );
 };
 
+subtest '#8: auto_cg tags every newly allocated volume into the protection group' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+
+    # auto_cg set -> alloc tags the new volume's cg attribute, so it auto-joins pve-fclu-cg.
+    my $name = $P->alloc_image( 'store1', { pool_id => '63', auto_cg => 'gold' },
+        600, 'raw', undef, 1024 * 1024 );
+    my ( undef, $entry ) = reg()->lookup($name);
+    is( $entry->{cg}, 'gold', 'new volume tagged into the configured protection group' );
+    ok( ( grep { $_ eq $name } @{ reg()->find_cg_members('gold') } ),
+        'volume auto-joins find_cg_members(gold)' );
+
+    # No auto_cg -> no cg tag (byte-for-byte prior behavior).
+    my $plain = $P->alloc_image( 'store1', { pool_id => '63' }, 601, 'raw', undef, 1024 * 1024 );
+    is( ( reg()->lookup($plain) )[1]->{cg}, undef, 'no auto_cg => volume carries no cg tag' );
+
+    # Empty auto_cg is treated as unset.
+    my $empty = $P->alloc_image( 'store1', { pool_id => '63', auto_cg => '' },
+        602, 'raw', undef, 1024 * 1024 );
+    is( ( reg()->lookup($empty) )[1]->{cg}, undef, 'empty auto_cg => no cg tag' );
+};
+
 done_testing();

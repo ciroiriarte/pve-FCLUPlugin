@@ -183,6 +183,19 @@ snapshot is an **explicit** operation — per-volume `qm`/`pvesm` snapshots are 
 and keep working. A volume belongs to **at most one** group; a group may span several
 VMs, and one VM's disks may be split across several groups.
 
+**Auto-membership (`auto_cg`).** Set `auto_cg <group>` on the store to have **every newly
+allocated volume** join that group automatically (it sets the volume's `cg` attribute at
+`alloc`). New disks are then covered by `pve-fclu-cg` group snapshots with no per-disk
+tagging — schedule `pve-fclu-cg snapshot <store> <group> <label>` (e.g. from cron) for
+hands-off protection. It affects **fresh allocations only** (not clones or adopted/managed
+volumes — tag those with `pve-fclu-cg tag`), and is membership only: taking the snapshots
+stays an explicit/scheduled operation. Retag or clear it any time with `pve-fclu-cg`.
+
+```
+# in storage.cfg (or: pvesm set <store> --auto_cg nightly)
+auto_cg nightly
+```
+
 ```
 # tag volumes into groups (volid or bare volname both accepted)
 pve-fclu-cg tag  <store> db   vm-100-disk-0 vm-100-disk-1
