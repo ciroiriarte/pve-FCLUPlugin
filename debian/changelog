@@ -1,3 +1,20 @@
+pve-fclu (0.1.0~alpha40) stable; urgency=medium
+
+  * hitachi: memoize the ensure-time WWN reconcile per (port,hg) (#17). A multi-disk
+    qm clone re-activates the same node for every disk and publish_lu self-ensures, so
+    ensure_host_access re-issued its never-cached foreign-WWN guard read (list_host_wwns)
+    up to 3x per disk/port — the dominant remaining clone host-mapping cost after
+    alpha34's T2-5/T2-6. A process-lifetime _wwn_ok{"port,hg"} memo (mirroring _hmo_ok)
+    runs the guard read + WWN registration + #4 rollback ONCE per (port,hg); across a
+    3-disk/2-port burst that cuts list_host_wwns 18 -> 8. SAFETY: the memo is confined to
+    the ensure-time reconcile — the map authorization (_assert_hg_ownership) still reads
+    fresh before every map_lun and is never memoized, so a foreign WWN appearing after
+    the memo is still caught before any LUN maps. Invalidated with _hmo_ok plus on a
+    pre-map conflict re-resolve. Architect-designed, independently code-reviewed APPROVE.
+    227 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 29 Jul 2026 11:34:54 -0300
+
 pve-fclu (0.1.0~alpha39) stable; urgency=medium
 
   * hitachi: shard nodes across FC target-port groups (#5). Optional port_groups +
