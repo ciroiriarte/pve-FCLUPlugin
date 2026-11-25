@@ -118,11 +118,14 @@ use PVE::Storage::FCLU::Plugin;
             @{ $s->{snaps}{$bid} } = grep { $_->{snap_id} ne $sid } @{ $s->{snaps}{$bid} };
         }
         1 }
-    sub restore_snapshot { my ( $s ) = @_; $s->{calls}{restore_snapshot}++; 1 }
+    sub restore_snapshot { my ( $s ) = @_; $s->{calls}{restore_snapshot}++;
+        $s->{on_restore}->() if $s->{on_restore};
+        die "BOOM restore\n" if $s->{fail_restore}; 1 }
     sub create_linked_clone {
         my ( $s, $src, %o ) = @_; $s->{calls}{create_linked_clone}++;
         $s->{last_clone_hctx} = $o{host_ctx};
         die "BOOM clone\n" if $s->{fail_clone};
+        $s->{on_clone}->() if $s->{on_clone};
         my $svol = $s->_id( $o{requested_id} );
         # Back the clone with a CoW pair on the source carrying this svol, so the
         # core can discover the backing pair (meta.svol) for the #23 release.
@@ -1230,6 +1233,93 @@ subtest '#8: auto_cg tags every newly allocated volume into the protection group
     my $empty = $P->alloc_image( 'store1', { pool_id => '63', auto_cg => '' },
         602, 'raw', undef, 1024 * 1024 );
     is( ( reg()->lookup($empty) )[1]->{cg}, undef, 'empty auto_cg => no cg tag' );
+};
+
+subtest 'snapshot rename keeps linked clones pinned; rollback re-checks dependents itself' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 940, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $vol, 941, 's1', 0 );
+
+    # Rename must carry the clone's parent_snap along, or the guards go blind.
+    $P->rename_snapshot( {}, 'store1', $vol, 's1', 's2' );
+    is( ( reg()->lookup($clone) )[1]->{parent_snap}, 's2', 'clone repointed to the new name' );
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's2' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'delete of the renamed snapshot still guarded' );
+    eval { $P->volume_rollback_is_possible( {}, 'store1', $vol, 's2' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'rollback preflight of the renamed snapshot guarded' );
+
+    # Direct rollback (no preflight) must refuse on its own, before touching the array.
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's2' ) };
+    like( $@, qr/linked clone\(s\) depend.*\Q$clone\E/, 'direct rollback refused with dependents' );
+    ok( !$T::Plugin::FAKE->{calls}{restore_snapshot}, 'no restore issued' );
+};
+
+subtest 'rollback and clone_image serialize through the restore marker' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 950, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+
+    # A rollback in flight (marker set by a live process) blocks a clone from that snapshot.
+    reg()->begin_snapshot_restore( $vol, 's1', node => 'node-x' );
+    eval { $P->clone_image( { pool_id => '63' }, 'store1', $vol, 951, 's1', 0 ) };
+    like( $@, qr/rollback to it is running/, 'clone refused while the snapshot is restoring' );
+    ok( !$T::Plugin::FAKE->{calls}{create_linked_clone}, 'no clone created on the array' );
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/already running/, 'a second concurrent rollback is refused' );
+    reg()->end_snapshot_restore( $vol, 's1', node => 'node-x' );
+
+    # A successful rollback clears its marker, so cloning works afterwards.
+    ok( $P->volume_snapshot_rollback( {}, 'store1', $vol, 's1' ), 'rollback succeeds' );
+    ok( !reg()->lookup_snapshot( $vol, 's1' )->{restoring}, 'marker cleared after success' );
+
+    # A failed restore also clears the marker and rethrows the driver error.
+    $T::Plugin::FAKE->{fail_restore} = 1;
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/BOOM restore/, 'driver failure propagates' );
+    ok( !reg()->lookup_snapshot( $vol, 's1' )->{restoring}, 'marker cleared after failure' );
+    $T::Plugin::FAKE->{fail_restore} = 0;
+
+    ok( $P->clone_image( { pool_id => '63' }, 'store1', $vol, 951, 's1', 0 ),
+        'clone allowed once no rollback is running' );
+};
+
+subtest 'clone_image vs concurrent rename; rollback marker TTL from the driver budget' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 960, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+
+    # A rename landing while the clone is being built must survive the clone's commit.
+    $T::Plugin::FAKE->{on_clone} = sub { reg()->rename_snapshot( $vol, 's1', 's2' ) };
+    my $clone = $P->clone_image( { pool_id => '63' }, 'store1', $vol, 961, 's1', 0 );
+    delete $T::Plugin::FAKE->{on_clone};
+    is( ( reg()->lookup($clone) )[1]->{parent_snap}, 's2', 'committed clone tracks the rename' );
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's2' ) };
+    like( $@, qr/linked clone\(s\) depend.*\Q$clone\E/, 'rollback of the renamed snapshot guarded' );
+
+    # An in-flight clone alone (reservation, nothing committed) blocks a rollback.
+    $P->volume_snapshot( {}, 'store1', $vol, 's3' );
+    my $res = reg()->reserve_volname( 962, parent_volname => $vol, parent_snap => 's3' );
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's3' ) };
+    like( $@, qr/\Q$res\E \(clone in progress\)/, 'in-flight clone blocks rollback' );
+    reg()->unregister($res);
+
+    # The driver's restore budget sizes the marker; it is visible during the restore.
+    no warnings 'once';
+    local *T::FakeDriver::restore_budget_s = sub { 7200 };
+    my $seen;
+    $T::Plugin::FAKE->{on_restore} = sub { $seen = reg()->lookup_snapshot( $vol, 's3' )->{restoring} };
+    ok( $P->volume_snapshot_rollback( {}, 'store1', $vol, 's3' ), 'rollback succeeds' );
+    ok( $seen, 'marker present while the driver restores' );
+    is( $seen->{expires} - $seen->{started}, 7200 + 3600, 'TTL = driver budget + 1h margin' );
+    is( $seen->{node}, 'node-x', 'marker records this node' );
+    ok( !reg()->lookup_snapshot( $vol, 's3' )->{restoring}, 'marker cleared afterwards' );
 };
 
 done_testing();

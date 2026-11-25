@@ -241,6 +241,8 @@ guarantees all LUNs freeze together, not that the guest flushed its caches first
 | "older storage API" warning at load | The package's APIVER is below the host's — upgrade `pve-fclu-*`. |
 | `conflict` thrown on activation | Cross-cluster host-group collision on a shared pool — the group holds a foreign WWN. Set a distinct `host_group_prefix` (and disjoint `ldev_range`) per cluster, or clear the stale WWN. |
 | Activation times out waiting for the device under load | Raise `device_timeout`; the connector re-rescans SCSI while it waits. |
+| Snapshot rollback refused: "linked clone(s) depend on this snapshot" | Restoring would rewrite blocks the listed clones share. Delete (or full-copy) those clones first. A clone that is still being created counts too; one left by a killed clone task stops counting after 1 h. |
+| "a rollback of this snapshot is already running" / clone refused: "a rollback to … is running" | A linked clone is refused while a rollback is rewriting what it would copy: the snapshot it is cloned from, or, for a clone of the live volume, a rollback to any of that volume's snapshots. Wait for the rollback to finish. A marker left by a crashed rollback is ignored once its process is gone on the node that set it. From any node, it is ignored once the driver's restore budget plus 1 h has passed (about 25 h for Hitachi defaults). |
 | Volume "orphaned" right after a package swap | Registry not migrated — run `pve-fclu-migrate-hitachi` (see [Migration](#migration-from-pve-storage-hitachiblock)). |
 
 ## Keeping docs in sync

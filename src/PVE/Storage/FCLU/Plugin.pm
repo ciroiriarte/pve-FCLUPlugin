@@ -1108,11 +1108,30 @@ sub volume_snapshot_rollback {
     die "snapshot '$snap' not found for volume '$volname'\n"
         unless $meta && defined $meta->{snap_id};
 
+    # Re-check dependents HERE, not only in volume_rollback_is_possible: callers may
+    # skip the preflight, and a clone can start after it. begin_snapshot_restore does
+    # the check and sets a restore marker in one locked write; clone_image's
+    # reservation refuses a marked snapshot, closing the check-then-act window.
+    # The marker's TTL comes from the driver's restore budget (optional
+    # restore_budget_s; the registry default applies without one) plus an hour of
+    # margin, so a long but live restore is never mistaken for a crashed one.
+    my $d    = $class->_driver( $storeid, $scfg );
+    my $node = eval { $class->_nodename };
+    my $budget = $d->can('restore_budget_s') ? $d->restore_budget_s : undef;
+    $reg->begin_snapshot_restore( $volname, $snap, node => $node,
+        ( $budget ? ( ttl => $budget + 3600 ) : () ) );
+
     # The driver owns the reverse-copy + re-split settle (#12): restore_snapshot
     # MUST leave the snapshot a usable, re-restorable pair before returning. Pass the
     # target's backend id so the driver refuses a pair that isn't this volume's (N3).
-    $class->_driver( $storeid, $scfg )
-        ->restore_snapshot( $meta->{snap_id}, pvol => $backend_id );
+    my $ok = eval {
+        $d->restore_snapshot( $meta->{snap_id}, pvol => $backend_id );
+        1;
+    };
+    my $err = $@;
+    eval { $reg->end_snapshot_restore( $volname, $snap, node => $node ) };
+    warn "FCLU: could not clear the rollback marker on '$volname\@$snap': $@" if $@;
+    die $err unless $ok;
 
     return 1;
 }
@@ -1155,7 +1174,14 @@ sub clone_image {
     }
 
     my $d        = $class->_driver( $storeid, $scfg );
-    my $new_name = $reg->reserve_volname($vmid);
+    # Reserve WITH lineage: the in-flight clone then counts as a dependent of its
+    # source (and snapshot), and the reservation is refused while that snapshot is
+    # being rolled back, so clone and rollback serialize through the registry lock.
+    my $new_name = $reg->reserve_volname( $vmid,
+        parent_volname => $volname,
+        ( $snap ? ( parent_snap => $snap ) : () ),
+        node => scalar eval { $class->_nodename },
+    );
 
     # $pair is resolved inside the eval but MUST be visible to the rollback: a linked
     # clone is a split CoW pair, so undoing a partial build has to release that pair
@@ -1183,17 +1209,17 @@ sub clone_image {
 
         $d->set_lu_label( $svol, $class->_make_label( $storeid, $new_name, $d ) );
 
-        # Commit LAST: identity + size + parentage (so the source can't be deleted
-        # while this clone shares its blocks) + the backing-pair id AND its P-VOL, so
+        # Commit LAST: identity + size + the backing-pair id AND its P-VOL, so
         # free_image can release the pair by id, or rediscover it from the P-VOL (#23).
+        # Parentage (parent_volname/parent_snap) is NOT passed: the reservation already
+        # carries it and register() merges over it. Re-passing the local $snap would
+        # overwrite a rename_snapshot that repointed the reservation meanwhile.
         my $lu = $d->get_lu($svol);
         $reg->register( $new_name, $svol,
             identity              => $d->get_lu_identity($svol),
             size_mb               => $src_meta->{size_mb},
             pool_ref              => $lu->{pool_ref},
-            parent_volname        => $volname,
             clone_parent_backend  => $clone_source,
-            ( $snap ? ( parent_snap => $snap ) : () ),
             ( $pair ? ( clone_backing_snap => $pair->{snap_id} ) : () ),
         );
         $committed = 1;

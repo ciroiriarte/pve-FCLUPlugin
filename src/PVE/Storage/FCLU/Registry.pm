@@ -284,14 +284,34 @@ sub unregister {
 # entry so concurrent allocations (same or other node) cannot pick the same name.
 # Pass base => 1 to reserve a base-volume name. The reservation is finalized by a
 # later register() or released by unregister() on failure.
+# %opts: base => 1 for a base-* name; parent_volname / parent_snap (+ node) when
+# reserving for a linked clone, so the in-flight clone counts as a dependent and the
+# reservation is refused while a rollback is rewriting what it would copy: the named
+# snapshot, or, for a clone of the live volume, a rollback to ANY of its snapshots
+# (the P-VOL is mid reverse-copy).
 sub reserve_volname {
     my ($self, $vmid, %opts) = @_;
 
     croak "vmid is required" unless defined $vmid;
     my $prefix = $opts{base} ? 'base' : 'vm';
+    my %lineage = map { defined $opts{$_} ? ( $_ => $opts{$_} ) : () }
+        qw(parent_volname parent_snap);
 
-    return $self->_with_registry_lock( sub {
+    # A refusal is returned out of the locked section (see begin_snapshot_restore).
+    my ( $reserved, $refusal ) = $self->_with_registry_lock( sub {
         my ($reg) = @_;
+        if ( defined( my $pv = $lineage{parent_volname} ) ) {
+            my $ps    = $lineage{parent_snap};
+            my $snaps = ( ref $reg->{$pv} eq 'HASH' && $reg->{$pv}{snapshots} ) || {};
+            for my $sn ( defined $ps ? ($ps) : sort keys %$snaps ) {
+                my $meta = $snaps->{$sn};
+                next unless ref $meta eq 'HASH'
+                    && _restore_mark_active( $meta->{restoring}, $opts{node} );
+                return ( undef, defined $ps
+                    ? "can't clone from snapshot '$ps' of '$pv': a rollback to it is running\n"
+                    : "can't clone '$pv': a rollback to its snapshot '$sn' is running\n" );
+            }
+        }
         my $max = 0;
         for my $name ( keys %$reg ) {
             if ( $name =~ /^(?:vm|base)-${vmid}-disk-(\d+)$/ ) {
@@ -299,9 +319,12 @@ sub reserve_volname {
             }
         }
         my $name = "${prefix}-${vmid}-disk-" . ( $max + 1 );
-        $reg->{$name} = { reserved => 1, timestamp => time() };
-        return $name;
+        $reg->{$name} = { reserved => 1, timestamp => time(), %lineage };
+        return ( $name, undef );
     } );
+    die $refusal if defined $refusal;
+
+    return $reserved;
 }
 
 # Atomically rename a registry entry (used by create_base: vm-... -> base-...).
@@ -331,7 +354,7 @@ sub find_dependents {
     for my $name ( keys %$reg ) {
         next if $name eq $volname;
         my $entry = $reg->{$name};
-        next unless ref $entry eq 'HASH';
+        next unless _counts_as_dependent($entry);
         push @deps, $name
             if defined $entry->{parent_volname} && $entry->{parent_volname} eq $volname;
     }
@@ -347,12 +370,34 @@ sub find_snapshot_dependents {
     croak "volname is required"  unless $volname;
     croak "snapname is required" unless $snapname;
 
-    my $reg = $self->load();
+    return _snapshot_dependents_in( $self->load(), $volname, $snapname );
+}
+
+# A clone's reservation counts as a dependent only while its build could still be
+# running. Linked-clone creation takes seconds; a reservation older than this was
+# left by a killed process and must not pin its parent forever (a reserved entry has
+# no backend_id, so pvesm cannot free it).
+use constant RESERVATION_DEP_TTL => 3600;
+
+sub _counts_as_dependent {
+    my ($entry) = @_;
+    return 0 unless ref $entry eq 'HASH';
+    return 1 unless $entry->{reserved};
+    return time() - ( $entry->{timestamp} // 0 ) <= RESERVATION_DEP_TTL ? 1 : 0;
+}
+
+# Pure scan over an already-loaded registry, so the locked mutators below can check
+# dependents against the SAME snapshot of state they are about to write. Counts a
+# clone still being built: clone_image reserves its volname with the parent fields
+# set, so an in-flight clone blocks delete/rollback exactly like a committed one.
+sub _snapshot_dependents_in {
+    my ($reg, $volname, $snapname) = @_;
+
     my @deps;
     for my $name ( keys %$reg ) {
         next if $name eq $volname;
         my $entry = $reg->{$name};
-        next unless ref $entry eq 'HASH';
+        next unless _counts_as_dependent($entry);
         push @deps, $name
             if defined $entry->{parent_volname} && $entry->{parent_volname} eq $volname
             && defined $entry->{parent_snap}    && $entry->{parent_snap}    eq $snapname;
@@ -409,6 +454,98 @@ sub rename_snapshot {
         croak "target snapshot '$target' already exists for '$volname'"
             if $snaps->{$target};
         $snaps->{$target} = delete $snaps->{$source};
+        # Repoint linked clones pinned to the old name in the same write, otherwise
+        # find_snapshot_dependents stops seeing them and delete/rollback of the
+        # renamed snapshot would pass its dependent guard.
+        $reg->{$_}{parent_snap} = $target
+            for @{ _snapshot_dependents_in( $reg, $volname, $source ) };
+        return;
+    } );
+
+    return 1;
+}
+
+# ── Rollback serialization ──
+#
+# A restore rewrites the volume from the snapshot, which breaks any linked clone
+# sharing that snapshot's blocks. The dependent check and the "restore in progress"
+# marker are taken in ONE locked write, and clone_image's reservation refuses a
+# snapshot carrying a live marker, so whichever of rollback/clone reaches the
+# registry first wins. The marker is NOT held under the registry lock (a restore can
+# run for hours); it records who set it so a crashed rollback cannot pin the
+# snapshot forever: it is stale once its pid is gone on the recording node, or once
+# its `expires` time passes. The caller supplies that TTL from the driver's restore
+# budget (restore times are vendor facts); DEFAULT_RESTORE_MARK_TTL applies only
+# when it does not.
+use constant DEFAULT_RESTORE_MARK_TTL => 25 * 3600;
+
+sub _restore_mark_active {
+    my ($mark, $node) = @_;
+
+    return 0 unless ref $mark eq 'HASH';
+    my $expires = $mark->{expires}
+        // ( ( $mark->{started} // 0 ) + DEFAULT_RESTORE_MARK_TTL );
+    return 0 if time() > $expires;
+    if ( defined $node && defined $mark->{node} && $mark->{node} eq $node
+        && $mark->{pid} ) {
+        return 0 unless kill( 0, $mark->{pid} ) || $!{EPERM};
+    }
+    return 1;
+}
+
+# Check for dependents and set the restore marker atomically. Croaks (message ends
+# in "\n", suitable for PVE) if the snapshot is missing, has dependents, or another
+# restore of it is live. %opts: node => the caller's node name (for stale detection),
+# ttl => seconds the marker stays authoritative (the driver's restore budget + margin).
+sub begin_snapshot_restore {
+    my ($self, $volname, $snapname, %opts) = @_;
+
+    croak "volname is required"  unless $volname;
+    croak "snapname is required" unless $snapname;
+
+    # Refusals are RETURNED from the locked section and raised after it: dying inside
+    # would surface as "Cannot acquire cluster registry lock: ..." on the pmxcfs path.
+    my $refusal = $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        my $meta = $reg->{$volname} && $reg->{$volname}{snapshots}
+            && $reg->{$volname}{snapshots}{$snapname};
+        return "can't rollback, snapshot '$snapname' does not exist on '$volname'\n"
+            unless $meta;
+
+        my $deps = _snapshot_dependents_in( $reg, $volname, $snapname );
+        return "can't rollback to '$snapname': linked clone(s) depend on this snapshot: "
+            . join( ', ', map { $reg->{$_}{reserved} ? "$_ (clone in progress)" : $_ }
+                sort @$deps ) . "\n" if @$deps;
+
+        my $m = $meta->{restoring};
+        return "can't rollback to '$snapname': a rollback of this snapshot is already"
+            . " running (node " . ( $m->{node} // '?' ) . ", pid " . ( $m->{pid} // '?' ) . ")\n"
+            if _restore_mark_active( $m, $opts{node} );
+
+        my $now = time();
+        $meta->{restoring} = { started => $now, node => $opts{node}, pid => $$,
+            expires => $now + ( $opts{ttl} // DEFAULT_RESTORE_MARK_TTL ) };
+        return undef;
+    } );
+    die $refusal if defined $refusal;
+
+    return 1;
+}
+
+# Clear the restore marker THIS process set (same pid + node), never one a later
+# rollback set after ours was judged stale. Tolerates a snapshot that vanished.
+# %opts: node => the same node name passed to begin_snapshot_restore.
+sub end_snapshot_restore {
+    my ($self, $volname, $snapname, %opts) = @_;
+
+    $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        my $meta = $reg->{$volname} && $reg->{$volname}{snapshots}
+            && $reg->{$volname}{snapshots}{$snapname};
+        my $m = ref $meta eq 'HASH' ? $meta->{restoring} : undef;
+        delete $meta->{restoring}
+            if ref $m eq 'HASH' && ( $m->{pid} // 0 ) == $$
+            && ( $m->{node} // '' ) eq ( $opts{node} // '' );
         return;
     } );
 

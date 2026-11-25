@@ -44,6 +44,13 @@ and do not advertise them — the framework will not offer the feature, and the 
 suite skips those assertions. An array legitimately lacking a feature is not
 non-conformant.
 
+If you implement `restore_snapshot` and a restore can run for more than about 24 hours,
+also provide `restore_budget_s`: the longest time, in seconds, that `restore_snapshot`
+can legitimately take, including any settle after the copy. The core uses it to decide
+when a rollback-in-progress marker counts as stale. Clones and rollbacks of that snapshot
+are refused while the marker is live. Without it, the marker expires after 25 hours. The
+core finds this hook with `can()`; it is not in `@CONTRACT_METHODS`.
+
 The canonical list lives in `@CONTRACT_METHODS` in `Driver.pm`:
 
 ```bash

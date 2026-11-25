@@ -993,6 +993,14 @@ sub _restore_timeout {
     return $self->profile->{restore_timeout_s} || 24 * 3600;
 }
 
+# Optional contract hook: the longest restore_snapshot can legitimately run. The core
+# sizes its rollback-in-progress marker from it. Covers the reverse copy (RCPY->PAIR)
+# plus the re-split back to PSUS and job/retry overhead (two generic op budgets).
+sub restore_budget_s {
+    my ($self) = @_;
+    return $self->_restore_timeout + 2 * ( $self->profile->{op_timeout_s} || 600 );
+}
+
 # Bounded poll for a snapshot pair to reach $want status. interval<=0 probes once
 # (the test fast-path); returns 1 on convergence, 0 on timeout (caller warns). A caller
 # may override the deadline with budget => <seconds> (e.g. the restore reverse-copy).

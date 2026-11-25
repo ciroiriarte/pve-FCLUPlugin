@@ -240,4 +240,144 @@ subtest 'consistency-group membership + cg_snapshot records' => sub {
     $r->remove_cg_snapshot( 'vm-1-disk-0', 's1' );   # idempotent
 };
 
+subtest 'rename_snapshot repoints only the dependents of THAT snapshot' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register( 'vm-3-disk-0', 'Q' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', svol => 'S1' );
+    $r->register_snapshot( 'vm-3-disk-0', 'a', svol => 'S3' );
+    $r->register( 'vm-2-disk-0', 'C1', parent_volname => 'vm-1-disk-0', parent_snap => 'a' );
+    $r->register( 'vm-4-disk-0', 'C3', parent_volname => 'vm-3-disk-0', parent_snap => 'a' );
+    my $inflight = $r->reserve_volname( 5, parent_volname => 'vm-1-disk-0', parent_snap => 'a' );
+
+    $r->rename_snapshot( 'vm-1-disk-0', 'a', 'b' );
+    is( ( $r->lookup('vm-2-disk-0') )[1]->{parent_snap}, 'b', 'committed clone repointed' );
+    is( $r->load->{$inflight}{parent_snap}, 'b', 'in-flight (reserved) clone repointed' );
+    is( ( $r->lookup('vm-4-disk-0') )[1]->{parent_snap}, 'a',
+        'same-named snapshot on another volume left alone' );
+    is_deeply( [ sort @{ $r->find_snapshot_dependents( 'vm-1-disk-0', 'b' ) } ],
+        [ sort( 'vm-2-disk-0', $inflight ) ], 'dependents found under the new name' );
+    is_deeply( $r->find_snapshot_dependents( 'vm-1-disk-0', 'a' ), [], 'none under the old name' );
+};
+
+subtest 'reservations with lineage count as dependents until they go stale' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', svol => 'S1' );
+    my $n = $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'a' );
+    is_deeply( $r->find_snapshot_dependents( 'vm-1-disk-0', 'a' ), [$n], 'fresh reservation counts' );
+    is_deeply( $r->find_dependents('vm-1-disk-0'), [$n], '... for find_dependents too' );
+
+    $r->_with_registry_lock( sub { $_[0]{$n}{timestamp} = time() - 2 * 3600; return } );
+    is_deeply( $r->find_snapshot_dependents( 'vm-1-disk-0', 'a' ), [],
+        'stale reservation (killed clone) no longer pins the snapshot' );
+};
+
+subtest 'begin/end_snapshot_restore: dependents, live and stale markers' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', svol => 'S1' );
+
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'ghost', node => 'n1' ) };
+    like( $@, qr/does not exist/, 'missing snapshot refused' );
+
+    ok( $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ), 'marker set' );
+    my $mark = $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring};
+    is( $mark->{pid}, $$, 'marker records the pid' );
+    is( $mark->{node}, 'n1', 'marker records the node' );
+
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/already running \(node n1, pid $$\)/, 'live marker blocks a second restore' );
+    unlike( $@, qr/Cannot acquire/, 'refusal is not reported as a lock failure' );
+    eval { $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'a', node => 'n1' ) };
+    like( $@, qr/rollback to it is running/, 'live marker blocks a clone reservation' );
+    ok( !grep( { /^vm-2-/ } keys %{ $r->load } ), 'refused reservation left no entry' );
+
+    ok( $r->end_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ), 'marker cleared' );
+    ok( !$r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring}, 'no marker after end' );
+    ok( $r->end_snapshot_restore( 'vm-1-disk-0', 'gone' ), 'end on a vanished snapshot is a no-op' );
+
+    # Stale: recording process gone on THIS node.
+    my $dead = fork() // die "fork: $!";
+    exit 0 unless $dead;
+    waitpid( $dead, 0 );
+    $r->_with_registry_lock( sub {
+        $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring} =
+            { started => time(), node => 'n1', pid => $dead };
+        return } );
+    ok( $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ),
+        'marker of a dead pid on this node is stale' );
+
+    # Another node's marker is trusted until the TTL, then stale.
+    $r->_with_registry_lock( sub {
+        $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring} =
+            { started => time(), node => 'n2', pid => $dead };
+        return } );
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/already running/, "another node's marker is honored" );
+    $r->_with_registry_lock( sub {
+        $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring}{started} = time() - 26 * 3600;  # no expires: default TTL
+        return } );
+    ok( $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ), 'expired marker is stale' );
+
+    # Dependents block the restore (checked in the same locked write).
+    $r->end_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' );
+    $r->register( 'vm-9-disk-0', 'C', parent_volname => 'vm-1-disk-0', parent_snap => 'a' );
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/linked clone\(s\) depend on this snapshot: vm-9-disk-0/, 'dependents refuse' );
+    ok( !$r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring}, 'no marker left on refusal' );
+};
+
+subtest 'restore marker: caller TTL, own-marker-only clear, live-volume clones' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', svol => 'S1' );
+    $r->register_snapshot( 'vm-1-disk-0', 'b', svol => 'S2' );
+
+    $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1', ttl => 100 );
+    my $m = $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring};
+    is( $m->{expires} - $m->{started}, 100, 'marker expiry follows the caller TTL' );
+
+    # Clone of the LIVE volume is refused while any of its snapshots is being restored.
+    eval { $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', node => 'n1' ) };
+    like( $@, qr/rollback to its snapshot 'a' is running/, 'live-volume clone refused mid-restore' );
+    ok( $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'b', node => 'n1' ),
+        'clone from an unrelated snapshot is still allowed' );
+
+    # end only clears a marker this process set.
+    $r->_with_registry_lock( sub {
+        $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring}{pid} = $$ + 1; return } );
+    $r->end_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' );
+    ok( $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring}, "another process's marker kept" );
+    $r->_with_registry_lock( sub {
+        $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring}{pid} = $$; return } );
+    $r->end_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n2' );
+    ok( $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{restoring}, "same pid on another node's marker kept" );
+
+    # Past the caller TTL the marker is stale even from another node.
+    $r->_with_registry_lock( sub {
+        my $mk = $_[0]{'vm-1-disk-0'}{snapshots}{a}{restoring};
+        @$mk{qw(node expires)} = ( 'n2', time() - 1 ); return } );
+    ok( $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ), 'expired TTL is stale' );
+};
+
+subtest 'register over a lineage reservation keeps a rename that happened mid-build' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', svol => 'S1' );
+    my $n = $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'a' );
+    $r->rename_snapshot( 'vm-1-disk-0', 'a', 'b' );
+    $r->register( $n, 'C' );   # clone_image commits without re-passing lineage
+    my ( undef, $e ) = $r->lookup($n);
+    is( $e->{parent_snap}, 'b', 'committed clone keeps the renamed parent' );
+    is( $e->{parent_volname}, 'vm-1-disk-0', 'parent volume kept' );
+    ok( !$e->{reserved}, 'reservation marker cleared' );
+
+    # In-flight reservations are labeled in the rollback refusal.
+    my $f = $r->reserve_volname( 3, parent_volname => 'vm-1-disk-0', parent_snap => 'b' );
+    $r->unregister($n);
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'b', node => 'n1' ) };
+    like( $@, qr/\Q$f\E \(clone in progress\)/, 'reserved dependent labeled in the message' );
+};
+
 done_testing();

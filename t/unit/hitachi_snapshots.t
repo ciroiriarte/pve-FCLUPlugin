@@ -314,4 +314,11 @@ subtest 'grouped full clone: rollback and argument guards' => sub {
     is( scalar @{ $d->list_lus }, $before, 'unpaired S-VOL was rolled back, not leaked' );
 };
 
+subtest 'restore_budget_s covers the reverse copy plus settle, and follows the profile' => sub {
+    my ( $d ) = setup();
+    is( $d->restore_budget_s, 24 * 3600 + 2 * 600, 'default: 24h restore + two op budgets' );
+    $d->profile->{restore_timeout_s} = 48 * 3600;
+    is( $d->restore_budget_s, 48 * 3600 + 2 * 600, 'a raised restore_timeout_s raises the budget' );
+};
+
 done_testing();
