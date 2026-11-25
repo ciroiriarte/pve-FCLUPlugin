@@ -1,3 +1,17 @@
+pve-fclu (0.1.0~alpha43) stable; urgency=medium
+
+  * fix: snapshot rename now repoints the linked clones pinned to the old name, so
+    delete/rollback of a renamed snapshot can no longer bypass the dependent-clone guard.
+  * fix: volume_snapshot_rollback enforces the dependent-clone guard itself instead of
+    relying on the preflight. The check and a rollback-in-progress marker are taken in one
+    locked registry write; clone_image reserves with lineage, so an in-flight clone blocks
+    a rollback and a running rollback blocks a clone of what it rewrites. The marker TTL
+    comes from the new optional driver hook restore_budget_s (Hitachi: restore_timeout_s +
+    2x op_timeout_s) plus 1h; stale markers (dead pid on its node, or expired) are ignored.
+    238 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 25 Nov 2026 10:00:00 -0300
+
 pve-fclu (0.1.0~alpha42) stable; urgency=medium
 
   * feat(#8): auto-assign new volumes to a consistency/protection group. New optional store
