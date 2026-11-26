@@ -1,3 +1,16 @@
+pve-fclu (0.1.0~alpha45) stable; urgency=medium
+
+  * fix(#28): snapshot names longer than ~13 characters failed on Hitachi, whose
+    snapshot group names are limited to 32 characters; long names now get a compact
+    group name. Existing snapshots are unaffected.
+  * feat: PVE 9.3 support. Storage API window raised to 17 (no more "older storage
+    API" warning); the 9.3 schema-generated web UI dialog is used on 9.3+, with
+    field titles, an advanced section and the type name "Hitachi Block (FCLU)".
+  * fix(hitachi): exact snapshot group match (no prefix tolerance).
+    263 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Thu, 26 Nov 2026 01:00:00 -0300
+
 pve-fclu (0.1.0~alpha44) stable; urgency=medium
 
   * fix(#27): reading or cloning a snapshot no longer returns the live volume. New
