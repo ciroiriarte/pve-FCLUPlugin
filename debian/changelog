@@ -1,3 +1,14 @@
+pve-fclu (0.1.0~alpha44) stable; urgency=medium
+
+  * fix(#27): reading or cloning a snapshot no longer returns the live volume. New
+    optional driver method materialize_snapshot presents a snapshot as an LU owned by
+    the snapshot; Hitachi assigns a fresh S-VOL to the existing Thin Image pair. Linked
+    clones from a snapshot are CoW children of that S-VOL; snapshot delete and
+    free_image release it, retry-safe against LDEV id and snapshot id reuse.
+    260 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 25 Nov 2026 22:00:00 -0300
+
 pve-fclu (0.1.0~alpha43) stable; urgency=medium
 
   * fix: snapshot rename now repoints the linked clones pinned to the old name, so
