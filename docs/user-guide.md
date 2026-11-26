@@ -48,9 +48,15 @@ on-disk registry must be migrated before the swap or volumes orphan.
 
 ### PVE compatibility
 
-Targets **Proxmox VE 9** (Debian 13 base). The plugin advertises storage APIVER 14
-(matching PVE 9.2). An "older storage API" warning at load means the plugin's APIVER
-is below the host's — upgrade the package.
+Targets **Proxmox VE 9** (Debian 13 base). The plugin advertises storage APIVER 17
+(matching PVE 9.3) and mirrors a lower host APIVER down to 10, so it loads on PVE 9.0
+to 9.3 without warnings. An "older storage API" warning at load means the plugin's
+APIVER is below the host's — upgrade the package.
+
+Web UI: on PVE 9.3 and later the add/edit dialog for this storage type is the one PVE
+generates from the plugin's schema (field labels, advanced section, type name "Hitachi
+Block (FCLU)"). On PVE 9.0 to 9.2 the package's own dialog is used instead; the injected
+`hitachiblock.js` detects which applies.
 
 ## storage.cfg configuration
 

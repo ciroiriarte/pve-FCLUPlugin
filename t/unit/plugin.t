@@ -49,7 +49,7 @@ use PVE::Storage::FCLU::Error;
     sub connect    { $_[0]{connected} = 1; $_[0] }
     sub disconnect { $_[0]{calls}{disconnect}++; $_[0]{connected} = 0; 1 }
     sub storage_status { my ($s) = @_; die "BOOM status\n" if $s->{fail_status}; @{ $s->{status} // [ 1000, 600, 400 ] } }
-    sub detect_profile { { max_label_len => 32 } }
+    sub detect_profile { { max_label_len => 32, ( $_[0]{max_group_len} ? ( max_group_len => $_[0]{max_group_len} ) : () ) } }
     sub _id { my $s = shift; my $n = $_[0]; return defined $n ? "$n" : '' . ++$SEQ; }
     sub create_lu {
         my ( $s, %o ) = @_; $s->{calls}{create_lu}++;
@@ -225,6 +225,17 @@ subtest 'identity: api mirrors host APIVER (clamped); plugindata; abstract hooks
     my $pd = PVE::Storage::FCLU::Plugin->plugindata;
     ok( $pd->{content}[0]{images}, 'images content advertised' );
     is_deeply( $pd->{'sensitive-properties'}, { password => 1 }, 'password is sensitive' );
+    {
+        no warnings 'redefine';
+        local *PVE::Storage::APIVER = sub { 19 };
+        is( PVE::Storage::FCLU::Plugin->api, 17, 'api clamps a newer host to 17 (PVE 9.3)' );
+    }
+    ok( $pd->{'advanced-properties'}{qos_upper_iops}, 'tuning knobs in the advanced section' );
+    ok( !$pd->{'advanced-properties'}{mgmt_ip}, 'mgmt_ip stays in the basic section' );
+    my $props = PVE::Storage::FCLU::Plugin->properties;
+    is( $props->{mgmt_ip}{title}, 'Management endpoint', 'properties carry web-UI titles' );
+    ok( !grep( { !defined $props->{$_} } @PVE::Storage::FCLU::Plugin::CORE_ADVANCED ),
+        'every advanced property exists' );
 
     # The bare base must croak on every vendor hook.
     for my $hook (qw(type vendor driver_class driver_config)) {
@@ -1704,6 +1715,37 @@ subtest '#27 N3: a new attempt reclaims an LDEV abandoned before assign' => sub 
     my $sm = reg()->lookup_snapshot( $vol, $snapname );
     ok( defined $sm->{svol} && $sm->{svol} ne '450', 'a fresh source recorded' );
     ok( !$sm->{svol_pending}, 'pending record cleared' );
+};
+
+subtest '#28: snapshot group names fit the driver limit' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $F->{max_group_len} = 32;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 991, 'raw', undef, 1 << 30 );
+    my ($bid) = reg()->lookup($vol);
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    is( reg()->lookup_snapshot( $vol, 's1' )->{group}, "pve_store1_${bid}_s1", 'short name keeps the readable form' );
+    my @long = qw(before-upgrade-2026-11-25 before-upgrade-2026-11-26);
+    $P->volume_snapshot( {}, 'store1', $vol, $_ ) for @long;
+    my @g = map { reg()->lookup_snapshot( $vol, $_ )->{group} } @long;
+    is( length $g[0], 32, 'long name compacted to exactly the limit' );
+    like( $g[0], qr/^pve_\Q$bid\E_[0-9a-f]+$/, 'compact form keeps the backend id' );
+    isnt( $g[0], $g[1], 'distinct snapshots get distinct groups' );
+    is( $P->_snapshot_group_name( 'store1', $bid, $long[0], $F ), $g[0], 'deterministic' );
+    $F->{max_group_len} = undef;
+    is( $P->_snapshot_group_name( 'store1', $bid, $long[0], $F ), "pve_store1_${bid}_$long[0]",
+        'no limit declared: readable form' );
+};
+
+subtest 'API 15: volume_resize refuses a snapshot target' => sub {
+    local $T::Plugin::FAKE = T::FakeDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 992, 'raw', undef, 1 << 30 );
+    eval { $P->volume_resize( {}, 'store1', $vol, 2 << 30, 0, 's1' ) };
+    like( $@, qr/resizing a snapshot is not supported/, 'snapname refused' );
 };
 
 done_testing();

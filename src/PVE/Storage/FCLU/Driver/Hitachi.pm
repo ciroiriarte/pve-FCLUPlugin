@@ -48,6 +48,7 @@ my %PLATFORM = (
         default_port => 23451,           # Ops Center Configuration Manager server
         min_lu_mb    => 48,              # POST /ldevs <= 46 MiB fails the async job
         max_label_len => 32,
+        max_group_len => 32,   # snapshotGroupName: longer is REJECTED, not truncated (#28)
         op_timeout_s => 600,
         # qos: VSP F/G350-900 support it (fw 88-06-01+, CM REST 10.2.0+). Advertised
         # here but UNVALIDATED — needs the §10 Ops Center CM connector + a real G/F array.
@@ -59,6 +60,7 @@ my %PLATFORM = (
         default_port => 443,             # embedded/direct GUM REST (e.g. E590H)
         min_lu_mb    => 48,
         max_label_len => 32,
+        max_group_len => 32,   # snapshotGroupName: longer is REJECTED, not truncated (#28)
         op_timeout_s => 600,
         # qos=0: the VSP E series does not support QoS (no REST surface — live-confirmed on E590H).
         capabilities => { snapshot => 1, clone => 1, qos => 0, cg_snapshot => 1 },
@@ -75,6 +77,7 @@ my %PLATFORM = (
         default_port => 443,
         min_lu_mb    => 48,
         max_label_len => 32,
+        max_group_len => 32,   # snapshotGroupName: longer is REJECTED, not truncated (#28)
         op_timeout_s => 600,
         # qos=0: VSP One Block is not in Hitachi's QoS support matrix (embedded GUM REST).
         capabilities => { snapshot => 1, clone => 1, qos => 0, cg_snapshot => 1 },

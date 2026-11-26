@@ -180,6 +180,11 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
   clone S-VOL is an independent writable DP volume; the template cannot be converted or
   deleted while any clone depends on it (dependency guard in `create_base` / `free_image`).
 
+- **Snapshot group names (#28).** Each snapshot is a Thin Image pair in a snapshot group
+  named `pve_<storage>_<ldev>_<snapshot>`. The array rejects a group name longer than 32
+  characters (it does not truncate it), so when the readable name is too long the plugin
+  uses `pve_<ldev>_<hash>` instead. That keeps any snapshot name PVE accepts working.
+  Existing snapshots keep the group name they were created with.
 - **Clones and reads from a snapshot (#27).** A plain snapshot is a Thin Image pair with
   **no S-VOL**, so there is nothing a host can read and nothing to clone from. On first
   use (a linked clone from the snapshot, or PVE activating it for a full copy) the driver

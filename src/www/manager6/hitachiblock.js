@@ -315,9 +315,16 @@ Ext.define('PVE.storage.HitachiBlockInputPanel', {
 
 // Register the type with the manager6 UI: friendly grid label + "Add" entry.
 // Guarded so a load-order surprise degrades gracefully instead of throwing.
-if (typeof PVE !== 'undefined' && PVE.Utils && PVE.Utils.storageSchema) {
+//
+// PVE 9.3+ generates the dialog for third-party plugins from their schema
+// (PVE.storage.CustomInputPanel, storage API 17) — but only for types NOT in
+// storageSchema. There we step aside so the generated dialog, built from the
+// plugin's titles / advanced-properties / display-name, is used; this
+// hand-written panel stays only for PVE 9.0-9.2.
+if (typeof PVE !== 'undefined' && PVE.Utils && PVE.Utils.storageSchema
+    && !Ext.ClassManager.get('PVE.storage.CustomInputPanel')) {
     PVE.Utils.storageSchema.hitachiblock = {
-        name: 'Hitachi Block',
+        name: 'Hitachi Block (FCLU)',
         ipanel: 'HitachiBlockInputPanel',
         faIcon: 'database',
         backups: false,

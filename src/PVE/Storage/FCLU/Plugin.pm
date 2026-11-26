@@ -29,10 +29,14 @@ use Digest::MD5 qw(md5_hex);
 # reports the host's own APIVER clamped into this range so PVE loads us
 # warning-free across tested hosts and only warns (never refuses) outside it.
 use constant FCLU_MIN_APIVER => 10;
-# 14 = the PVE 9.2 storage APIVER (the frozen reference plugin validated against it,
-# and FCLU is a faithful port of the same PVE-facing surface); reporting a lower value
-# makes PVE log "implementing an older storage API". Raise as newer APIVERs are tested.
-use constant FCLU_MAX_APIVER => 14;
+# 17 = the PVE 9.3 storage APIVER (libpve-storage-perl 9.1.17+). Reviewed against the
+# ApiChangeLog for 15-17: v15 volume_resize($snapname) is refused below (no volume
+# chains); v15 virtual-size and v16 format helpers serve volume chains / base-class
+# alloc_image and rename_volume, which we do not use; v17 guest volume types are
+# optional (parse_volname keeps returning 'images', and nothing here compares a vtype
+# with 'images'). Reporting a lower value makes PVE log "implementing an older storage
+# API". Raise as newer APIVERs are tested.
+use constant FCLU_MAX_APIVER => 17;
 
 # Per-storeid caches (PVE storage plugins are CLASS-based — no instance to hold
 # state), mirroring the reference's %_clients. Cleared by deactivate_storage.
@@ -56,6 +60,30 @@ sub api {
     return $host;
 }
 
+# Web UI field labels (schema 'title') and the advanced section, for the dialog that
+# PVE 9.3+ generates from a third-party plugin's schema (storage API 17 changelog).
+our %CORE_TITLES = (
+    mgmt_ip               => 'Management endpoint',
+    pool_id               => 'DP pool ID',
+    snap_pool_id          => 'Snapshot pool ID',
+    qos_upper_iops        => 'QoS upper IOPS',
+    qos_upper_iops_per_gb => 'QoS upper IOPS per GiB',
+    qos_upper_mbps        => 'QoS upper MB/s',
+    qos_lower_iops        => 'QoS lower IOPS',
+    qos_lower_mbps        => 'QoS lower MB/s',
+    qos_priority          => 'QoS priority (1-3)',
+    tls_verify            => 'Verify TLS certificate',
+    tls_ca_file           => 'TLS CA file',
+    lock_timeout          => 'Lock timeout (s)',
+    debug                 => 'Debug level',
+    device_timeout        => 'Device timeout (s)',
+    surface_oob_snapshots => 'Show array-side snapshots',
+    auto_cg               => 'Auto consistency group',
+);
+our @CORE_ADVANCED = qw(snap_pool_id qos_upper_iops qos_upper_iops_per_gb qos_upper_mbps
+    qos_lower_iops qos_lower_mbps qos_priority tls_verify tls_ca_file lock_timeout debug
+    device_timeout surface_oob_snapshots auto_cg);
+
 sub plugindata {
     return {
         # images = VM disks; rootdir = LXC rootfs (PVE formats+mounts the raw LUN,
@@ -65,7 +93,20 @@ sub plugindata {
         # password is sensitive: PVE never writes it to storage.cfg and passes it to
         # the add/update hooks via %sensitive.
         'sensitive-properties' => { password => 1 },
+        # Web UI (PVE 9.3+ generates the add/edit dialog from the schema; ignored by
+        # older versions): tuning knobs go to the advanced section.
+        'advanced-properties' => { map { $_ => 1 } @CORE_ADVANCED },
     };
+}
+
+# Add a 'title' to each property schema that has one in %$titles (copies; the schema
+# hashes are not shared with callers).
+sub _titled {
+    my ($class, $props, $titles) = @_;
+    return { map {
+        my $k = $_;
+        ( $k => { %{ $props->{$k} }, ( exists $titles->{$k} ? ( title => $titles->{$k} ) : () ) } )
+    } keys %$props };
 }
 
 # ── Configuration schema (§5) ──
@@ -77,7 +118,7 @@ sub plugindata {
 # are referenced (not defined) in options() so PVE keeps `password` out of
 # storage.cfg and hands it to the add/update hooks via %sensitive.
 sub properties {
-    return {
+    return __PACKAGE__->_titled( {
         mgmt_ip => {
             description => "Management endpoint (IP/hostname) of the array's control-plane"
                 . " REST API. May be a comma-separated list for management-plane failover.",
@@ -160,7 +201,7 @@ sub properties {
                 . " stays an explicit/scheduled pve-fclu-cg operation. Unset = no auto-assign.",
             type        => 'string', optional => 1,
         },
-    };
+    }, \%CORE_TITLES );
 }
 
 sub options {
@@ -452,6 +493,24 @@ sub _qos_from_scfg {
     $qos{lower_mbps}        = $scfg->{qos_lower_mbps} if $scfg->{qos_lower_mbps};
     $qos{response_priority} = $scfg->{qos_priority}   if $scfg->{qos_priority};
     return \%qos;
+}
+
+# The array snapshot group name for snapshot $snap of $backend_id. It encodes the
+# volume's backend id, so a name-based array fallback search can never resolve to
+# another volume's pair sharing this snapshot name (the reference's collision guard).
+# The readable form is used when it fits the driver's max_group_len; otherwise a
+# compact form keeps the backend id plus a hash of store, volume and snapshot name.
+# Hitachi rejects (does not truncate) a name over 32 characters (#28). The name is
+# recorded with the snapshot and never re-derived, so existing snapshots are unaffected.
+sub _snapshot_group_name {
+    my ($class, $storeid, $backend_id, $snap, $d) = @_;
+    my $full = "pve_${storeid}_${backend_id}_${snap}";
+    my $max  = $d->detect_profile->{max_group_len};
+    return $full if !$max || length $full <= $max;
+    my $pre = "pve_${backend_id}_";
+    die "cannot build a snapshot group name for backend id '$backend_id' within $max characters\n"
+        if length($pre) + 8 > $max;
+    return substr( $pre . md5_hex("$storeid\0$backend_id\0$snap"), 0, $max );
 }
 
 # Ownership label, clamped to the driver's advertised max length (§7 — not a
@@ -1063,7 +1122,11 @@ sub free_image {
 }
 
 sub volume_resize {
-    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;
+    my ($class, $scfg, $storeid, $volname, $size, $running, $snapname) = @_;
+
+    # API 15: $snapname targets a snapshot, used only with snapshot-as-volume-chain,
+    # which this plugin does not support (array snapshots are not resizable images).
+    die "resizing a snapshot is not supported on storage '$storeid'\n" if defined $snapname;
 
     my $reg = $class->_registry($storeid);
     my ( $backend_id, $meta ) = $reg->lookup($volname);
@@ -1161,10 +1224,7 @@ sub volume_snapshot {
     die "storage '$storeid' does not support snapshots\n"
         unless $class->_driver_supports( $d, 'snapshot' );
 
-    # Encode the volume's backend id into the group name so a name-based array
-    # fallback search can never resolve to another volume's pair sharing this
-    # snapshot name (the reference's #-collision guard).
-    my $group  = "pve_${storeid}_${backend_id}_${snap}";
+    my $group = $class->_snapshot_group_name( $storeid, $backend_id, $snap, $d );
 
     # Monotonic 0-based creation index, so the snapshot chain stays correctly
     # ordered even when two snapshots land in the same wall-clock second (the

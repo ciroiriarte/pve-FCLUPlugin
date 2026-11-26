@@ -256,6 +256,7 @@ per **brand**; a `Profile` selected at `connect()`/`detect_profile()` carries th
   family       => 'vsp_e',
   min_lu_mb    => 48,            # was the hardcoded MIN_LDEV_MB
   max_label_len=> 32,            # was Config.pm MAX_LABEL_LEN — NOT in the core
+  max_group_len=> 32,            # snapshot group name limit; core compacts longer names (#28)
   default_port => 443,           # was %PLATFORM_DEFAULTS
   alloc_granule=> 256,           # was LDEVS_PER_CU
   api_version_range => ['v1','v3'],  # clamp array-reported storage API version to a tested range (#17)

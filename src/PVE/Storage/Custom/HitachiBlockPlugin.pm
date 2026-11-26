@@ -81,9 +81,45 @@ sub _derive_cluster_prefix {
 
 # ── Configuration schema (vendor deltas merged over the generic base) ──
 
+# Web UI metadata (PVE 9.3+ generated dialog): labels, advanced section, type name.
+our %HITACHI_TITLES = (
+    storage_id              => 'Storage device ID',
+    target_ports            => 'Target FC ports',
+    port_groups             => 'Port groups',
+    node_port_groups        => 'Node port groups',
+    host_mode               => 'Host mode',
+    host_mode_options       => 'Host mode options',
+    skip_unmap_io_check     => 'Skip unmap I/O check',
+    persistent_reservations => 'Persistent reservations',
+    platform                => 'Platform',
+    control_plane           => 'Control plane',
+    mgmt_port               => 'Management port',
+    ldev_range              => 'LDEV range',
+    host_group_prefix       => 'Host group prefix',
+    discard_zero_page       => 'Reclaim zero pages',
+    port_scheduler          => 'Spread LUNs across ports',
+    copy_speed              => 'Clone copy speed',
+    group_delete            => 'Group delete',
+    rest_keepalive          => 'REST keep-alive',
+);
+
+sub plugindata {
+    my ($class) = @_;
+    my $pd = $class->SUPER::plugindata;
+    return {
+        %$pd,
+        meta => { 'display-name' => 'Hitachi Block (FCLU)' },
+        'advanced-properties' => { %{ $pd->{'advanced-properties'} // {} },
+            map { $_ => 1 } qw(port_groups node_port_groups host_mode host_mode_options
+                skip_unmap_io_check persistent_reservations platform control_plane mgmt_port
+                ldev_range host_group_prefix discard_zero_page port_scheduler copy_speed
+                group_delete rest_keepalive) },
+    };
+}
+
 sub properties {
     my ($class) = @_;
-    return {
+    return $class->_titled( {
         %{ $class->SUPER::properties },
         storage_id => {
             description => "Storage device ID (storageDeviceId) of the array, e.g. the"
@@ -230,7 +266,7 @@ sub properties {
             default     => 0,
             optional    => 1,
         },
-    };
+    }, { %PVE::Storage::FCLU::Plugin::CORE_TITLES, %HITACHI_TITLES } );
 }
 
 sub options {

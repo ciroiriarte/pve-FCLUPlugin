@@ -142,4 +142,21 @@ subtest '_parse_ldev_range + CU-alignment hint' => sub {
     is( scalar @warns, 0, 'an unset range is silent' );
 };
 
+subtest 'web UI metadata (PVE 9.3 generated dialog)' => sub {
+    my $C  = 'PVE::Storage::Custom::HitachiBlockPlugin';
+    my $pd = $C->plugindata;
+    is( $pd->{meta}{'display-name'}, 'Hitachi Block (FCLU)', 'display name' );
+    ok( $pd->{'advanced-properties'}{ldev_range} && $pd->{'advanced-properties'}{qos_priority},
+        'vendor and core knobs are advanced' );
+    ok( !$pd->{'advanced-properties'}{$_}, "$_ is basic" ) for qw(storage_id target_ports pool_id mgmt_ip);
+    is_deeply( $pd->{'sensitive-properties'}, { password => 1 }, 'core sensitive list kept' );
+    my $props = $C->properties;
+    is( $props->{target_ports}{title}, 'Target FC ports', 'vendor title' );
+    is( $props->{mgmt_ip}{title}, 'Management endpoint', 'core title inherited' );
+    ok( !grep( { !defined $props->{$_} } keys %{ $pd->{'advanced-properties'} } ),
+        'every advanced property exists in the schema' );
+    my @untitled = grep { !defined $props->{$_}{title} } sort keys %$props;
+    is_deeply( \@untitled, [], 'every declared property has a title' );
+};
+
 done_testing();
