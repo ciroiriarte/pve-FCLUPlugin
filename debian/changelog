@@ -1,3 +1,16 @@
+pve-fclu (0.1.0~alpha46) stable; urgency=medium
+
+  * fix(#26): snapshot delete, volume free, convert-to-template and rename now
+    check for linked clones in the same locked registry write that marks the
+    operation, so a clone started at the same moment can no longer be built from
+    a snapshot or volume being deleted. A marker left by a crashed task clears
+    when its process is gone, after 6 h, or (for the retry only) at once when
+    the node that set it is offline.
+  * Refused registry operations no longer rewrite the registry.
+    268 unit tests.
+
+ -- Ciro Iriarte <ciro.iriarte+software@gmail.com>  Wed, 25 Nov 2026 23:28:14 -0300
+
 pve-fclu (0.1.0~alpha45) stable; urgency=medium
 
   * fix(#28): snapshot names longer than ~13 characters failed on Hitachi, whose
