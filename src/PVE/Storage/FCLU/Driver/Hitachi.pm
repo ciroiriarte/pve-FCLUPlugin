@@ -1837,14 +1837,14 @@ sub _err {
 }
 
 # A snapshot id ("pvol,mu") can be reused by a later pair on the same P-VOL. When the
-# caller knows the pair's group, refuse a pair from another group. The array may store
-# a shortened group name, so a returned name that is a prefix of the expected one
-# (of at least 16 characters) is accepted.
+# caller knows the pair's group, refuse a pair from another group. Exact match: the
+# array stores the name verbatim and rejects (never truncates) one over 32 characters
+# (verified live on the E590H, 2026-11-25).
 sub _check_pair_group {
     my ($self, $pair, $want) = @_;
     return 1 unless defined $want && length $want;
     my $got = $pair->{snapshotGroupName} // '';
-    return 1 if $got eq $want || ( length $got >= 16 && index( $want, $got ) == 0 );
+    return 1 if $got eq $want;
     $self->_err( 'invalid', "snapshot '" . ( $pair->{snapshotId} // '?' )
         . "' is not the expected pair (group '$got', expected '$want')" );
 }

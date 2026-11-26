@@ -424,8 +424,8 @@ subtest '#27 N1: restore refuses a reused snapshot id from another group' => sub
     like( "$e", qr/not the expected pair/, 'mismatched group refused' );
     ok( !$f->{calls}{restore_snapshot}, 'no reverse copy issued' );
     ok( $d->restore_snapshot( $snap->{snap_id}, pvol => $bid, group => 'pve_s_1_newer' ), 'matching group restores' );
-    ok( $d->_check_pair_group( { snapshotGroupName => 'pve_e590h-test_267_a_long' }, 'pve_e590h-test_267_a_long_snapshot_name' ),
-        'an array-shortened group name is accepted' );
+    my $e2 = eval { $d->_check_pair_group( { snapshotGroupName => 'pve_e590h-test_267_a_long' }, 'pve_e590h-test_267_a_long_x' ); 1 } ? undef : $@;
+    like( "$e2", qr/not the expected pair/, 'a prefix of the expected group is not a match' );
 };
 
 done_testing();
