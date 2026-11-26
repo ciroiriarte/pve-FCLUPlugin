@@ -262,6 +262,30 @@ sub run_contract_tests {
         }
     };
 
+    subtest "[$name] materialize_snapshot (optional, §2): idempotent snapshot source" => sub {
+        my $d   = $factory->();
+        my $cap = $d->capabilities;
+      SKIP: {
+            skip 'no snapshot.single or no materialize_snapshot', 1
+                unless $CAP->has_feature( $cap, 'snapshot', 'single' ) && $d->can('materialize_snapshot');
+            my %ctx = _host_ctx('node-a');
+            $d->ensure_host_access(%ctx);
+            my $bid  = $d->create_lu( size_bytes => 1 << 30 );
+            my $snap = $d->create_snapshot($bid);
+            my $r1   = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%ctx );
+            is( ref $r1, 'HASH', 'returns a hash' );
+            like( $r1->{backend_id}, qr/^[\w.:-]{1,255}$/, 'source backend_id obeys charset' );
+            ok( $d->get_lu( $r1->{backend_id} ), 'source LU is gettable' );
+            my $r2 = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%ctx );
+            is( $r2->{backend_id}, $r1->{backend_id}, 'second call returns the same source' );
+            ok( !$r2->{created}, '... with created => 0' );
+            is( scalar( @{ $d->list_lu_mappings( $r1->{backend_id} ) } ), 0,
+                'no mapping left on the source' );
+            $d->delete_snapshot( $snap->{snap_id} );
+            $d->delete_lu($_) for $r1->{backend_id}, $bid;
+        }
+    };
+
     subtest "[$name] linked clone (capability-gated, §6)" => sub {
         my $d   = $factory->();
         my $cap = $d->capabilities;

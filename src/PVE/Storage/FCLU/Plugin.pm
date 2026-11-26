@@ -11,6 +11,7 @@ use PVE::Storage::FCLU::Registry;
 use PVE::Storage::FCLU::Credentials;
 use PVE::Storage::FCLU::Capabilities;
 use PVE::Storage::FCLU::Label;
+use Digest::MD5 qw(md5_hex);
 
 # The generic, vendor-neutral PVE Storage plugin base (ARCHITECTURE.md §5/§7).
 # Almost every method body lives here; a per-vendor subclass is a thin shim that
@@ -475,13 +476,27 @@ sub _nodename {
 # raises on a missing volume; 'soft' returns () (idempotent teardown path).
 sub _resolve_backend {
     my ($class, $storeid, $scfg, $volname, $snapname, $mode) = @_;
-    my ( $backend_id, $entry ) = $class->_registry($storeid)->lookup($volname);
+    my $reg = $class->_registry($storeid);
+    my ( $backend_id, $entry ) = $reg->lookup($volname);
 
-    if ($snapname) {
-        # Snapshot S-VOL resolution lands with the snapshot slice; for now a
-        # snapshot's own backend id is read from the snapshot subregistry if present.
-        my $snap = $class->_registry($storeid)->lookup_snapshot( $volname, $snapname );
-        $backend_id = $snap->{svol} if $snap && defined $snap->{svol};
+    if ( defined $backend_id && $snapname ) {
+        # A snapshot resolves ONLY to the LU that presents it (its source, recorded in
+        # the snapshot record with its own identity), NEVER to the volume: falling back
+        # would hand a reader the CURRENT disk under the snapshot's name, so a full clone
+        # "from a snapshot" would silently copy live data (#27). activate_volume
+        # materializes the source first; without one, fail closed.
+        my $snap = $reg->lookup_snapshot( $volname, $snapname );
+        # A half-deleted snapshot (pair gone, source delete pending a retry) no longer
+        # holds its image: never hand its leftover LU to a reader.
+        my $usable = $snap && !$snap->{pair_released};
+        return ( "$snap->{svol}", { identity => $snap->{svol_identity} } )
+            if $usable && defined $snap->{svol} && length $snap->{svol};
+        return () if ( $mode // 'die' ) eq 'soft';
+        die "snapshot '$snapname' not found for volume '$volname'\n" unless $snap;
+        die "snapshot '$snapname' of '$volname' is being deleted; finish the delete\n"
+            unless $usable;
+        die "snapshot '$snapname' of '$volname' has no host-readable volume yet;"
+            . " activate it first\n";
     }
 
     if ( !defined $backend_id ) {
@@ -489,6 +504,205 @@ sub _resolve_backend {
         die "volume '$volname'" . ( $snapname ? "\@$snapname" : '' ) . " not found in registry\n";
     }
     return ( $backend_id, $entry );
+}
+
+# The LU that presents snapshot $snap of $volname (its "source"): the volume a host
+# reads for a full copy, and the CoW parent of a linked clone. A recorded source is
+# reused; otherwise the driver materializes one (materialize_snapshot, §2) and it is
+# recorded as OWNED by the snapshot, so snapshot delete / free_image delete it (#27).
+#
+# Crash/race safety: the intended id + label are recorded (svol_pending) BEFORE the
+# driver allocates, so a crash mid-way leaves a record cleanup can act on; the source
+# write is compare-and-set; and nothing here deletes an LU that may already be
+# assigned to the pair (a later call adopts it instead).
+sub _snapshot_source {
+    my ($class, $storeid, $scfg, $volname, $snap, $d) = @_;
+
+    my $reg = $class->_registry($storeid);
+    my ($pvol) = $reg->lookup($volname);
+    die "volume '$volname' not found in registry\n" unless defined $pvol;
+    my $sm = $reg->lookup_snapshot( $volname, $snap );
+    die "snapshot '$snap' not found for volume '$volname'\n"
+        unless $sm && defined $sm->{snap_id};
+    die "snapshot '$snap' of '$volname' is being deleted; finish the delete\n"
+        if $sm->{pair_released};
+    return "$sm->{svol}" if defined $sm->{svol} && length $sm->{svol};
+
+    $d //= $class->_driver( $storeid, $scfg );
+    die "storage '$storeid' cannot present snapshot '$snap' of '$volname' as a volume"
+        . " (the driver has no materialize_snapshot)\n"
+        unless $d->can('materialize_snapshot');
+
+    # An earlier attempt that crashed before assigning left an LDEV under its pending
+    # id. Reclaim it before the record is overwritten, unless it became the pair's S-VOL
+    # (the driver adopts that one) or the pair cannot be read (leave it alone then).
+    # Only a STALE record (older than an hour): a fresh one may be another node still
+    # building the same snapshot's source.
+    if ( my $old = $sm->{svol_pending} ) {
+        if ( defined $old->{id} && time() - ( $old->{started} // 0 ) > 3600 ) {
+            my $pairs = eval { $d->list_snapshots($pvol) };
+            my ($pair) = grep { $_->{snap_id} eq $sm->{snap_id} } @{ $pairs // [] };
+            my $assigned = $pair && defined $pair->{meta}{svol} && "$pair->{meta}{svol}" eq "$old->{id}";
+            if ( $pairs && !$assigned
+                && ( $class->_owned_lun_check( $storeid, $scfg, $d, $old->{id}, $old->{label} ) // '' ) eq 'ok' )
+            {
+                $class->_unmap_owned_luns( $d, $sm, $old->{id} );
+                eval { $d->delete_lu( $old->{id} ) };
+                warn "FCLU: reclaiming abandoned snapshot volume '$old->{id}' failed: $@" if $@;
+            }
+        }
+    }
+
+    my $conn  = $class->_connector;
+    my %hctx  = %{ $conn->host_context( hostname => $class->_nodename ) };
+    $d->ensure_host_access(%hctx);   # a driver may need this node's host object (temporary paths)
+    my $rid   = $class->_alloc_backend_id( $storeid, $scfg, $d );
+    # Unique per snapshot even after label truncation (the cleanup guard relies on the
+    # label identifying THIS snapshot's LU): keyed on the pair id, not the name, so it
+    # also survives a snapshot rename.
+    my $label = $class->_make_label( $storeid,
+        "${volname}_" . substr( md5_hex("$sm->{snap_id}"), 0, 8 ), $d );
+    $reg->update_snapshot_meta( $volname, $snap,
+        svol_pending => { label => $label, started => time(), node => $class->_nodename,
+            ( defined $rid ? ( id => "$rid" ) : () ) } );
+
+    my $res = eval {
+        $d->materialize_snapshot( $pvol, $sm->{snap_id},
+            ( defined $rid ? ( requested_id => $rid ) : () ),
+            host_ctx => \%hctx,
+            label    => $label,
+            ( defined $sm->{group} ? ( group => $sm->{group} ) : () ),
+        );
+    };
+    if ( my $err = $@ ) {
+        # The driver cleaned up after a definite failure, so drop the intent record.
+        # Keep it when the outcome is uncertain (partial / timeout, or an unclassified
+        # exception): snapshot delete then reclaims whatever was left.
+        my $code = ref $err && eval { $err->isa('PVE::Storage::FCLU::Error') } ? $err->code : '';
+        eval { $reg->update_snapshot_meta( $volname, $snap, svol_pending => undef ) }
+            if $code && $code ne 'partial' && $code ne 'timeout';
+        die $err;
+    }
+    my $svol = ref $res eq 'HASH' ? $res->{backend_id} : undef;
+    die "driver materialize_snapshot returned no backend_id for '$volname\@$snap'\n"
+        unless defined $svol && length $svol;
+    # Never adopt the parent or a registered volume as a snapshot-owned LU: a stale
+    # snap_id resolving to a linked clone's backing pair would hand back that clone,
+    # and snapshot delete would then destroy it.
+    die "refusing snapshot volume '$svol' for '$volname\@$snap': it is the parent or a"
+        . " registered volume\n"
+        if "$svol" eq "$pvol" || defined $reg->find_volname_by_backend($svol);
+
+    # A driver that mapped the LU temporarily may have surfaced a host device; make
+    # sure none lingers here. The identity is the driver's (taken while mapped) when given.
+    my $ident = $res->{identity} // eval { $d->get_lu_identity($svol) };
+    eval { $conn->detach($ident) } if $ident && $res->{created};
+    my $lbl = $res->{created} ? $label : ( ( eval { $d->get_lu($svol) } // {} )->{label} // $label );
+
+    my $eff = $reg->set_snapshot_source( $volname, $snap, $svol,
+        svol_owned => 1, svol_label => $lbl, ( $ident ? ( svol_identity => $ident ) : () ) );
+    die "snapshot '$snap' of '$volname' was deleted while it was being prepared;"
+        . " volume '$svol' was left in place\n" unless defined $eff;
+    if ( "$eff" ne "$svol" && $res->{created} ) {
+        # Another caller recorded a different source first; ours is unreferenced.
+        if ( ( $class->_owned_lun_check( $storeid, $scfg, $d, $svol, $label ) // '' ) eq 'ok' ) {
+            eval { $d->delete_lu($svol) };
+            warn "FCLU: deleting unused snapshot volume '$svol' failed: $@" if $@;
+        }
+    }
+    $reg->update_snapshot_meta( $volname, $snap, svol_pending => undef );
+    return "$eff";
+}
+
+sub _is_not_found {
+    my ($class, $e) = @_;
+    return $e->code eq 'not_found' if ref $e && eval { $e->isa('PVE::Storage::FCLU::Error') };
+    return defined $e && "$e" =~ /\b404\b|not[ _]found/i ? 1 : 0;
+}
+
+# The LUs snapshot record $sm owns, as { backend_id => expected label }: its recorded
+# source, plus — when an allocation was pending (crash before the source was recorded)
+# — the pending id and the pair's live S-VOL ($pair_svol, from the driver).
+sub _owned_snapshot_luns {
+    my ($class, $sm, $pair_svol) = @_;
+    my %c;
+    $c{ $sm->{svol} } = $sm->{svol_label}
+        if $sm->{svol_owned} && defined $sm->{svol} && length $sm->{svol};
+    if ( my $p = $sm->{svol_pending} ) {
+        $c{ $p->{id} } //= $p->{label} if defined $p->{id};
+        $c{$pair_svol} //= $p->{label}
+            if defined $pair_svol && length $pair_svol && !defined $sm->{svol};
+    }
+    return \%c;
+}
+
+# Gate before ANY unmap or delete of a snapshot-owned LU. Returns 'ok', 'gone'
+# (already deleted) or undef (refused, with a warning). It must be inside the delete
+# fence, not a registered volume, and still carry the label recorded when it was
+# created: an id the array has since reused for another volume fails here and is
+# left alone, which is what makes a retried delete safe.
+sub _owned_lun_check {
+    my ($class, $storeid, $scfg, $d, $id, $label) = @_;
+    if ( !$class->safe_delete_precheck( $scfg, $id ) ) {
+        warn "FCLU: snapshot volume '$id' is outside the delete fence; leaving it\n";
+        return undef;
+    }
+    if ( defined $class->_registry($storeid)->find_volname_by_backend($id) ) {
+        warn "FCLU: snapshot volume id '$id' now belongs to a registered volume; leaving it\n";
+        return undef;
+    }
+    my $lu = eval { $d->get_lu($id) };
+    if ( !$lu ) {
+        my $e = $@;
+        return 'gone' if $class->_is_not_found($e);
+        warn "FCLU: cannot read snapshot volume '$id' ($e); leaving it\n";
+        return undef;
+    }
+    if ( !defined $label || ( $lu->{label} // '' ) ne $label ) {
+        warn "FCLU: snapshot volume '$id' no longer carries its label (id reused?); leaving it\n";
+        return undef;
+    }
+    return 'ok';
+}
+
+# Host side of owned LUs: detach on this node and reap every mapping cluster-wide,
+# so the pair and the LU can be deleted. Only for LUs that passed _owned_lun_check.
+sub _unmap_owned_luns {
+    my ($class, $d, $sm, @ids) = @_;
+    for my $id (@ids) {
+        eval { $class->_connector->detach( $sm->{svol_identity} ) }
+            if $sm->{svol_identity} && defined $sm->{svol} && "$sm->{svol}" eq "$id";
+        warn "FCLU: snapshot volume detach warning: $@" if $@;
+        next unless $d->can('unpublish_lu_all');
+        eval { $d->unpublish_lu_all($id) };
+        warn "FCLU: snapshot volume unmap warning: $@" if $@;
+    }
+    return;
+}
+
+# Plan the cleanup of one snapshot's owned LUs: { id => 'ok' } for those that may be
+# unmapped and deleted. $pair_svol is the pair's live S-VOL when known.
+sub _owned_cleanup_plan {
+    my ($class, $storeid, $scfg, $d, $sm, $pair_svol) = @_;
+    my $c = $class->_owned_snapshot_luns( $sm, $pair_svol );
+    my %ok;
+    for my $id ( sort keys %$c ) {
+        my $r = $class->_owned_lun_check( $storeid, $scfg, $d, $id, $c->{$id} );
+        $ok{$id} = 1 if defined $r && $r eq 'ok';
+    }
+    return \%ok;
+}
+
+# Delete planned LUs (pair already gone) and drop them from the snapshot record right
+# away, so a retry can never act on an id the array may hand out again.
+sub _delete_owned_luns {
+    my ($class, $reg, $d, $volname, $snap, $plan) = @_;
+    for my $id ( sort keys %$plan ) {
+        $d->delete_lu($id);
+        $reg->clear_snapshot_source( $volname, $snap, $id );
+    }
+    $reg->update_snapshot_meta( $volname, $snap, svol_pending => undef );
+    return 1;
 }
 
 sub alloc_image {
@@ -564,9 +778,12 @@ sub alloc_image {
 
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+
+    my $d = $class->_driver( $storeid, $scfg );
+    # A snapshot is read through its source LU; materialize it on first use (#27).
+    $class->_snapshot_source( $storeid, $scfg, $volname, $snapname, $d ) if $snapname;
     my ($backend_id) = $class->_resolve_backend( $storeid, $scfg, $volname, $snapname, 'die' );
 
-    my $d    = $class->_driver( $storeid, $scfg );
     my $conn = $class->_connector;
     my %hctx = %{ $conn->host_context( hostname => $class->_nodename ) };
 
@@ -579,8 +796,11 @@ sub activate_volume {
     # array session — and so a driver whose NAA is only known POST-publish records
     # it now (alloc-time identity may have been undef for such an array).
     my $identity = $d->get_lu_identity($backend_id);
-    $class->_registry($storeid)->update_meta( $volname, identity => $identity )
-        if $identity && !$snapname;   # snapshot-S-VOL identity lands with the snapshot slice
+    if ($identity) {
+        my $reg = $class->_registry($storeid);
+        $snapname ? $reg->update_snapshot_meta( $volname, $snapname, svol_identity => $identity )
+                  : $reg->update_meta( $volname, identity => $identity );
+    }
 
     # Attach the multipath device by the array-reported canonical identity (§3).
     # device_timeout (storage.cfg) overrides the connector default for arrays whose
@@ -616,8 +836,8 @@ sub deactivate_volume {
     # node only (§12.2 live-migration rule). Resolve the device identity from the
     # REGISTRY (recorded at alloc), not a live array call — host teardown must work
     # even when the array session is down (node fencing / array maintenance), which
-    # is exactly when it matters. (Snapshot-S-VOL identity lands with the snapshot
-    # slice via the snapshot subregistry.)
+    # is exactly when it matters. For a snapshot, $entry is its source's record
+    # (identity from the snapshot subregistry), so this tears down the source LU.
     my $identity = $entry->{identity};
     eval { $conn->detach($identity) } if $identity;
     warn "FCLU: device detach warning: $@" if $@;
@@ -628,8 +848,11 @@ sub deactivate_volume {
 
     # Vendor post-deactivate hook (best-effort, e.g. Hitachi discard-zero-page thin
     # reclaim on the now-unmapped LU). Default no-op; must never fail the deactivate.
-    eval { $class->_after_deactivate( $storeid, $scfg, $backend_id, $d ) };
-    warn "FCLU: post-deactivate hook warning: $@" if $@;
+    # Not for a snapshot's source: that LU is the snapshot image, not a thin volume.
+    if ( !$snapname ) {
+        eval { $class->_after_deactivate( $storeid, $scfg, $backend_id, $d ) };
+        warn "FCLU: post-deactivate hook warning: $@" if $@;
+    }
 
     return 1;
 }
@@ -676,7 +899,9 @@ sub filesystem_path {
         my $p    = $live ? eval { $conn->device_path($live) } : undef;
         if ( defined $p ) {
             $path = $p;
-            $class->_registry($storeid)->update_meta( $volname, identity => $live );
+            my $reg = $class->_registry($storeid);
+            $snapname ? $reg->update_snapshot_meta( $volname, $snapname, svol_identity => $live )
+                      : $reg->update_meta( $volname, identity => $live );
         }
         # else: the LU was never mapped, so there is no host device to name YET. Do NOT
         # die: PVE resolves the volume vtype via path() during `pvesm free` (the API
@@ -750,14 +975,43 @@ sub free_image {
         }
     }
 
-    # Delete this volume's own snapshot pairs first (capability-gated).
+    # Delete this volume's own snapshot pairs (capability-gated), and the LUs its
+    # snapshots own (#27): checked and unmapped before the pairs go, deleted after,
+    # and dropped from the record at once so a retried free never touches a reused id.
+    my $snaps = $reg->list_snapshots($volname);
+    my ( $pairs, $listed, %pair_svol, %deleted ) = ( [], 0 );
     if ( PVE::Storage::FCLU::Capabilities->has_feature( $d->capabilities, 'snapshot', 'single' ) ) {
-        eval {
-            for my $s ( @{ $d->list_snapshots($backend_id) } ) {
-                $d->delete_snapshot( $s->{snap_id} );
-            }
-        };
-        warn "FCLU: snapshot cleanup warning: $@" if $@;
+        $pairs  = eval { $d->list_snapshots($backend_id) };
+        $listed = defined $pairs ? 1 : 0;
+        warn "FCLU: snapshot listing warning: $@" if !$listed;
+        $pairs //= [];
+        $pair_svol{ $_->{snap_id} } = $_->{meta}{svol} for @$pairs;
+    }
+    my %plan = map {
+        my $sm = $snaps->{$_};
+        ( $_ => $class->_owned_cleanup_plan( $storeid, $scfg, $d, $sm,
+            defined $sm->{svol} ? undef : $pair_svol{ $sm->{snap_id} // '' } ) )
+    } keys %$snaps;
+    $class->_unmap_owned_luns( $d, $snaps->{$_}, keys %{ $plan{$_} } ) for keys %plan;
+    for my $p (@$pairs) {
+        if ( eval { $d->delete_snapshot( $p->{snap_id} ); 1 } ) { $deleted{ $p->{snap_id} } = 1 }
+        else { warn "FCLU: snapshot cleanup warning ($p->{snap_id}): $@" }
+    }
+    for my $name ( sort keys %plan ) {
+        next unless %{ $plan{$name} };
+        my $sid = $snaps->{$name}{snap_id} // '';
+        # Only once its pair is gone: deleted here, already released, or confirmed absent
+        # from a successful listing. Never rely on the array refusing an assigned S-VOL.
+        my $gone = $deleted{$sid} || $snaps->{$name}{pair_released}
+            || ( $listed && !exists $pair_svol{$sid} );
+        if ( !$gone ) {
+            warn "FCLU: keeping snapshot volume(s) of '$name': its pair could not be deleted\n";
+            next;
+        }
+        # Wait only on a pair this call actually deleted (else the poll burns its budget).
+        eval { $d->wait_pair_released($sid) } if $deleted{$sid} && $d->can('wait_pair_released');
+        eval { $class->_delete_owned_luns( $reg, $d, $volname, $name, $plan{$name} ) };
+        warn "FCLU: snapshot volume cleanup warning ($name): $@" if $@;
     }
 
     # Release this volume's own backing CoW pair when it is itself a linked clone
@@ -878,8 +1132,9 @@ sub volume_size_info {
 # The array driver owns the pair mechanics (Thin Image et al.) behind the §2
 # contract (create/delete/restore/list_snapshots); the core only orchestrates and
 # tracks per-volume snapshot metadata in the registry snapshot subregistry
-# (snap_id = the driver's opaque pair id; svol = the snapshot's S-VOL backend id,
-# needed as a linked-clone source). Migrated from the reference plugin's
+# (snap_id = the driver's opaque pair id; svol = the LU presenting the snapshot —
+# from the driver's descriptor, or materialized on first read/clone and then marked
+# svol_owned so it is deleted with the snapshot, #27). Migrated from the reference plugin's
 # volume_snapshot* family, with the direct REST/Config calls swapped for the
 # driver contract + Registry.
 
@@ -949,7 +1204,27 @@ sub volume_snapshot_delete {
     die "snapshot '$snap' not found for volume '$volname'\n"
         unless $meta && defined $meta->{snap_id};
 
-    $class->_driver( $storeid, $scfg )->delete_snapshot( $meta->{snap_id} );
+    # Owned source LUs (#27) are checked and unmapped before the pair goes, deleted
+    # after. Retry-safe: once the pair is deleted that is recorded (pair_released), so
+    # a retry never re-issues delete_snapshot on an id the array may have reused; each
+    # LU is dropped from the record as soon as it is deleted; and _owned_lun_check
+    # refuses any id that no longer carries our label.
+    my $d = $class->_driver( $storeid, $scfg );
+    my $pair_svol;
+    if ( $meta->{svol_pending} && !defined $meta->{svol} && !$meta->{pair_released} ) {
+        my ($pair) = grep { $_->{snap_id} eq $meta->{snap_id} }
+            @{ ( eval { $d->list_snapshots($backend_id) } // [] ) };
+        $pair_svol = $pair->{meta}{svol} if $pair;
+    }
+    my $plan = $class->_owned_cleanup_plan( $storeid, $scfg, $d, $meta, $pair_svol );
+    $class->_unmap_owned_luns( $d, $meta, keys %$plan );
+    if ( !$meta->{pair_released} ) {
+        $d->delete_snapshot( $meta->{snap_id} );
+        $reg->update_snapshot_meta( $volname, $snap, pair_released => 1 );
+        eval { $d->wait_pair_released( $meta->{snap_id} ) }
+            if %$plan && $d->can('wait_pair_released');
+    }
+    $class->_delete_owned_luns( $reg, $d, $volname, $snap, $plan );
     $reg->unregister_snapshot( $volname, $snap );
 
     return 1;
@@ -1082,8 +1357,10 @@ sub volume_rollback_is_possible {
         . " roll it back on the array\n" if $snap =~ /^oob-/;
 
     my $reg = $class->_registry($storeid);
-    die "can't rollback, snapshot '$snap' does not exist on '$volname'\n"
-        unless $reg->lookup_snapshot( $volname, $snap );
+    my $rsm = $reg->lookup_snapshot( $volname, $snap );
+    die "can't rollback, snapshot '$snap' does not exist on '$volname'\n" unless $rsm;
+    die "can't rollback to '$snap': it is being deleted; finish the delete\n"
+        if $rsm->{pair_released};
 
     my $deps = $reg->find_snapshot_dependents( $volname, $snap );
     if (@$deps) {
@@ -1107,6 +1384,8 @@ sub volume_snapshot_rollback {
     my $meta = $reg->lookup_snapshot( $volname, $snap );
     die "snapshot '$snap' not found for volume '$volname'\n"
         unless $meta && defined $meta->{snap_id};
+    die "can't rollback to '$snap': it is being deleted; finish the delete\n"
+        if $meta->{pair_released};
 
     # Re-check dependents HERE, not only in volume_rollback_is_possible: callers may
     # skip the preflight, and a clone can start after it. begin_snapshot_restore does
@@ -1125,7 +1404,8 @@ sub volume_snapshot_rollback {
     # MUST leave the snapshot a usable, re-restorable pair before returning. Pass the
     # target's backend id so the driver refuses a pair that isn't this volume's (N3).
     my $ok = eval {
-        $d->restore_snapshot( $meta->{snap_id}, pvol => $backend_id );
+        $d->restore_snapshot( $meta->{snap_id}, pvol => $backend_id,
+            ( defined $meta->{group} ? ( group => $meta->{group} ) : () ) );
         1;
     };
     my $err = $@;
@@ -1165,15 +1445,9 @@ sub clone_image {
     # backing pair (P-VOL = the live source, S-VOL = the clone) IS the crash-consistent
     # point-in-time; no separate implicit snapshot object is created, and free_image
     # releases that one pair like any other linked clone (#23).
+    my $d            = $class->_driver( $storeid, $scfg );
     my $clone_source = $src_backend;
-    if ($snap) {
-        my $sm = $reg->lookup_snapshot( $volname, $snap );
-        die "snapshot '$snap' not found for volume '$volname'\n" unless $sm;
-        die "snapshot '$snap' has no S-VOL backend id\n" unless defined $sm->{svol};
-        $clone_source = $sm->{svol};
-    }
 
-    my $d        = $class->_driver( $storeid, $scfg );
     # Reserve WITH lineage: the in-flight clone then counts as a dependent of its
     # source (and snapshot), and the reservation is refused while that snapshot is
     # being rolled back, so clone and rollback serialize through the registry lock.
@@ -1189,6 +1463,13 @@ sub clone_image {
     # is still assigned to a pair — the reference's #23 hazard).
     my ( $svol, $pair, $committed ) = ( undef, undef, 0 );
     eval {
+        # From a snapshot, the CoW parent is the LU presenting it (materialized on
+        # first use, #27), so the clone shares the snapshot's blocks, never the live
+        # volume's. Done AFTER the reservation: the reservation already counts as a
+        # dependent and is refused during a rollback, so a concurrent snapshot delete or
+        # rollback cannot slip in between.
+        $clone_source = $class->_snapshot_source( $storeid, $scfg, $volname, $snap, $d )
+            if $snap;
         my $rid = $class->_alloc_backend_id( $storeid, $scfg, $d );
         $svol = $d->create_linked_clone( $clone_source,
             ( defined $rid ? ( requested_id => $rid ) : () ),
@@ -1499,6 +1780,12 @@ sub volume_has_feature {
 
     return undef unless $features->{$feature} && $features->{$feature}{$key};
 
+    # Nothing is offered FROM a half-deleted snapshot (its pair is gone, #27).
+    if ( $key eq 'snap' && defined $storeid ) {
+        my $sm = eval { $class->_registry($storeid)->lookup_snapshot( $volname, $snapname ) };
+        return undef if $sm && $sm->{pair_released};
+    }
+
     # Array-offloaded features (snapshot/clone) ALSO require the driver to advertise
     # the matching capability (§6, via Capabilities). Fail SOFT: only downgrade to
     # "unsupported" when the driver POSITIVELY lacks it — a driver build/connection
@@ -1516,9 +1803,25 @@ sub volume_has_feature {
             $ok = PVE::Storage::FCLU::Capabilities->has_feature(
                 $d->capabilities, 'clone', 'from_current' )
                 if $ok && $feature eq 'clone' && $key eq 'current';
+            # A clone FROM a snapshot needs clone.from_snapshot (#27): the driver must
+            # be able to clone the snapshot's image, not just a volume.
+            $ok = PVE::Storage::FCLU::Capabilities->has_feature(
+                $d->capabilities, 'clone', 'from_snapshot' )
+                if $ok && $feature eq 'clone' && $key eq 'snap';
             $ok;
         };
         return undef if defined $gated && !$gated;
+    }
+
+    # A full copy FROM a snapshot reads it through its source LU (#27): offer it only
+    # when the snapshot has one or the driver can materialize one. Fail soft as above.
+    if ( defined $storeid && $feature eq 'copy' && $key eq 'snap' ) {
+        my $readable = eval {
+            my $sm = $class->_registry($storeid)->lookup_snapshot( $volname, $snapname );
+            ( $sm && defined $sm->{svol} ) || $class->_driver( $storeid, $scfg )->can('materialize_snapshot')
+                ? 1 : 0;
+        };
+        return undef if defined $readable && !$readable;
     }
 
     return 1;

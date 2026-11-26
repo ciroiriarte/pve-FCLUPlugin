@@ -125,4 +125,18 @@ sub exception {
     return $err;
 }
 
+subtest 'materialize_snapshot: S-VOL-less snapshot gets one LU, then reuses it' => sub {
+    my $m   = mk();
+    my $bid = $m->create_lu( size_bytes => 1 << 30 );
+    my $s   = $m->create_snapshot($bid);
+    ok( !defined $s->{meta}{svol}, 'Mock snapshots carry no LU' );
+    my $r1 = $m->materialize_snapshot( $bid, $s->{snap_id}, label => 'src' );
+    ok( $r1->{created} && $m->get_lu( $r1->{backend_id} ), 'created a gettable LU' );
+    is( $m->get_lu( $r1->{backend_id} )->{size_bytes}, 1 << 30, 'sized like the parent' );
+    my $r2 = $m->materialize_snapshot( $bid, $s->{snap_id} );
+    is_deeply( $r2, { backend_id => $r1->{backend_id}, created => 0 }, 'second call reuses it' );
+    my $e = exception( sub { $m->materialize_snapshot( 'nope', $s->{snap_id} ) } );
+    ok( $e, 'wrong parent refused' );
+};
+
 done_testing();

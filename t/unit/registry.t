@@ -380,4 +380,25 @@ subtest 'register over a lineage reservation keeps a rename that happened mid-bu
     like( $@, qr/\Q$f\E \(clone in progress\)/, 'reserved dependent labeled in the message' );
 };
 
+subtest '#27: set_snapshot_source is compare-and-set; update_snapshot_meta is guarded' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', 'P' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', snap_id => '1,0' );
+
+    is( $r->set_snapshot_source( 'vm-1-disk-0', 'a', 'S1', svol_owned => 1 ), 'S1', 'first writer records' );
+    is( $r->set_snapshot_source( 'vm-1-disk-0', 'a', 'S2', svol_owned => 1 ), 'S1', 'second writer gets the winner' );
+    my $m = $r->lookup_snapshot( 'vm-1-disk-0', 'a' );
+    is( $m->{svol}, 'S1', 'source unchanged' );
+    ok( $m->{svol_owned}, 'owned flag recorded' );
+    is( $r->set_snapshot_source( 'vm-1-disk-0', 'gone', 'S3' ), undef, 'missing snapshot => undef' );
+
+    $r->update_snapshot_meta( 'vm-1-disk-0', 'a', svol_identity => { ids => { naa => 'ab' } } );
+    is( $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{svol_identity}{ids}{naa}, 'ab', 'identity merged' );
+    for my $k (qw(snap_id svol svol_owned restoring)) {
+        eval { $r->update_snapshot_meta( 'vm-1-disk-0', 'a', $k => 'x' ) };
+        like( $@, qr/reserved key '$k'/, "update_snapshot_meta refuses $k" );
+    }
+    ok( $r->update_snapshot_meta( 'vm-1-disk-0', 'gone', svol_identity => {} ), 'missing snapshot is a no-op' );
+};
+
 done_testing();

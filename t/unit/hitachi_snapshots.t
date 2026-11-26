@@ -321,4 +321,111 @@ subtest 'restore_budget_s covers the reverse copy plus settle, and follows the p
     is( $d->restore_budget_s, 48 * 3600 + 2 * 600, 'a raised restore_timeout_s raises the budget' );
 };
 
+{
+    package T::HitachiPaths;   # records host-access calls instead of driving host groups
+    our @ISA = ('PVE::Storage::FCLU::Driver::Hitachi');
+    sub publish_lu   { my ( $s, $id ) = @_; push @{ $s->{_pub} },   "$id"; die "BOOM map\n" if $s->{_fail_map}; 1 }
+    sub unpublish_lu { my ( $s, $id ) = @_; push @{ $s->{_unpub} }, "$id"; 1 }
+}
+sub setup_paths {
+    my $f = FCLU::FakeHitachiRest->new;
+    my $d = T::HitachiPaths->new( platform => 'vsp_e', rest => $f, pool_id => '63', snap_pool_id => '63' );
+    $d->{_snap_poll_interval} = 0;
+    return ( $d, $f );
+}
+my %HCTX = ( hostname => 'node-x', protocol => 'scsi-fc', initiators => ['10000000c9aa0001'] );
+
+subtest '#27 materialize_snapshot: map, assign, unmap; then idempotent' => sub {
+    my ( $d, $f ) = setup_paths();
+    my $bid  = $d->create_lu( size_bytes => GIB );
+    my $snap = $d->create_snapshot($bid);
+    ok( !defined $snap->{meta}{svol}, 'plain snapshot has no S-VOL' );
+
+    my $r = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX,
+        requested_id => 300, label => 'pve:x:vm-1-disk-0_s1' );
+    is( $r->{backend_id}, '300', 'S-VOL 300 created and assigned' );
+    ok( $r->{created}, '... reported as created' );
+    is( $f->{snaps}{ $snap->{snap_id} }{svolLdevId}, '300', 'pair now carries the S-VOL' );
+    is_deeply( $d->{_pub}, ['300'], 'S-VOL mapped for the assign' );
+    is_deeply( $d->{_unpub}, ['300'], '... and unmapped afterwards' );
+    is( $d->get_lu('300')->{size_bytes}, GIB, 'S-VOL sized like the P-VOL' );
+
+    my $again = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX, requested_id => 301 );
+    is_deeply( $again, { backend_id => '300', created => 0 }, 'existing S-VOL reused' );
+    ok( !$f->{ldevs}{301}, 'no second LDEV allocated' );
+
+    my $e = eval { $d->materialize_snapshot( 999, $snap->{snap_id}, host_ctx => \%HCTX ); 1 } ? undef : $@;
+    like( "$e", qr/not on ldev/, 'wrong P-VOL refused' );
+};
+
+subtest '#27 materialize_snapshot: lost race and failures clean up the LDEV' => sub {
+    my ( $d, $f ) = setup_paths();
+    my $bid  = $d->create_lu( size_bytes => GIB );
+    my $snap = $d->create_snapshot($bid);
+
+    # A concurrent caller assigns first: ours is dropped, theirs returned.
+    no warnings 'redefine';
+    my $orig = \&FCLU::FakeHitachiRest::assign_snapshot_volume;
+    local *FCLU::FakeHitachiRest::assign_snapshot_volume = sub {
+        my ( $s, $id ) = @_; $s->{snaps}{$id}{svolLdevId} = '310'; die "API request failed: KART30000-E already assigned\n" };
+    my $r = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX, requested_id => 311 );
+    is_deeply( $r, { backend_id => '310', created => 0 }, 'winner returned' );
+    ok( !$f->{ldevs}{311} || ( $f->{ldevs}{311}{emulationType} // '' ) eq 'NOT DEFINED', 'our LDEV deleted' );
+
+    # Map failure: LDEV deleted, error surfaces, pair untouched.
+    my $snap2 = $d->create_snapshot($bid);
+    $d->{_fail_map} = 1;
+    local *FCLU::FakeHitachiRest::assign_snapshot_volume = $orig;
+    my $ok = eval { $d->materialize_snapshot( $bid, $snap2->{snap_id}, host_ctx => \%HCTX, requested_id => 312 ); 1 };
+    ok( !$ok, 'map failure surfaces' );
+    ok( !$f->{ldevs}{312} || ( $f->{ldevs}{312}{emulationType} // '' ) eq 'NOT DEFINED', 'LDEV deleted after failure' );
+    ok( !defined $f->{snaps}{ $snap2->{snap_id} }{svolLdevId}, 'pair left without an S-VOL' );
+    $d->{_fail_map} = 0;
+
+    my $e = eval { $d->materialize_snapshot( $bid, $snap2->{snap_id} ); 1 } ? undef : $@;
+    like( "$e", qr/needs host_ctx/, 'host_ctx required' );
+};
+
+subtest '#27 materialize_snapshot: group pin, unconfirmed assign, failed create' => sub {
+    my ( $d, $f ) = setup_paths();
+    my $bid  = $d->create_lu( size_bytes => GIB );
+    my $snap = $d->create_snapshot( $bid, snapshot_group => 'pve_s_1_a' );
+
+    my $e = eval { $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX, group => 'other' ); 1 } ? undef : $@;
+    like( "$e", qr/not the expected pair/, 'a pair from another group is refused' );
+
+    # Assign lands, but the read-back fails every time: keep the LDEV, error out.
+    no warnings 'redefine';
+    my $orig = \&FCLU::FakeHitachiRest::get_snapshot;
+    my $n = 0;
+    local *FCLU::FakeHitachiRest::get_snapshot = sub { return $orig->(@_) if $n++ == 0; die "API request failed: 503\n" };
+    my $ok = eval { $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX,
+        requested_id => 320, group => 'pve_s_1_a' ); 1 };
+    like( $@, qr/could not confirm/, 'unconfirmed assign reported' );
+    ok( $f->{ldevs}{320} && ( $f->{ldevs}{320}{emulationType} // '' ) ne 'NOT DEFINED', 'LDEV kept (may be assigned)' );
+    local *FCLU::FakeHitachiRest::get_snapshot = $orig;
+    my $r = $d->materialize_snapshot( $bid, $snap->{snap_id}, host_ctx => \%HCTX, group => 'pve_s_1_a' );
+    is_deeply( $r, { backend_id => '320', created => 0 }, 'next call adopts it' );
+
+    # create_ldev fails: nothing to delete, no delete_ldev issued.
+    my $snap2 = $d->create_snapshot($bid);
+    my $dels  = $f->{calls}{delete_ldev} // 0;
+    local *FCLU::FakeHitachiRest::create_ldev = sub { die "API request failed: KART40044-E id in use\n" };
+    eval { $d->materialize_snapshot( $bid, $snap2->{snap_id}, host_ctx => \%HCTX, requested_id => 330 ) };
+    ok( $@, 'create failure surfaces' );
+    is( $f->{calls}{delete_ldev} // 0, $dels, 'no delete_ldev for an LDEV we never made' );
+};
+
+subtest '#27 N1: restore refuses a reused snapshot id from another group' => sub {
+    my ( $d, $f ) = setup();
+    my $bid  = $d->create_lu( size_bytes => GIB );
+    my $snap = $d->create_snapshot( $bid, snapshot_group => 'pve_s_1_newer' );
+    my $e = eval { $d->restore_snapshot( $snap->{snap_id}, pvol => $bid, group => 'pve_s_1_older' ); 1 } ? undef : $@;
+    like( "$e", qr/not the expected pair/, 'mismatched group refused' );
+    ok( !$f->{calls}{restore_snapshot}, 'no reverse copy issued' );
+    ok( $d->restore_snapshot( $snap->{snap_id}, pvol => $bid, group => 'pve_s_1_newer' ), 'matching group restores' );
+    ok( $d->_check_pair_group( { snapshotGroupName => 'pve_e590h-test_267_a_long' }, 'pve_e590h-test_267_a_long_snapshot_name' ),
+        'an array-shortened group name is accepted' );
+};
+
 done_testing();

@@ -175,9 +175,28 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
   create **N clone-pairs sharing the single base — and zero intermediate/base snapshot
   objects**. There is nothing per-clone to deduplicate: the object-minimal shared-base
   model is inherent to using the base LU directly as the CoW source (cloning from a
-  *snapshot* instead uses that snapshot's S-VOL as the shared P-VOL, identically). Each
+  *snapshot* instead uses that snapshot's S-VOL as the shared P-VOL, identically; see the
+  next point). Each
   clone S-VOL is an independent writable DP volume; the template cannot be converted or
   deleted while any clone depends on it (dependency guard in `create_base` / `free_image`).
+
+- **Clones and reads from a snapshot (#27).** A plain snapshot is a Thin Image pair with
+  **no S-VOL**, so there is nothing a host can read and nothing to clone from. On first
+  use (a linked clone from the snapshot, or PVE activating it for a full copy) the driver
+  **materializes** one through `materialize_snapshot`: it allocates a DP LDEV in
+  `ldev_range` sized to the P-VOL, maps it to this node (the assign still requires LU
+  paths), assigns it to the existing pair, and unmaps it again. The pair then reports the
+  S-VOL with status PSUS, and the S-VOL reads the snapshot's data. Linked clones are
+  cascaded CoW pairs on that unmapped S-VOL, so a clone's writes never reach the
+  snapshot. The S-VOL is recorded as owned by the snapshot, reused by later clones and
+  reads, and deleted with the snapshot or when its volume is freed. The LDEV id and label
+  are recorded before allocation, so a crash midway is reclaimed by the snapshot delete.
+  Before any unmap or delete, the id must still carry that label. After a full clone
+  from a snapshot, PVE may leave the snapshot's S-VOL mapped on that node; deleting the
+  snapshot from another node unmaps it everywhere, which can leave a pathless multipath
+  map on the first node until it is flushed. Verified live on the
+  E590H (93-07-23). Before alpha44 a snapshot clone failed with `has no S-VOL backend
+  id`, and a snapshot read resolved to the **live** volume instead.
 
 - **`OPEN-0V` multipath:** a clone S-VOL presents SCSI product **`OPEN-0V`** (TI
   v-vol). Multipath must match `OPEN-.*` or the clone never gets a `/dev/mapper`

@@ -37,6 +37,7 @@ BEGIN {
 
 use lib 'src';
 use PVE::Storage::FCLU::Plugin;
+use PVE::Storage::FCLU::Error;
 
 # A stateful fake array driver (the §2 surface the plugin calls in slices 4A/4B).
 {
@@ -62,10 +63,12 @@ use PVE::Storage::FCLU::Plugin;
     sub get_lu_identity { my ( $s, $id ) = @_; $s->{lus}{$id} or die "404\n"; return $s->{lus}{$id}{identity} }
     sub set_lu_label { my ( $s, $id, $l ) = @_; $s->{calls}{set_lu_label}++; die "BOOM label\n" if $s->{fail_label}; $s->{lus}{$id}{label} = $l if $s->{lus}{$id}; 1 }
     sub set_lu_qos   { my ( $s ) = @_; $s->{calls}{set_lu_qos}++; 1 }
-    sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; delete $s->{lus}{$id}; 1 }
+    sub delete_lu    { my ( $s, $id ) = @_; $s->{calls}{delete_lu}++; push @{ $s->{deleted} }, "$id";
+        die "BOOM delete\n" if $s->{fail_delete} || ( $s->{fail_delete_id} // '' ) eq "$id";
+        delete $s->{lus}{$id}; 1 }
     sub resize_lu    { my ( $s, $id, $new ) = @_; $s->{calls}{resize_lu}++;
         $s->{lus}{$id}{size_bytes} = $new if $s->{lus}{$id} && $new > $s->{lus}{$id}{size_bytes}; 1 }
-    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1, from_current => 1 }, copy => { full => 1 }, qos => {}, resize => {}, transfer => {}, replication => {} } }
+    sub capabilities { { snapshot => { single => 1, consistency_group => 1 }, clone => { linked => 1, from_current => 1, from_snapshot => 1 }, copy => { full => 1 }, qos => {}, resize => {}, transfer => {}, replication => {} } }
     # Grouped full clone: prepare allocates an S-VOL + an IDLE pair under a group; the
     # group action triggers all pairs at one instant; clone_copy_state reports completion.
     sub prepare_full_clone {
@@ -114,6 +117,7 @@ use PVE::Storage::FCLU::Plugin;
     sub list_snapshots { my ( $s, $bid ) = @_; $s->{calls}{list_snapshots}++;
         [ map { $s->_snap_descr( $bid, $_ ) } @{ $s->{snaps}{$bid} // [] } ] }
     sub delete_snapshot { my ( $s, $sid ) = @_; $s->{calls}{delete_snapshot}++;
+        die "BOOM pair delete\n" if $s->{fail_pair_delete};
         for my $bid ( keys %{ $s->{snaps} } ) {
             @{ $s->{snaps}{$bid} } = grep { $_->{snap_id} ne $sid } @{ $s->{snaps}{$bid} };
         }
@@ -143,13 +147,48 @@ use PVE::Storage::FCLU::Plugin;
     sub unpublish_lu_all { my ( $s, $id ) = @_; $s->{calls}{unpublish_lu_all}++; 1 }
 }
 
+# Plain Thin-Image-style snapshots: the pair has NO S-VOL (what the real Hitachi
+# array returns, #27). T::NoSvolDriver cannot materialize one; T::MatDriver can.
+{
+    package T::NoSvolDriver;
+    our @ISA = ('T::FakeDriver');
+    sub create_snapshot {
+        my ( $s, $bid, %o ) = @_; $s->{calls}{create_snapshot}++;
+        my $p = { snap_id => "$bid," . scalar( @{ $s->{snaps}{$bid} // [] } ),
+            group => $o{snapshot_group}, svol => undef, status => 'PSUS' };
+        push @{ $s->{snaps}{$bid} }, $p;
+        return $s->_snap_descr( $bid, $p );
+    }
+
+    package T::MatDriver;
+    our @ISA = ('T::NoSvolDriver');
+    sub materialize_snapshot {
+        my ( $s, $pvol, $sid, %o ) = @_; $s->{calls}{materialize_snapshot}++;
+        $s->{last_materialize} = { %o };
+        die $s->{fail_materialize} if ref $s->{fail_materialize};
+        die "BOOM materialize\n" if $s->{fail_materialize};
+        my ($p) = grep { $_->{snap_id} eq $sid } @{ $s->{snaps}{$pvol} // [] };
+        die "no such snapshot '$sid'\n" unless $p;
+        return { backend_id => $s->{return_id}, created => 0 } if defined $s->{return_id};
+        return { backend_id => $p->{svol}, created => 0 } if defined $p->{svol};
+        my $svol = $s->_id( $o{requested_id} );
+        $s->{lus}{$svol} = { backend_id => $svol, size_bytes => $s->{lus}{$pvol}{size_bytes},
+            label => $o{label}, identity => { protocol => 'scsi-fc',
+                ids => { naa => '60060e80' . sprintf( '%08x', ++$T::FakeDriver::SEQ ) } } };
+        $p->{svol} = $svol;
+        die "BOOM crash after assign\n" if $s->{crash_after_assign};
+        $s->{on_materialize}->() if $s->{on_materialize};
+        return { backend_id => $svol, created => 1 };
+    }
+}
+
 # A fake host connector.
 {
     package T::FakeConn;
     sub new { bless { calls => {} }, shift }
     sub host_context { my ( $s, %o ) = @_; { hostname => $o{hostname}, protocol => 'scsi-fc', initiators => ['10000000c9aa'] } }
     sub attach      { my ( $s, $id ) = @_; $s->{calls}{attach}++; '/dev/mapper/3' . $id->{ids}{naa} }
-    sub detach      { my ( $s ) = @_; $s->{calls}{detach}++; 1 }
+    sub detach      { my ( $s, $id ) = @_; $s->{calls}{detach}++; push @{ $s->{detached} }, $id; 1 }
     sub flush       { my ( $s ) = @_; $s->{calls}{flush}++; 1 }
     sub resize      { my ( $s ) = @_; $s->{calls}{resize}++; 1 }
     sub device_path { my ( $s, $id ) = @_; my $naa = $id->{ids}{naa};
@@ -627,7 +666,7 @@ subtest 'volume_has_feature capability gating (fail soft when the driver lacks i
     # live-source clone declines so PVE falls back to a host copy.
     package T::SnapCloneDriver;
     our @ISA = ('T::FakeDriver');
-    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1 } } }
+    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1, from_snapshot => 1 } } }
 
     package T::SnapClonePlugin;
     use parent -norequire, 'T::Plugin';
@@ -1320,6 +1359,351 @@ subtest 'clone_image vs concurrent rename; rollback marker TTL from the driver b
     is( $seen->{expires} - $seen->{started}, 7200 + 3600, 'TTL = driver budget + 1h margin' );
     is( $seen->{node}, 'node-x', 'marker records this node' );
     ok( !reg()->lookup_snapshot( $vol, 's3' )->{restoring}, 'marker cleared afterwards' );
+};
+
+subtest '#27: S-VOL-less snapshot is materialized once, then cloned, read and released' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my ( $F, $C ) = ( $T::Plugin::FAKE, $T::Plugin::CONN );
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 970, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    ok( !defined reg()->lookup_snapshot( $vol, 's1' )->{svol}, 'snapshot recorded without a source' );
+
+    # No silent fallback to the live volume.
+    eval { $P->filesystem_path( {}, $vol, 'store1', 's1' ) };
+    like( $@, qr/no host-readable volume yet/, 'path of an unmaterialized snapshot fails closed' );
+    is( $P->deactivate_volume( 'store1', {}, $vol, 's1' ), 1, 'deactivate of it is a no-op' );
+    ok( !$F->{calls}{unpublish_lu}, '... that unmaps nothing (not the live volume)' );
+
+    my $c1 = $P->clone_image( { pool_id => '63' }, 'store1', $vol, 971, 's1', 0 );
+    is( $F->{calls}{materialize_snapshot}, 1, 'clone materialized the snapshot source' );
+    is( $F->{last_materialize}{host_ctx}{hostname}, 'node-x', 'driver got this node\'s host context' );
+    like( $F->{last_materialize}{label}, qr/\Q${vol}_s1\E|pve:/, 'source LU is labeled' );
+    my $sm   = reg()->lookup_snapshot( $vol, 's1' );
+    my $svol = $sm->{svol};
+    ok( defined $svol && $sm->{svol_owned}, 'source recorded and marked owned' );
+    ok( $sm->{svol_identity}, 'source identity recorded' );
+    is( ( reg()->lookup($c1) )[1]->{clone_parent_backend}, $svol, 'clone is a CoW child of the source' );
+    is( ( reg()->lookup($c1) )[1]->{parent_snap}, 's1', 'clone pinned to the snapshot' );
+
+    my $c2 = $P->clone_image( { pool_id => '63' }, 'store1', $vol, 972, 's1', 0 );
+    is( $F->{calls}{materialize_snapshot}, 1, 'second clone reuses the recorded source' );
+
+    # Activation reads the SOURCE, not the volume.
+    $P->activate_volume( 'store1', {}, $vol );
+    my $vpath = $P->filesystem_path( {}, $vol, 'store1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $spath = $P->filesystem_path( {}, $vol, 'store1', 's1' );
+    is( $spath, '/dev/mapper/3' . $F->{lus}{$svol}{identity}{ids}{naa}, 'snapshot path is the source device' );
+    isnt( $spath, $vpath, 'snapshot path differs from the live volume path' );
+    my $unp = $F->{calls}{unpublish_lu} // 0;
+    $P->deactivate_volume( 'store1', {}, $vol, 's1' );
+    is( $F->{calls}{unpublish_lu}, $unp + 1, 'deactivating the snapshot unmaps its source' );
+
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/linked clone\(s\) depend/, 'delete refused while clones depend on it' );
+    $P->free_image( 'store1', { pool_id => '63' }, $_ ) for $c1, $c2;
+    ok( $F->{lus}{$svol}, 'freeing the clones keeps the snapshot source' );
+
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'snapshot delete' );
+    ok( !$F->{lus}{$svol}, 'owned source LU deleted with the snapshot' );
+    ok( !reg()->lookup_snapshot( $vol, 's1' ), 'snapshot record gone' );
+};
+
+subtest '#27: snapshot delete keeps the record when the source delete fails (retryable)' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 973, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+
+    $F->{fail_delete} = 1;
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/BOOM delete/, 'source delete failure surfaces' );
+    ok( reg()->lookup_snapshot( $vol, 's1' ), 'record kept for a retry' );
+    $F->{fail_delete} = 0;
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'retry succeeds' );
+    ok( !$F->{lus}{$svol}, 'source deleted on retry' );
+};
+
+subtest '#27: free_image deletes the sources its snapshots own' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 974, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, $_ ) for qw(s1 s2);
+    $P->activate_volume( 'store1', {}, $vol, 's1' );   # only s1 is materialized
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+    my ($vbid) = reg()->lookup($vol);
+
+    $P->free_image( 'store1', { pool_id => '63' }, $vol );
+    ok( !$F->{lus}{$svol}, 'owned source deleted' );
+    ok( !$F->{lus}{$vbid}, 'volume deleted' );
+    ok( $F->{calls}{unpublish_lu_all} >= 2, 'source and volume mappings reaped cluster-wide' );
+};
+
+subtest '#27: without materialize_snapshot, snapshot reads and clones fail closed' => sub {
+    local $T::Plugin::FAKE = T::NoSvolDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 975, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    my $pub = $F->{calls}{publish_lu} // 0;
+
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/no materialize_snapshot/, 'activation of the snapshot refused' );
+    is( $F->{calls}{publish_lu} // 0, $pub, 'nothing was mapped (not the live volume)' );
+    eval { $P->clone_image( { pool_id => '63' }, 'store1', $vol, 976, 's1', 0 ) };
+    like( $@, qr/no materialize_snapshot/, 'clone from the snapshot refused' );
+    ok( !$F->{calls}{create_linked_clone}, 'no clone attempted on the array' );
+    ok( !grep( { /^vm-976-/ } keys %{ reg()->load } ), 'no reservation left behind' );
+};
+
+subtest '#27: clone from a snapshot is gated on clone.from_snapshot' => sub {
+    package T::NoFromSnapDriver;
+    our @ISA = ('T::FakeDriver');
+    sub capabilities { { snapshot => { single => 1 }, clone => { linked => 1 } } }
+    package main;
+    local $T::Plugin::FAKE = T::NoFromSnapDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    is( $P->volume_has_feature( {}, 'clone', 'store1', 'vm-1-disk-0', 's1' ), undef,
+        'snapshot clone not offered without clone.from_snapshot' );
+    $P->deactivate_storage( 'store1', {} );
+    is( $P->volume_has_feature( {}, 'clone', 'store1', 'base-1-disk-0' ), 1,
+        'base clone unaffected' );
+};
+
+subtest '#27 B1: a retried free_image never touches a source id the array reused' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 980, 'raw', undef, 1 << 30 );
+    my ($vbid) = reg()->lookup($vol);
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+
+    $F->{fail_delete_id} = $vbid;            # the volume's own delete fails
+    eval { $P->free_image( 'store1', { pool_id => '63' }, $vol ) };
+    like( $@, qr/BOOM delete/, 'first free fails on the volume delete' );
+    ok( !$F->{lus}{$svol}, 'source was deleted' );
+    ok( !defined reg()->lookup_snapshot( $vol, 's1' )->{svol}, '... and dropped from the record at once' );
+
+    # The array hands the freed id to another VM's disk.
+    $F->{lus}{$svol} = { backend_id => $svol, label => 'pve:x:vm-999-disk-0', identity => {} };
+    my $unmaps = $F->{calls}{unpublish_lu_all} // 0;
+    $F->{fail_delete_id} = undef;
+    $P->free_image( 'store1', { pool_id => '63' }, $vol );
+    ok( $F->{lus}{$svol}, 'retry left the reused id alone' );
+    ok( !grep( { $_ eq $svol } @{ $F->{deleted} }[ 1 .. $#{ $F->{deleted} } ] ),
+        'no second delete of that id' );
+    is( $F->{calls}{unpublish_lu_all}, $unmaps + 1, 'only the volume itself was unmapped on retry' );
+};
+
+subtest '#27 B1: snapshot delete retry skips the pair, refuses a relabeled id' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 981, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+
+    $F->{fail_delete_id} = $svol;
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/BOOM delete/, 'source delete fails' );
+    ok( reg()->lookup_snapshot( $vol, 's1' )->{pair_released}, 'pair deletion recorded' );
+    my $pair_deletes = $F->{calls}{delete_snapshot};
+    $F->{fail_delete_id} = undef;
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'retry succeeds' );
+    is( $F->{calls}{delete_snapshot}, $pair_deletes, 'retry did not re-issue delete_snapshot' );
+    ok( !$F->{lus}{$svol}, 'source deleted on retry' );
+
+    # A source whose label no longer matches (id reused) is never unmapped or deleted.
+    $P->volume_snapshot( {}, 'store1', $vol, 's2' );
+    $P->activate_volume( 'store1', {}, $vol, 's2' );
+    my $sv2 = reg()->lookup_snapshot( $vol, 's2' )->{svol};
+    $F->{lus}{$sv2}{label} = 'pve:x:someone-else';
+    my $unmaps = $F->{calls}{unpublish_lu_all} // 0;
+    my $warn = '';
+    { local $SIG{__WARN__} = sub { $warn .= $_[0] };
+      ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's2' ), 'snapshot delete completes' ); }
+    ok( $F->{lus}{$sv2}, 'relabeled LU left in place' );
+    is( $F->{calls}{unpublish_lu_all} // 0, $unmaps, '... and not unmapped' );
+    like( $warn, qr/no longer carries its label/, 'with a warning' );
+};
+
+subtest '#27 M4: a crash after assign is reclaimed by snapshot delete' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 982, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $F->{crash_after_assign} = 1;
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/crash after assign/, 'materialize dies after assigning' );
+    my $sm = reg()->lookup_snapshot( $vol, 's1' );
+    ok( $sm->{svol_pending} && !defined $sm->{svol}, 'intent recorded, no source' );
+    my ($pair) = grep { $_->{snap_id} eq $sm->{snap_id} } @{ $F->{snaps}{ ( reg()->lookup($vol) )[0] } };
+    my $orphan = $pair->{svol};
+    ok( $F->{lus}{$orphan}, 'the S-VOL exists on the array' );
+    $F->{crash_after_assign} = 0;
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'snapshot delete' );
+    ok( !$F->{lus}{$orphan}, 'orphaned S-VOL reclaimed via the pending record' );
+};
+
+subtest '#27 M2/M3: wrong source refused; vanished snapshot keeps the LU' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol   = $P->alloc_image( 'store1', { pool_id => '63' }, 983, 'raw', undef, 1 << 30 );
+    my $other = $P->alloc_image( 'store1', { pool_id => '63' }, 984, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+
+    $F->{return_id} = ( reg()->lookup($other) )[0];
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/parent or a registered volume/, 'a registered volume is never adopted' );
+    $F->{return_id} = ( reg()->lookup($vol) )[0];
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/parent or a registered volume/, 'nor the parent itself' );
+    ok( !defined reg()->lookup_snapshot( $vol, 's1' )->{svol}, 'nothing recorded' );
+    $F->{return_id} = undef;
+
+    # The snapshot record disappears while its source is being made: keep the LU.
+    $F->{on_materialize} = sub { reg()->unregister_snapshot( $vol, 's1' ) };
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/deleted while it was being prepared/, 'reported' );
+    my $lbl  = $F->{last_materialize}{label};
+    my @kept = grep { ( $F->{lus}{$_}{label} // '' ) eq $lbl } keys %{ $F->{lus} };
+    is( scalar @kept, 1, 'the possibly-assigned LU was not deleted' );
+    delete $F->{on_materialize};
+};
+
+subtest '#27: rename keeps the source; copy from a snapshot is gated on readability' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 985, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $sm = reg()->lookup_snapshot( $vol, 's1' );
+    $P->rename_snapshot( {}, 'store1', $vol, 's1', 's9' );
+    my $sm9 = reg()->lookup_snapshot( $vol, 's9' );
+    is_deeply( [ @$sm9{qw(svol svol_owned svol_label)} ], [ @$sm{qw(svol svol_owned svol_label)} ],
+        'source, owned flag and label move with the rename' );
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's9' ), 'delete after rename' );
+    ok( !$F->{lus}{ $sm->{svol} }, 'source still deleted (label recorded at creation)' );
+
+    is( $P->volume_has_feature( {}, 'copy', 'store1', $vol, 'sx' ), 1, 'copy offered: driver can materialize' );
+    local $T::Plugin::FAKE = T::NoSvolDriver->new;
+    $P->deactivate_storage( 'store1', {} );
+    is( $P->volume_has_feature( {}, 'copy', 'store1', $vol, 'sx' ), undef,
+        'copy not offered when the snapshot cannot be read' );
+};
+
+subtest '#27 N1: a half-deleted snapshot cannot be read, cloned or rolled back' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 986, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+    $F->{fail_delete_id} = $svol;
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ) };
+    ok( reg()->lookup_snapshot( $vol, 's1' )->{pair_released}, 'snapshot is half-deleted' );
+
+    eval { $P->filesystem_path( {}, $vol, 'store1', 's1' ) };
+    like( $@, qr/being deleted/, 'path refused' );
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    like( $@, qr/being deleted/, 'activation refused' );
+    eval { $P->clone_image( { pool_id => '63' }, 'store1', $vol, 987, 's1', 0 ) };
+    like( $@, qr/being deleted|does not support a linked clone/, 'clone refused' );
+    eval { $P->volume_rollback_is_possible( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/being deleted/, 'rollback preflight refused' );
+    eval { $P->volume_snapshot_rollback( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/being deleted/, 'rollback refused' );
+    ok( !$F->{calls}{restore_snapshot}, 'no restore issued' );
+    is( $P->volume_has_feature( {}, $_, 'store1', $vol, 's1' ), undef, "no '$_' from it" ) for qw(clone copy);
+    is( $P->deactivate_volume( 'store1', {}, $vol, 's1' ), 1, 'deactivate is a soft no-op' );
+
+    $F->{fail_delete_id} = undef;
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'retry finishes the delete' );
+};
+
+subtest '#27 N2: labels are unique per snapshot; pending kept only when uncertain' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 988, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, $_ ) for qw(before-upgrade-1 before-upgrade-2);
+    $P->activate_volume( 'store1', {}, $vol, $_ ) for qw(before-upgrade-1 before-upgrade-2);
+    my @l = map { reg()->lookup_snapshot( $vol, $_ )->{svol_label} } qw(before-upgrade-1 before-upgrade-2);
+    ok( length $l[0] <= 32, 'label fits the driver limit' );
+    isnt( $l[0], $l[1], 'same-prefix snapshots get distinct labels' );
+
+    $P->volume_snapshot( {}, 'store1', $vol, 's3' );
+    $F->{fail_materialize} = PVE::Storage::FCLU::Error->new( code => 'array_busy', message => 'busy' );
+    eval { $P->activate_volume( 'store1', {}, $vol, 's3' ) };
+    ok( $@, 'definite failure surfaces' );
+    ok( !reg()->lookup_snapshot( $vol, 's3' )->{svol_pending}, 'definite failure clears the intent' );
+    $F->{fail_materialize} = PVE::Storage::FCLU::Error->new( code => 'partial', message => 'unsure' );
+    eval { $P->activate_volume( 'store1', {}, $vol, 's3' ) };
+    ok( reg()->lookup_snapshot( $vol, 's3' )->{svol_pending}, 'uncertain failure keeps the intent' );
+    $F->{fail_materialize} = undef;
+};
+
+subtest '#27 N4: free_image keeps a source whose pair could not be deleted' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 989, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $P->activate_volume( 'store1', {}, $vol, 's1' );
+    my $svol = reg()->lookup_snapshot( $vol, 's1' )->{svol};
+    $F->{fail_pair_delete} = 1;
+    my $warn = '';
+    { local $SIG{__WARN__} = sub { $warn .= $_[0] };
+      $P->free_image( 'store1', { pool_id => '63' }, $vol ); }
+    ok( $F->{lus}{$svol}, 'source kept while its pair still exists' );
+    like( $warn, qr/keeping snapshot volume/, 'with a warning' );
+};
+
+subtest '#27 N3: a new attempt reclaims an LDEV abandoned before assign' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 990, 'raw', undef, 1 << 30 );
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    # Simulate: pending record written, LDEV created and labeled, crash before assign.
+    my $lbl = 'pve:store1:abandoned';
+    $F->{lus}{450} = { backend_id => '450', label => $lbl, identity => {} };
+    reg()->update_snapshot_meta( $vol, 's1', svol_pending => { id => '450', label => $lbl, started => time() } );
+    eval { $P->activate_volume( 'store1', {}, $vol, 's1' ) };
+    ok( $F->{lus}{450}, 'a fresh pending LDEV (maybe another node building it) is left alone' );
+    $P->volume_snapshot( {}, 'store1', $vol, 's2' );
+    reg()->update_snapshot_meta( $vol, 's2', svol_pending => { id => '450', label => $lbl, started => time() - 7200 } );
+    my $snapname = 's2';
+    $P->activate_volume( 'store1', {}, $vol, $snapname );
+    ok( !$F->{lus}{450}, 'a stale abandoned LDEV is reclaimed' );
+    my $sm = reg()->lookup_snapshot( $vol, $snapname );
+    ok( defined $sm->{svol} && $sm->{svol} ne '450', 'a fresh source recorded' );
+    ok( !$sm->{svol_pending}, 'pending record cleared' );
 };
 
 done_testing();

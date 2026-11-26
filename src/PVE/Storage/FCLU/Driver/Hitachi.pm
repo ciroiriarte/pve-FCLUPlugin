@@ -621,6 +621,8 @@ sub restore_snapshot {
             "refusing to restore snapshot '$snap_id': its P-VOL (" . ( $got // 'undef' )
             . ") does not match the target volume ($opts{pvol})" )
             unless defined $got && "$got" eq "$opts{pvol}";
+        # A reused "pvol,mu" id must not reverse-copy from a different pair (#27).
+        $self->_check_pair_group( $s, $opts{group} );
     }
 
     # Reverse-copy S-VOL -> P-VOL, then RE-SPLIT so the snapshot stays a usable,
@@ -741,6 +743,87 @@ sub _alloc_svol {
         );
     } );
     return defined $args{requested_id} ? "$args{requested_id}" : "$res->{resourceId}";
+}
+
+# §2 materialize_snapshot: give an existing (S-VOL-less) Thin Image snapshot pair an
+# S-VOL so the snapshot can be read or used as a linked-clone source (#27).
+#
+# REAL-ARRAY FLOW (verified live on the E590H 93-07-23, 2026-11-25): allocate a DP LDEV
+# the size of the P-VOL, MAP it (assign-volume still requires LU paths, KART30000-E),
+# assign it to the pair, then UNMAP it. The pair reports svolLdevId + PSUS, the S-VOL
+# reads the snapshot's data, and create_linked_clone() on the unmapped S-VOL builds a
+# cascaded CoW child whose writes do not reach the snapshot. Race-safe: if the pair
+# already has an S-VOL (a concurrent caller won, or a crash after assign), return it
+# and drop ours.
+sub materialize_snapshot {
+    my ($self, $pvol, $snap_id, %args) = @_;
+
+    my $pair = $self->_call( sub { $self->{rest}->get_snapshot($snap_id) } );
+    $self->_err( 'invalid', "snapshot '$snap_id' is not on ldev '$pvol'" )
+        unless defined $pair->{pvolLdevId} && "$pair->{pvolLdevId}" eq "$pvol";
+    # A "pvol,mu" id can be reused by a later pair on the same P-VOL (a clone's backing
+    # pair, an array-side snapshot). The caller's group pins the pair it means.
+    $self->_check_pair_group( $pair, $args{group} );
+    return { backend_id => "$pair->{svolLdevId}", created => 0 }
+        if defined $pair->{svolLdevId} && length $pair->{svolLdevId};
+
+    my $hctx = $args{host_ctx};
+    $self->_err( 'invalid', 'materialize_snapshot needs host_ctx (assign requires LU paths)' )
+        unless ref $hctx eq 'HASH' && $hctx->{hostname};
+
+    my $src = $self->_call( sub { $self->{rest}->get_ldev($pvol) } );
+    my $blocks = $src->{blockCapacity} // $src->{numOfBlocks};
+    $self->_err( 'internal', 'source ldev has no block capacity' ) unless defined $blocks;
+
+    my $svol;
+    if ( defined $args{requested_id} ) {
+        $svol = "$args{requested_id}";
+        $self->_call( sub { $self->{rest}->create_ldev(
+            pool_id => $self->{pool_id}, block_capacity => $blocks, ldev_id => int($svol) ) } );
+    } else {
+        my $res = $self->_call( sub { $self->{rest}->create_ldev(
+            pool_id => $self->{pool_id}, block_capacity => $blocks ) } );
+        $svol = "$res->{resourceId}";
+    }
+
+    my $ident;
+    my $ok = eval {
+        $self->_call( sub { $self->{rest}->set_ldev_label( $svol, $args{label} ) } )
+            if defined $args{label};
+        $self->publish_lu( $svol, %$hctx );
+        $self->_call( sub { $self->{rest}->assign_snapshot_volume( $snap_id, $svol ) } );
+        # The NAA is only reported while the LU is mapped: take the identity now.
+        $ident = eval { $self->get_lu_identity($svol) };
+        1;
+    };
+    my $err = $@;
+    # The temporary paths existed only to satisfy assign; remove them either way.
+    eval { $self->unpublish_lu( $svol, %$hctx ) };
+    warn "FCLU Hitachi: removing temporary paths of snapshot S-VOL '$svol' failed: $@" if $@;
+
+    # Read the pair back. Only a CONFIRMED read decides; if it cannot be read, never
+    # delete our LDEV — it may already be the pair's S-VOL, and the next call (which
+    # finds svolLdevId set) adopts it.
+    my ( $now, $read_err );
+    for my $try ( 1 .. 3 ) {
+        $now = eval { $self->_call( sub { $self->{rest}->get_snapshot($snap_id) } ) };
+        last if $now;
+        $read_err = $@;
+    }
+    $self->_err( 'partial', "could not confirm whether snapshot '$snap_id' took S-VOL"
+        . " '$svol' ($read_err); retry to adopt or reclaim it" ) unless $now;
+
+    my $got = defined $now->{svolLdevId} && length $now->{svolLdevId} ? "$now->{svolLdevId}" : undef;
+    if ( defined $got && $got eq $svol ) {   # assigned (even if the job reply was lost)
+        return { backend_id => $svol, created => 1, ( $ident ? ( identity => $ident ) : () ) };
+    }
+
+    # Confirmed not ours on the pair: drop the LDEV we allocated; hand back a winner.
+    eval { $self->_call( sub { $self->{rest}->delete_ldev( int($svol) ) } ) };
+    warn "FCLU Hitachi: deleting unassigned snapshot S-VOL '$svol' failed: $@" if $@;
+    return { backend_id => $got, created => 0 } if defined $got;
+    die $err if !$ok;
+    $self->_err( 'internal', "snapshot '$snap_id' has no S-VOL after assigning '$svol'" );
 }
 
 # Persistent CoW child — the PVE clone_image primitive (§6). Allocate a DP S-VOL and
@@ -1751,6 +1834,19 @@ sub _resolve_owned_hg {
 sub _err {
     my ($self, $code, $message) = @_;
     PVE::Storage::FCLU::Error->throw( code => $code, message => "Hitachi: $message" );
+}
+
+# A snapshot id ("pvol,mu") can be reused by a later pair on the same P-VOL. When the
+# caller knows the pair's group, refuse a pair from another group. The array may store
+# a shortened group name, so a returned name that is a prefix of the expected one
+# (of at least 16 characters) is accepted.
+sub _check_pair_group {
+    my ($self, $pair, $want) = @_;
+    return 1 unless defined $want && length $want;
+    my $got = $pair->{snapshotGroupName} // '';
+    return 1 if $got eq $want || ( length $got >= 16 && index( $want, $got ) == 0 );
+    $self->_err( 'invalid', "snapshot '" . ( $pair->{snapshotId} // '?' )
+        . "' is not the expected pair (group '$got', expected '$want')" );
 }
 
 sub _is_not_found {

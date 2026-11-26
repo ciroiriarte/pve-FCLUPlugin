@@ -510,6 +510,23 @@ sub list_snapshots {
     ];
 }
 
+# Mock snapshots carry no addressable LU (like a plain Thin Image pair), so the core
+# must go through materialize_snapshot to read or clone one. The materialized LU is
+# recorded in the snapshot's meta.svol; a second call returns it (created => 0).
+sub materialize_snapshot {
+    my ($self, $parent, $snap_id, %args) = @_;
+    $self->_require_connected;
+    $self->_maybe_fault('materialize_snapshot');
+    my $s = $self->{snaps}{$snap_id}
+        or $self->_err( code => 'not_found', message => "no such snapshot '$snap_id'" );
+    $self->_err( code => 'invalid', message => "snapshot '$snap_id' is not on '$parent'" )
+        unless $s->{parent_backend_id} eq $parent;
+    return { backend_id => $s->{meta}{svol}, created => 0 } if defined $s->{meta}{svol};
+    my $bid = $self->_clone( $parent, label => $args{label}, requested_id => $args{requested_id} );
+    $s->{meta}{svol} = $bid;
+    return { backend_id => $bid, created => 1 };
+}
+
 # Clone helper: a clone is a brand-new LU of the same size in the same pool.
 sub _clone {
     my ($self, $backend_id, %args) = @_;

@@ -302,9 +302,9 @@ sub _alloc_backend_id {
 
     my ($min, $max) = $class->_parse_ldev_range($range);
 
-    my $reg = $class->_registry($storeid)->list;
-    my @reserved =
-        grep { defined } map { ref eq 'HASH' ? $_->{backend_id} : () } values %$reg;
+    # Everything the registry knows, including snapshot source LUs and pending source
+    # allocations (#27), so a fresh LU never takes one of their ids.
+    my @reserved = @{ $class->_registry($storeid)->known_backend_ids };
 
     return $d->next_free_backend_id( min => $min, max => $max, reserved => \@reserved );
 }

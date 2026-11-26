@@ -94,7 +94,7 @@ systemctl restart pvedaemon
   driver skeleton, the conformance test, and the make-it-fail-then-pass loop, plus the PVE
   shim and packaging. Start here.
 - **[`docs/driver-contract.md`](docs/driver-contract.md)** — the reference for
-  `fclu-driver-api-1`: the 18 mandatory and 10 capability-gated methods, data shapes, the
+  `fclu-driver-api-1`: the 18 mandatory and 11 capability-gated methods, data shapes, the
   idempotency/retry table, the typed error vocabulary, capability advertisement, and the
   host-access safety invariants.
 - **[`docs/adr/`](docs/adr/)** — architecture decision records (the *why* behind a design

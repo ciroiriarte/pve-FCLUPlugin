@@ -61,6 +61,7 @@ my @CONTRACT_METHODS = (
     { name => 'delete_snapshot', optional => 1 },
     { name => 'restore_snapshot', optional => 1 },
     { name => 'list_snapshots', optional => 1 },
+    { name => 'materialize_snapshot', optional => 1 },
     { name => 'create_linked_clone', optional => 1 },
     { name => 'create_full_clone', optional => 1 },
     { name => 'create_cg_snapshot', optional => 1 },
@@ -212,6 +213,23 @@ sub restore_snapshot { my ($self) = @_; $self->_nyi('restore_snapshot') }
 
 # list_snapshots($backend_id) -> [\%snap, ...]. OPTIONAL. Snapshot descriptors (§12.1).
 sub list_snapshots { my ($self) = @_; $self->_nyi('list_snapshots') }
+
+# materialize_snapshot($parent_backend_id, $snap_id, %args) -> { backend_id, created }.
+# OPTIONAL (clone.from_snapshot / reading a snapshot). Return an LU that presents the
+# snapshot's point-in-time image, creating one if the snapshot has none, so the core
+# can activate it (host read) or pass it to create_linked_clone as the CoW source.
+# The core never assumes how a vendor exposes a snapshot; this is where the driver
+# decides. Idempotent and race-safe: a snapshot that already has one returns it with
+# created => 0, including when a concurrent caller won the race. %args: requested_id
+# (the core's id fence; MUST be used for an allocated LU), label (MUST be set: the core
+# re-checks it before ever deleting the LU), group (the snapshot's recorded group;
+# the driver MUST verify $snap_id is on $parent and, where it can, is that pair),
+# host_ctx (for arrays that need temporary LU paths; remove any mapping you add). May
+# return identity (taken while mapped). The core treats ANY returned LU as OWNED by
+# the snapshot, created => 0 included, and deletes it after deleting the snapshot. It
+# MUST NOT be written by a guest (it is the snapshot itself). If the outcome cannot be
+# confirmed, die WITHOUT deleting an LU that may already be assigned.
+sub materialize_snapshot { my ($self) = @_; $self->_nyi('materialize_snapshot') }
 
 # create_linked_clone($backend_id, %args) -> $backend_id. OPTIONAL (clone.linked).
 # Persistent CoW child — the PVE clone_image primitive (§6). Only advertise `clone`

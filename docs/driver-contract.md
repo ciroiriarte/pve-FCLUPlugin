@@ -28,13 +28,13 @@ host access             ensure_host_access  publish_lu  unpublish_lu
 identity                get_lu_identity
 ```
 
-## The 10 you may implement
+## The 11 you may implement
 
 ```
 qos                     set_lu_qos  get_lu_qos
 pool/tier               migrate_lu
 snapshots               create_snapshot  delete_snapshot  restore_snapshot
-                        list_snapshots
+                        list_snapshots  materialize_snapshot
 clones                  create_linked_clone  create_full_clone
 consistency groups      create_cg_snapshot
 ```
@@ -43,6 +43,33 @@ These are **capability-gated**. If your array cannot do snapshots, do not implem
 and do not advertise them — the framework will not offer the feature, and the conformance
 suite skips those assertions. An array legitimately lacking a feature is not
 non-conformant.
+
+**Reading or cloning a snapshot.** The core never assumes a snapshot is a volume. When
+PVE reads a snapshot (a full clone from it) or makes a linked clone from it, the core
+needs an LU that presents the snapshot's point-in-time image:
+
+- If your `create_snapshot` descriptor carries one in `meta.svol`, the core uses it and
+  never deletes it; `delete_snapshot` stays responsible for it.
+- Otherwise implement `materialize_snapshot($parent, $snap_id, %args)`, returning
+  `{ backend_id, created }` (plus `identity` if you can only read it while mapped):
+  - Use `requested_id` when you allocate (it is the core's id fence), and set `label`.
+    Before it ever unmaps or deletes the LU, the core checks that it is inside the
+    fence, is not a registered volume, and still carries that label. An id the array
+    has since reused for something else is left alone.
+  - Verify that `$snap_id` is on `$parent` and, using `group`, that it is the pair the
+    core means. Snapshot ids can be reused.
+  - Remove any temporary mapping you add through `host_ctx`.
+  - Be idempotent: return the existing LU with `created => 0` if the snapshot already
+    has one, including when a concurrent caller won.
+  - If you cannot confirm the outcome, die without deleting an LU that may already be
+    assigned. The next call adopts it.
+  - The core treats any LU you return, `created => 0` included, as owned by the
+    snapshot, and deletes it after `delete_snapshot` and when the parent volume is
+    freed. A guest must never write to it: linked clones are CoW children of it, made
+    with `create_linked_clone`.
+- With neither, snapshot reads and clones fail with an error. Advertise
+  `clone.from_snapshot` only if one of the first two applies, because the core gates
+  snapshot clones on it.
 
 If you implement `restore_snapshot` and a restore can run for more than about 24 hours,
 also provide `restore_budget_s`: the longest time, in seconds, that `restore_snapshot`

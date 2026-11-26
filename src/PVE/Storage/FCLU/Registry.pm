@@ -552,6 +552,100 @@ sub end_snapshot_restore {
     return 1;
 }
 
+# Record the LU that presents a snapshot (its "source": the S-VOL a clone or a host
+# read uses), compare-and-set under the registry lock. If the snapshot already has a
+# source, that one wins and is returned unchanged; otherwise $svol is recorded with
+# %extra (e.g. svol_owned => 1, svol_identity => {...}). Returns the effective source,
+# or undef if the snapshot no longer exists.
+sub set_snapshot_source {
+    my ($self, $volname, $snapname, $svol, %extra) = @_;
+
+    croak "volname is required"  unless $volname;
+    croak "snapname is required" unless $snapname;
+    croak "svol is required"     unless defined $svol && length $svol;
+
+    return scalar $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        my $meta = $reg->{$volname} && $reg->{$volname}{snapshots}
+            && $reg->{$volname}{snapshots}{$snapname};
+        return undef unless ref $meta eq 'HASH';
+        return $meta->{svol} if defined $meta->{svol} && length $meta->{svol};
+        $meta->{svol} = "$svol";
+        $meta->{$_} = $extra{$_} for keys %extra;
+        return $meta->{svol};
+    } );
+}
+
+# Drop LU $id from a snapshot record once it has been deleted: the recorded source
+# (svol + its owned/label/identity keys) if it is $id, and a pending allocation that
+# named $id. Keeps a retry from ever acting on an id the array may hand out again.
+sub clear_snapshot_source {
+    my ($self, $volname, $snapname, $id) = @_;
+
+    croak "volname is required"  unless $volname;
+    croak "snapname is required" unless $snapname;
+    croak "id is required"       unless defined $id;
+
+    $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        my $m = $reg->{$volname} && $reg->{$volname}{snapshots}
+            && $reg->{$volname}{snapshots}{$snapname};
+        return unless ref $m eq 'HASH';
+        if ( defined $m->{svol} && "$m->{svol}" eq "$id" ) {
+            delete @$m{qw(svol svol_owned svol_label svol_identity)};
+        }
+        delete $m->{svol_pending}
+            if ref $m->{svol_pending} eq 'HASH' && ( $m->{svol_pending}{id} // '' ) eq "$id";
+        return;
+    } );
+
+    return 1;
+}
+
+# Every backend id the registry knows: volumes, their snapshots' source LUs, and
+# pending source allocations. For id allocation, so a fresh LU never reuses one.
+sub known_backend_ids {
+    my ($self) = @_;
+    my @ids;
+    for my $e ( values %{ $self->load } ) {
+        next unless ref $e eq 'HASH';
+        push @ids, $e->{backend_id} if defined $e->{backend_id};
+        for my $sm ( values %{ $e->{snapshots} // {} } ) {
+            next unless ref $sm eq 'HASH';
+            push @ids, $sm->{svol} if defined $sm->{svol};
+            push @ids, $sm->{svol_pending}{id}
+                if ref $sm->{svol_pending} eq 'HASH' && defined $sm->{svol_pending}{id};
+        }
+    }
+    return [ map {"$_"} @ids ];
+}
+
+# Merge metadata into an existing snapshot record (e.g. svol_identity after a host
+# activation). The identity- and lifecycle-bearing keys have their own writers and
+# are refused here. A key whose value is undef is removed. No-op if the snapshot is gone.
+sub update_snapshot_meta {
+    my ($self, $volname, $snapname, %meta) = @_;
+
+    croak "volname is required"  unless $volname;
+    croak "snapname is required" unless $snapname;
+    croak "update_snapshot_meta must not touch reserved key '$_'"
+        for grep { exists $meta{$_} } qw(snap_id svol svol_owned restoring);
+
+    $self->_with_registry_lock( sub {
+        my ($reg) = @_;
+        my $m = $reg->{$volname} && $reg->{$volname}{snapshots}
+            && $reg->{$volname}{snapshots}{$snapname};
+        return unless ref $m eq 'HASH';
+        for my $k ( keys %meta ) {
+            if ( defined $meta{$k} ) { $m->{$k} = $meta{$k} }
+            else                     { delete $m->{$k} }
+        }
+        return;
+    } );
+
+    return 1;
+}
+
 sub unregister_snapshot {
     my ($self, $volname, $snapname) = @_;
 

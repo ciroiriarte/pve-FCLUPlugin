@@ -23,6 +23,7 @@ subtest 'canonical method surface is the §2 set' => sub {
         ensure_host_access publish_lu unpublish_lu list_lu_mappings target_ports
         get_lu_identity
         create_snapshot delete_snapshot restore_snapshot list_snapshots
+        materialize_snapshot
         create_linked_clone create_full_clone create_cg_snapshot
     );
 
@@ -49,6 +50,7 @@ subtest 'canonical method surface is the §2 set' => sub {
         [ sort qw(
             set_lu_qos get_lu_qos migrate_lu
             create_snapshot delete_snapshot restore_snapshot list_snapshots
+            materialize_snapshot
             create_linked_clone create_full_clone create_cg_snapshot
         ) ],
         'optional set is the capability-gated methods',
