@@ -201,7 +201,10 @@ the ceiling; each additional group adds one port-budget's worth of headroom:
   snapshot from another node unmaps it everywhere, which can leave a pathless multipath
   map on the first node until it is flushed. Verified live on the
   E590H (93-07-23). Before alpha44 a snapshot clone failed with `has no S-VOL backend
-  id`, and a snapshot read resolved to the **live** volume instead.
+  id`, and a snapshot read resolved to the **live** volume instead. The array refuses to
+  delete an S-VOL that is still assigned to its pair (`KART30000-E`, SSB `2E30`/`4105`,
+  "LDEV is used as a local copy pair"; verified live), which backs up the plugin's own
+  ordering: pair first, then the S-VOL.
 
 - **`OPEN-0V` multipath:** a clone S-VOL presents SCSI product **`OPEN-0V`** (TI
   v-vol). Multipath must match `OPEN-.*` or the clone never gets a `/dev/mapper`

@@ -585,6 +585,11 @@ sub _snapshot_source {
         unless $sm && defined $sm->{snap_id};
     die "snapshot '$snap' of '$volname' is being deleted; finish the delete\n"
         if $sm->{pair_released};
+    my $me = eval { $class->_nodename };
+    die "snapshot '$snap' of '$volname' is being deleted\n"
+        if $reg->mark_active( $sm->{deleting}, $me );
+    die "'$volname' is being deleted\n"
+        if $reg->mark_active( ( $reg->lookup($volname) )[1]{busy}, $me );
     return "$sm->{svol}" if defined $sm->{svol} && length $sm->{svol};
 
     $d //= $class->_driver( $storeid, $scfg );
@@ -992,10 +997,22 @@ sub free_image {
         if $meta->{protected};
 
     # Refuse while linked clones (CoW children) still depend on this volume as their
-    # source — deleting it would corrupt them.
-    my $deps = $reg->find_dependents($volname);
-    die "cannot delete '$volname': linked clone(s) depend on it: " . join( ', ', sort @$deps ) . "\n"
-        if @$deps;
+    # source — deleting it would corrupt them. The check and a "being deleted" marker
+    # are one locked write, and a clone reservation of a marked volume is refused, so
+    # no clone can start between the check and the delete (#26). A successful free
+    # removes the entry (and the marker); a failed one clears the marker.
+    my $node = eval { $class->_nodename };
+    $reg->begin_volume_op( $volname, 'deleted', node => $node );
+    my @ret = eval { $class->_free_image_checked( $storeid, $scfg, $volname, $reg, $backend_id, $meta ) };
+    if ( my $err = $@ ) {
+        eval { $reg->end_volume_op( $volname, node => $node ) };
+        die $err;
+    }
+    return wantarray ? @ret : $ret[0];
+}
+
+sub _free_image_checked {
+    my ($class, $storeid, $scfg, $volname, $reg, $backend_id, $meta) = @_;
 
     # §7 destructive-op fence (registry membership is primary — we looked it up; a
     # vendor MAY add a stricter check, e.g. Hitachi ldev_range). Fail fast.
@@ -1255,10 +1272,22 @@ sub volume_snapshot_delete {
     die "volume '$volname' not found in registry\n" unless defined $backend_id;
 
     # Refuse while linked clones created FROM this snapshot still share its blocks —
-    # deleting the pair would corrupt them (promote/remove the clones first).
-    my $deps = $reg->find_snapshot_dependents( $volname, $snap );
-    die "cannot delete snapshot '$snap' of '$volname': linked clone(s) depend on it: "
-        . join( ', ', sort @$deps ) . "\n" if @$deps;
+    # deleting the pair would corrupt them (promote/remove the clones first). Check and
+    # marker are one locked write; a clone reservation of a snapshot being deleted is
+    # refused (#26). Success unregisters the snapshot (marker included); failure clears it.
+    my $node = eval { $class->_nodename };
+    $reg->begin_snapshot_delete( $volname, $snap, node => $node );
+    my $ok = eval { $class->_snapshot_delete_checked( $scfg, $storeid, $volname, $snap, $reg, $backend_id ); 1 };
+    if ( !$ok ) {
+        my $err = $@;
+        eval { $reg->end_snapshot_delete( $volname, $snap, node => $node ) };
+        die $err;
+    }
+    return 1;
+}
+
+sub _snapshot_delete_checked {
+    my ($class, $scfg, $storeid, $volname, $snap, $reg, $backend_id) = @_;
 
     my $meta = $reg->lookup_snapshot( $volname, $snap );
     die "snapshot '$snap' not found for volume '$volname'\n"
@@ -1401,7 +1430,8 @@ sub rename_snapshot {
     # make it permanently unmanageable through PVE (delete/rollback refuse the prefix).
     die "snapshot name '$target' is reserved ('oob-' marks array-managed snapshots)\n"
         if $target =~ /^oob-/;
-    $class->_registry($storeid)->rename_snapshot( $volname, $source, $target );
+    $class->_registry($storeid)->rename_snapshot( $volname, $source, $target,
+        node => scalar eval { $class->_nodename } );
     return;
 }
 
@@ -1593,16 +1623,22 @@ sub create_base {
     my ($backend_id) = $reg->lookup($volname);
     die "volume '$volname' not found in registry\n" unless defined $backend_id;
 
-    my $deps = $reg->find_dependents($volname);
-    die "cannot convert '$volname' to a base image: linked clone(s) depend on it: "
-        . join( ', ', sort @$deps ) . "\n" if @$deps;
-
     my ($disk) = $name =~ /-disk-(\d+)$/;
     my $base_name = "base-${vmid}-disk-${disk}";
 
+    # The dependent check and the registry rename are one locked write, so no clone of
+    # the old name can start in between (#26). The label follows; if it cannot be set
+    # the rename is undone.
+    my $node = eval { $class->_nodename };
+    $reg->rename_volume( $volname, $base_name, node => $node,
+        refuse_dependents => "cannot convert '$volname' to a base image" );
     my $d = $class->_driver( $storeid, $scfg );
-    $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $base_name, $d ) );
-    $reg->rename_volume( $volname, $base_name );
+    eval { $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $base_name, $d ) ) };
+    if ( my $err = $@ ) {
+        eval { $reg->rename_volume( $base_name, $volname ) };
+        warn "FCLU: could not undo the rename of '$volname' to '$base_name': $@" if $@;
+        die $err;
+    }
 
     return $base_name;
 }
@@ -1714,18 +1750,23 @@ sub rename_volume {
     my ($backend_id) = $reg->lookup($source_volname);
     die "volume '$source_volname' not found in registry\n" unless defined $backend_id;
 
-    # Renaming a parent would dangle its linked clones' parent_volname reference.
-    my $deps = $reg->find_dependents($source_volname);
-    die "cannot rename '$source_volname': linked clone(s) depend on it: "
-        . join( ', ', sort @$deps ) . "\n" if @$deps;
-
     my $format = ( $class->parse_volname($source_volname) )[6];
     $target_volname = $class->find_free_diskname( $storeid, $scfg, $target_vmid, $format )
         if !$target_volname;
 
+    # Renaming a parent would dangle its linked clones' parent_volname reference. The
+    # dependent check and the rename are one locked write (#26); the label follows,
+    # and a failed label change undoes the rename.
+    my $node = eval { $class->_nodename };
+    $reg->rename_volume( $source_volname, $target_volname, node => $node,
+        refuse_dependents => "cannot rename '$source_volname'" );
     my $d = $class->_driver( $storeid, $scfg );
-    $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $target_volname, $d ) );
-    $reg->rename_volume( $source_volname, $target_volname );
+    eval { $d->set_lu_label( $backend_id, $class->_make_label( $storeid, $target_volname, $d ) ) };
+    if ( my $err = $@ ) {
+        eval { $reg->rename_volume( $target_volname, $source_volname ) };
+        warn "FCLU: could not undo the rename of '$source_volname': $@" if $@;
+        die $err;
+    }
 
     return "${storeid}:${target_volname}";
 }

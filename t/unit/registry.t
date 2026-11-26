@@ -401,4 +401,149 @@ subtest '#27: set_snapshot_source is compare-and-set; update_snapshot_meta is gu
     ok( $r->update_snapshot_meta( 'vm-1-disk-0', 'gone', svol_identity => {} ), 'missing snapshot is a no-op' );
 };
 
+subtest '#26: snapshot delete marker blocks clones and rollback, clears on end' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', '300' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', snap_id => '300,3' );
+    ok( $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ), 'marker set' );
+    ok( $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{deleting}, 'recorded' );
+    eval { $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'a', node => 'n1' ) };
+    like( $@, qr/it is being deleted/, 'clone from the snapshot refused' );
+    ok( $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', node => 'n1' ), 'clone of the live volume still allowed' );
+    eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/being deleted/, 'rollback refused' );
+    eval { $r->rename_snapshot( 'vm-1-disk-0', 'a', 'b', node => 'n1' ) };
+    like( $@, qr/delete of it is running/, 'rename refused' );
+    ok( $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ), 'own retry may re-enter' );
+    $r->end_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' );
+    ok( !$r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{deleting}, 'cleared' );
+
+    # Another live process's marker refuses; a dead pid on the same node is stale.
+    my $reg = $r->load;
+    $reg->{'vm-1-disk-0'}{snapshots}{a}{deleting} = { node => 'n1', pid => 999999, started => time, expires => time + 600 };
+    $r->_with_registry_lock( sub { %{ $_[0] } = %$reg; return } );
+    ok( $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ), 'dead-pid marker ignored' );
+    $r->end_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' );
+    $reg = $r->load;
+    $reg->{'vm-1-disk-0'}{snapshots}{a}{deleting} = { node => 'n2', pid => 1, started => time, expires => time + 600 };
+    $r->_with_registry_lock( sub { %{ $_[0] } = %$reg; return } );
+    eval { $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/another delete of it is running/, 'live marker from another node refuses' );
+
+    # A clone reservation already in place refuses the delete (the other order).
+    my $r2 = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r2->register( 'vm-1-disk-0', '300' );
+    $r2->register_snapshot( 'vm-1-disk-0', 'a', snap_id => '300,3' );
+    $r2->reserve_volname( 2, parent_volname => 'vm-1-disk-0', parent_snap => 'a', node => 'n1' );
+    eval { $r2->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/clone in progress/, 'in-flight clone blocks the delete' );
+};
+
+subtest '#26: volume busy marker; atomic rename refusal; refusals do not write' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', '300' );
+    ok( $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ), 'busy marker set' );
+    eval { $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', node => 'n1' ) };
+    like( $@, qr/it is being deleted/, 'clone of a volume being deleted refused' );
+    $r->end_volume_op( 'vm-1-disk-0', node => 'n1' );
+    ok( !( $r->lookup('vm-1-disk-0') )[1]{busy}, 'cleared' );
+
+    $r->reserve_volname( 2, parent_volname => 'vm-1-disk-0', node => 'n1' );
+    eval { $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ) };
+    like( $@, qr/cannot delete 'vm-1-disk-0': linked clone\(s\) depend on it: vm-2-disk-1 \(clone in progress\)/,
+        'in-flight clone blocks free' );
+    eval { $r->rename_volume( 'vm-1-disk-0', 'base-1-disk-0', refuse_dependents => "cannot convert 'vm-1-disk-0'" ) };
+    like( $@, qr/^cannot convert 'vm-1-disk-0': linked clone\(s\) depend on it/, 'atomic rename refused' );
+    ok( defined $r->lookup('vm-1-disk-0'), 'not renamed' );
+
+    # A refusal costs no registry write.
+    no warnings 'redefine';
+    my $writes = 0;
+    my $orig = \&PVE::Storage::FCLU::Registry::_write_registry_atomic;
+    local *PVE::Storage::FCLU::Registry::_write_registry_atomic = sub { $writes++; $orig->(@_) };
+    eval { $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ) };
+    eval { $r->rename_volume( 'vm-1-disk-0', 'x', refuse_dependents => 'no' ) };
+    is( $writes, 0, 'refused calls skipped the write' );
+
+    $r->unregister('vm-2-disk-1');
+    ok( $r->rename_volume( 'vm-1-disk-0', 'base-1-disk-0', refuse_dependents => 'no' ), 'renames once free' );
+    is( $writes, 2, 'unregister + rename wrote' );
+};
+
+subtest '#26: rename_snapshot refused while a rollback holds the snapshot' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', '300' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', snap_id => '300,3' );
+    $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' );
+    eval { $r->rename_snapshot( 'vm-1-disk-0', 'a', 'b', node => 'n1' ) };
+    like( $@, qr/rollback to it is running/, 'refused' );
+    $r->end_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' );
+    ok( $r->rename_snapshot( 'vm-1-disk-0', 'a', 'b', node => 'n1' ), 'allowed after' );
+};
+
+subtest '#26 review: cross-guards, offline-node staleness, reserved keys' => sub {
+    my $r = mk( base_dir => tempdir( CLEANUP => 1 ) );
+    $r->register( 'vm-1-disk-0', '300' );
+    $r->register_snapshot( 'vm-1-disk-0', 'a', snap_id => '300,3' );
+
+    $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' );
+    eval { $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ) };
+    like( $@, qr/a delete of snapshot 'a' is running/, 'free refused during a snapshot delete' );
+    eval { $r->rename_volume( 'vm-1-disk-0', 'base-1-disk-0', refuse_dependents => 'no', node => 'n1' ) };
+    like( $@, qr/a delete of snapshot 'a' is running/, 'rename refused: would carry the marker away' );
+    $r->end_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' );
+
+    $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' );
+    eval { $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ) };
+    like( $@, qr/'vm-1-disk-0' is being deleted/, 'snapshot delete refused during a free' );
+    $r->end_volume_op( 'vm-1-disk-0', node => 'n1' );
+
+    $r->register( 'vm-2-disk-0', '301' );
+    eval { $r->rename_volume( 'vm-1-disk-0', 'vm-2-disk-0' ) };
+    like( $@, qr/^cannot rename 'vm-1-disk-0': volume 'vm-2-disk-0' already exists\n/, 'clean exists refusal' );
+
+    # A retry-safe marker from a node the cluster reports offline is stale; a rollback
+    # marker from that node is not.
+    my $reg = $r->load;
+    my $far = { node => 'n2', pid => 1, started => time, expires => time + 600 };
+    $reg->{'vm-1-disk-0'}{busy} = { %$far, op => 'deleted', retry_safe => 1 };
+    $reg->{'vm-1-disk-0'}{snapshots}{a}{restoring} = {%$far};
+    $r->_with_registry_lock( sub { %{ $_[0] } = %$reg; return } );
+    delete $reg->{'vm-1-disk-0'}{snapshots}{a}{restoring};
+    $reg->{'vm-1-disk-0'}{snapshots}{a}{deleting} = { %$far, retry_safe => 1 };
+    $r->_with_registry_lock( sub { %{ $_[0] } = %$reg; return } );
+    eval { $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ) };
+    like( $@, qr/being deleted \(node n2/, 'online/unknown owner: free retry refused' );
+    {
+        local $PVE::Storage::FCLU::Registry::NODE_OFFLINE = sub { $_[0] eq 'n2' };
+        ok( $r->mark_active( $r->load->{'vm-1-disk-0'}{busy}, 'n1' ), 'offline owner: still live for gates' );
+        eval { $r->reserve_volname( 3, parent_volname => 'vm-1-disk-0', node => 'n1' ) };
+        like( $@, qr/being deleted/, 'offline owner: clone of the volume still refused' );
+        eval { $r->reserve_volname( 3, parent_volname => 'vm-1-disk-0', parent_snap => 'a', node => 'n1' ) };
+        like( $@, qr/being deleted/, 'offline owner: clone of the snapshot still refused' );
+        eval { $r->begin_snapshot_restore( 'vm-1-disk-0', 'a', node => 'n1' ) };
+        like( $@, qr/being deleted/, 'offline owner: rollback still refused' );
+        eval { $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ) };
+        like( $@, qr/'vm-1-disk-0' is being deleted/, 'remote busy still blocks a snapshot delete (strict)' );
+        my $g = $r->load;
+        delete $g->{'vm-1-disk-0'}{busy};
+        $r->_with_registry_lock( sub { %{ $_[0] } = %$g; return } );
+        ok( $r->begin_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' ), 'offline owner: snapshot delete retry takes over' );
+        is( $r->lookup_snapshot( 'vm-1-disk-0', 'a' )->{deleting}{node}, 'n1', 'marker now ours' );
+        $r->end_snapshot_delete( 'vm-1-disk-0', 'a', node => 'n1' );
+        $g = $r->load;
+        $g->{'vm-1-disk-0'}{busy} = { %$far, op => 'deleted', retry_safe => 1 };
+        $r->_with_registry_lock( sub { %{ $_[0] } = %$g; return } );
+        ok( $r->begin_volume_op( 'vm-1-disk-0', 'deleted', node => 'n1' ), 'offline owner: free retry takes over' );
+        eval { $r->reserve_volname( 3, parent_volname => 'vm-1-disk-0', node => 'n1' ) };
+        like( $@, qr/being deleted/, 'clone blocked by the new owner' );
+        $r->end_volume_op( 'vm-1-disk-0', node => 'n1' );
+    }
+
+    eval { $r->update_meta( 'vm-1-disk-0', busy => undef ) };
+    like( $@, qr/reserved key 'busy'/, 'busy reserved' );
+    eval { $r->update_snapshot_meta( 'vm-1-disk-0', 'a', deleting => undef ) };
+    like( $@, qr/deleting/, 'deleting reserved' );
+};
+
 done_testing();

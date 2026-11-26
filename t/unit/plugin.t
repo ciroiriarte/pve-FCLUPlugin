@@ -1748,4 +1748,42 @@ subtest 'API 15: volume_resize refuses a snapshot target' => sub {
     like( $@, qr/resizing a snapshot is not supported/, 'snapname refused' );
 };
 
+subtest '#26: failed delete/free clears its marker; create_base/rename are atomic' => sub {
+    local $T::Plugin::FAKE = T::MatDriver->new;
+    local $T::Plugin::CONN = T::FakeConn->new;
+    my $F = $T::Plugin::FAKE;
+    $P->deactivate_storage( 'store1', {} );
+    my $vol = $P->alloc_image( 'store1', { pool_id => '63' }, 993, 'raw', undef, 1 << 30 );
+    my ($bid) = reg()->lookup($vol);
+
+    $P->volume_snapshot( {}, 'store1', $vol, 's1' );
+    $F->{fail_pair_delete} = 1;
+    eval { $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ) };
+    like( $@, qr/BOOM pair delete/, 'snapshot delete fails' );
+    ok( !reg()->lookup_snapshot( $vol, 's1' )->{deleting}, 'its marker is cleared' );
+    $F->{fail_pair_delete} = 0;
+    ok( $P->volume_snapshot_delete( {}, 'store1', $vol, 's1' ), 'retry succeeds' );
+
+    $F->{fail_delete_id} = $bid;
+    eval { $P->free_image( 'store1', { pool_id => '63' }, $vol ) };
+    like( $@, qr/BOOM delete/, 'free fails' );
+    ok( !( reg()->lookup($vol) )[1]{busy}, 'busy marker cleared' );
+    $F->{fail_delete_id} = undef;
+
+    # create_base: a clone in flight refuses it atomically; a failed label undoes the rename.
+    reg()->reserve_volname( 994, parent_volname => $vol, node => 'x' );
+    eval { $P->create_base( 'store1', {}, $vol ) };
+    like( $@, qr/cannot convert '\Q$vol\E' to a base image: linked clone\(s\) depend on it: .*clone in progress/,
+        'in-flight clone refuses create_base' );
+    reg()->unregister($_) for grep { /^vm-994-/ } keys %{ reg()->load };
+    $F->{fail_label} = 1;
+    eval { $P->create_base( 'store1', {}, $vol ) };
+    like( $@, qr/BOOM label/, 'label failure surfaces' );
+    ok( defined reg()->lookup($vol), 'rename undone: volume keeps its name' );
+    $F->{fail_label} = 0;
+    my $base = $P->create_base( 'store1', {}, $vol );
+    like( $base, qr/^base-993-disk-/, 'create_base succeeds after' );
+    is( $F->{lus}{$bid}{label} =~ /\Q$base\E/ ? 1 : 0, 1, 'label follows the new name' );
+};
+
 done_testing();

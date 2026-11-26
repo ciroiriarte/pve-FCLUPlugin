@@ -371,6 +371,17 @@ partial-failure rollback are **vendor-neutral** and move into `FCLU::Registry` /
 `cfs_lock_storage`, to avoid self-deadlock against PVE's own storage lock —
 `Config.pm:160`) stays and stays generic.
 
+**Dependent guards are atomic with the operation** (#26, alpha43 for rollback). A linked
+clone reserves its volname with lineage (`parent_volname`, `parent_snap`), so an in-flight
+clone counts as a dependent. An operation that destroys or rewrites what a clone is built
+from checks dependents and records a marker `{ started, node, pid, expires }` in **one**
+locked registry write, and `reserve_volname` refuses a clone of a marked object. That
+covers rollback (`restoring` on the snapshot), snapshot delete (`deleting` on the
+snapshot) and `free_image` (`busy` on the volume). `create_base` and `rename_volume`
+do the dependent check inside the locked registry rename itself. A marker is stale once
+its pid is gone on the recording node, or once it expires. A refusal skips the registry
+write.
+
 **One change**: generalize the entry shape off the integer `ldev_id` to an opaque
 `backend_id` + recorded identity [Codex]:
 
